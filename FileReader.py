@@ -2,17 +2,21 @@ import numpy as np
 import pandas as pd
 from pathlib import Path
 from pyteomics import mzxml
-from typing import List, Tuple, Dict
+from typing import List, Tuple
 from multiprocessing import Pool, cpu_count
 import os
+import time
+import shutil
+
+# Import your modules
+from Config import Config
+from FileUtils import FileUtils
 
 # Configuration
 NOISE_LEVEL = 5000.0
-MZ_TOLERANCE = 0.0005
-MIN_CONSEC_SCANS = 7
 
-
-def centroid_scan(scan_idx: int, mzs: np.ndarray, intensities: np.ndarray, noise_level: float) -> List[Tuple[int, float, float]]:
+def centroid_scan(scan_idx: int, mzs: np.ndarray, intensities: np.ndarray, noise_level: float) -> List[
+    Tuple[int, float, float]]:
     """Detect peaks in a single scan"""
     if len(intensities) < 3:
         return []
@@ -50,37 +54,37 @@ def centroid_scan(scan_idx: int, mzs: np.ndarray, intensities: np.ndarray, noise
 def process_single_mzxml(args: Tuple[str, str, float]) -> str:
     """
     Process a single mzXML file (designed for parallel execution)
-    
+
     Args:
         args: Tuple of (input_file_path, output_csv_path, noise_level)
-    
+
     Returns:
         Status message
     """
     file_path, output_csv, noise_level = args
-    
+
     try:
         # Check if output already exists
         if os.path.exists(output_csv):
             return f"[↷] {os.path.basename(file_path)} (already exists)"
-        
+
         data_rows = []
-        
+
         with mzxml.read(file_path) as reader:
             for scan in reader:
                 # Only process MS1 scans
                 if scan.get('msLevel', 0) == 1:
                     scan_number = int(scan['num'])
                     rt = float(scan['retentionTime'])  # Retention time in minutes
-                    
+
                     # Convert to numpy arrays
                     mzs = np.array(scan['m/z array'], dtype=np.float32)
                     intensities = np.array(scan['intensity array'], dtype=np.float32)
-                    
+
                     if len(mzs) > 0:
                         # Detect peaks in this scan
                         peaks = centroid_scan(scan_number, mzs, intensities, noise_level)
-                        
+
                         # Add each peak to output data
                         for _, mz, intensity in peaks:
                             data_rows.append({
@@ -89,104 +93,158 @@ def process_single_mzxml(args: Tuple[str, str, float]) -> str:
                                 'intensity': intensity,
                                 'scan': scan_number
                             })
-        
+
         # Create DataFrame and save to CSV
         df = pd.DataFrame(data_rows)
         df.to_csv(output_csv, index=False, float_format='%.3f')
-        
+
         return f"[✔] {os.path.basename(file_path)} ({len(df)} peaks)"
-        
+
     except Exception as e:
         return f"[!] {os.path.basename(file_path)}: {str(e)[:50]}"
 
 
-def process_mzxml_files_parallel(input_files: List[str], output_dir: str, 
-                                 noise_level: float = NOISE_LEVEL, 
-                                 n_processes: int = None):
+def process_all_files_for_group(group_name, noise_level: float = NOISE_LEVEL, n_processes: int = None):
     """
-    Process multiple mzXML files in parallel
-    
+    Process all mzXML files for a specific mass group
+
     Args:
-        input_files: List of paths to input mzXML files
-        output_dir: Directory to save output CSV files
+        group_name: The mass group to process (e.g., 1, 2, 3, etc.)
         noise_level: Minimum intensity threshold for peak detection
         n_processes: Number of parallel processes (default: CPU count - 1)
     """
-    # Create output directory if it doesn't exist
-    Path(output_dir).mkdir(parents=True, exist_ok=True)
-    
+    # Set the current group in Config
+    Config.set_mass_group(group_name)
+
+    # Get input file paths from FileUtils
+    input_files = FileUtils.get_file_paths()
+
+    # Create output directory using Config's directory structure
+    output_dir = Config.BASE_DIR / Config.OUTPUT_ROOT / Config.ANALYSIS_FOLDER / str(Config.CURRENT_GROUP) / "EIC CSVs"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
     # Prepare arguments for each file
     args_list = []
     for file_path in input_files:
         base_name = os.path.splitext(os.path.basename(file_path))[0]
-        output_csv = os.path.join(output_dir, f"{base_name}_raw.csv")
-        args_list.append((file_path, output_csv, noise_level))
-    
+        output_csv = output_dir / f"{base_name}_EIC_raw.csv"
+        args_list.append((file_path, str(output_csv), noise_level))
+
     # Determine number of processes
     if n_processes is None:
         n_processes = max(1, cpu_count() - 1)
-    
+
+    print(f"Processing Group: {group_name}")
     print(f"Processing {len(input_files)} files using {n_processes} processes...")
-    
+    print(f"Input directory: {Config.BASE_DIR / Config.INPUT_SUBDIR}")
+    print(f"Output directory: {output_dir}\n")
+
     # Process files in parallel
     with Pool(processes=n_processes) as pool:
         results = pool.map(process_single_mzxml, args_list)
-    
+
     # Print results
-    print("\nProcessing complete:")
+    print("Processing complete:")
     for result in results:
         print(result)
-    
+
+    # Summary statistics
+    successful = sum(1 for r in results if r.startswith("[✔]"))
+    cached = sum(1 for r in results if r.startswith("[↷]"))
+    failed = sum(1 for r in results if r.startswith("[!]"))
+
+    print(f"Summary: {successful} processed, {cached} cached, {failed} failed")
+
     return results
 
 
-def process_single_mzxml_file(input_file: str, output_csv: str, noise_level: float = NOISE_LEVEL):
+def process_all_groups(noise_level: float = NOISE_LEVEL, n_processes: int = None):
     """
-    Process a single mzXML file (non-parallel version for single file use)
-    
+    Process all mass groups defined in Config.MASS_GROUPS
+
     Args:
-        input_file: Path to input mzXML file
-        output_csv: Path to output CSV file
         noise_level: Minimum intensity threshold for peak detection
+        n_processes: Number of parallel processes (default: CPU count - 1)
     """
-    result = process_single_mzxml((input_file, output_csv, noise_level))
-    print(result)
-    
-    # Load and return the DataFrame
-    if os.path.exists(output_csv):
-        return pd.read_csv(output_csv)
-    return None
+    total_start_time = time.time()
+
+    print("mzXML to CSV Converter - Parallel Processing")
+    print("Processing All Mass Groups")
+
+    all_results = {}
+
+    for group_name in Config.MASS_GROUPS.keys():
+        group_start_time = time.time()
+
+        results = process_all_files_for_group(
+            group_name=group_name,
+            noise_level=noise_level,
+            n_processes=n_processes
+        )
+
+        group_elapsed = time.time() - group_start_time
+        all_results[group_name] = {
+            'results': results,
+            'time': group_elapsed
+        }
+
+        print(f"\nGroup {group_name} completed in {group_elapsed:.2f} seconds")
+        print(f"Average time per file: {group_elapsed / len(FileUtils.get_file_paths()):.2f} seconds")
+
+    total_elapsed = time.time() - total_start_time
+
+    print("ALL GROUPS PROCESSING SUMMARY")
+    for group_name, data in all_results.items():
+        print(f"Group {group_name}: {data['time']:.2f} seconds")
+    print(f"\nTotal processing time: {total_elapsed:.2f} seconds")
+    return all_results
 
 
-# Example usage
+def analyze_results_for_group(group_name):
+    """Analyze the generated CSV files for a specific group and print statistics"""
+    Config.set_mass_group(group_name)
+    output_dir = Config.BASE_DIR / Config.OUTPUT_ROOT / Config.ANALYSIS_FOLDER / str(Config.CURRENT_GROUP) / "EIC CSVs"
+
+    csv_files = list(output_dir.glob("*_EIC_raw.csv"))
+
+    if not csv_files:
+        print(f"No CSV files found for group {group_name}!")
+        return
+
+    print(f"\nAnalyzing {len(csv_files)} CSV files for group {group_name}...\n")
+
+    total_peaks = 0
+    rt_min, rt_max = float('inf'), 0
+    mass_min, mass_max = float('inf'), 0
+    int_min, int_max = float('inf'), 0
+
+    for csv_file in csv_files:
+        df = pd.read_csv(csv_file)
+        total_peaks += len(df)
+
+        if len(df) > 0:
+            rt_min = min(rt_min, df['rt'].min())
+            rt_max = max(rt_max, df['rt'].max())
+            mass_min = min(mass_min, df['mass'].min())
+            mass_max = max(mass_max, df['mass'].max())
+            int_min = min(int_min, df['intensity'].min())
+            int_max = max(int_max, df['intensity'].max())
+
+    print(f"GROUP {group_name} STATISTICS")
+    print(f"Total files processed: {len(csv_files)}")
+    print(f"Total peaks detected: {total_peaks:,}")
+    print(f"Average peaks per file: {total_peaks / len(csv_files):,.0f}")
+    print(f"\nRetention time range: {rt_min:.2f} - {rt_max:.2f} minutes")
+    print(f"Mass range: {mass_min:.2f} - {mass_max:.2f} m/z")
+    print(f"Intensity range: {int_min:.0f} - {int_max:.0f}")
+
 if __name__ == "__main__":
-    # Example 1: Process multiple files in parallel
-    input_files = [
-        "path/to/file1.mzXML",
-        "path/to/file2.mzXML",
-        "path/to/file3.mzXML",
-        # Add more files...
-    ]
-    
-    output_directory = "output_csvs"
-    
-    # Process all files in parallel
-    process_mzxml_files_parallel(
-        input_files=input_files,
-        output_dir=output_directory,
+    # Process all groups
+    process_all_groups(
         noise_level=NOISE_LEVEL,
-        n_processes=None  # Auto-detect (CPU count - 1)
+        n_processes=None  # Auto-detect CPU cores
     )
-    
-    # Example 2: Process a single file
-    # df = process_single_mzxml_file(
-    #     input_file="path/to/single_file.mzXML",
-    #     output_csv="output.csv",
-    #     noise_level=NOISE_LEVEL
-    # )
-    # print(df.head())
-    
-    # Example 3: Read from a directory
-    # from glob import glob
-    # input_files = glob("path/to/mzxml_files/*.mzXML")
-    # process_mzxml_files_parallel(input_files, "output_csvs")
+
+    # Analyze results for each group
+    for group_name in Config.MASS_GROUPS.keys():
+        analyze_results_for_group(group_name)
