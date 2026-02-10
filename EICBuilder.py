@@ -240,7 +240,9 @@ def split_shoulders_in_window(
         right_idx: int,
         noise_level: float,
         mass_str: str,
-        base_name: str
+        base_name: str,
+        scan_start: int,
+        scan_end: int,
 ) -> List[Dict]:
     """
     Detect and split shoulder peaks within a peak window
@@ -249,19 +251,24 @@ def split_shoulders_in_window(
     y_raw_win = intensity_raw[left_idx:right_idx + 1]
     y_smooth_win = intensity_smooth[left_idx:right_idx + 1]
 
-    if len(y_smooth_win) < 7:
-        apex_local = int(np.argmax(y_raw_win))
-        apex_idx = left_idx + apex_local
-        area = trapezoid(y_raw_win, x_win)
-        return [{
-            'File': base_name,
+    def _record(apex_idx: int, area: float) -> Dict:
+        return {
+            'File Name': base_name,
             'm/z': mass_str,
             'RT_start': round(float(x_win[0]), 4),
             'RT_apex': round(float(rt_vals[apex_idx]), 4),
             'RT_end': round(float(x_win[-1]), 4),
+            'Scan_start': int(scan_start),
+            'Scan_end': int(scan_end),
             'Peak Area': round(float(area), 2),
-            'height': round(float(intensity_raw[apex_idx]), 2)
-        }]
+            'Height': round(float(intensity_raw[apex_idx]), 2),
+        }
+
+    if len(y_smooth_win) < 7:
+        apex_local = int(np.argmax(y_raw_win))
+        apex_idx = left_idx + apex_local
+        area = trapezoid(y_raw_win, x_win)
+        return [_record(apex_idx, area)]
 
     main_local = int(np.argmax(y_smooth_win))
     main_idx = left_idx + main_local
@@ -285,15 +292,7 @@ def split_shoulders_in_window(
 
     if not candidates:
         area = trapezoid(y_raw_win, x_win)
-        return [{
-            'File': base_name,
-            'm/z': mass_str,
-            'RT_start': round(float(x_win[0]), 4),
-            'RT_apex': round(float(rt_vals[main_idx]), 4),
-            'RT_end': round(float(x_win[-1]), 4),
-            'Peak Area': round(float(area), 2),
-            'height': round(float(intensity_raw[main_idx]), 2)
-        }]
+        return [_record(main_idx, area)]
 
     best = None
     best_height = -1.0
@@ -327,15 +326,7 @@ def split_shoulders_in_window(
 
     if best is None or best_valley_idx is None:
         area = trapezoid(y_raw_win, x_win)
-        return [{
-            'File': base_name,
-            'm/z': mass_str,
-            'RT_start': round(float(x_win[0]), 4),
-            'RT_apex': round(float(rt_vals[main_idx]), 4),
-            'RT_end': round(float(x_win[-1]), 4),
-            'Peak Area': round(float(area), 2),
-            'height': round(float(intensity_raw[main_idx]), 2)
-        }]
+        return [_record(main_idx, area)]
 
     valley_idx = best_valley_idx
     left_l, left_r = left_idx, valley_idx
@@ -367,24 +358,8 @@ def split_shoulders_in_window(
         shoulder_area = area_left
 
     return [
-        {
-            'File': base_name,
-            'm/z': mass_str,
-            'RT_start': round(float(rt_vals[left_idx]), 4),
-            'RT_apex': round(float(rt_vals[shoulder_apex_idx]), 4),
-            'RT_end': round(float(rt_vals[right_idx]), 4),
-            'Peak Area': round(float(shoulder_area), 2),
-            'height': round(float(intensity_raw[shoulder_apex_idx]), 2)
-        },
-        {
-            'File': base_name,
-            'm/z': mass_str,
-            'RT_start': round(float(rt_vals[left_idx]), 4),
-            'RT_apex': round(float(rt_vals[main_apex_idx]), 4),
-            'RT_end': round(float(rt_vals[right_idx]), 4),
-            'Peak Area': round(float(main_area), 2),
-            'height': round(float(intensity_raw[main_apex_idx]), 2)
-        }
+        _record(shoulder_apex_idx, shoulder_area),
+        _record(main_apex_idx, main_area),
     ]
 
 
@@ -525,7 +500,9 @@ def analyze_csv_and_generate_eic(
                     right_idx=right_idx,
                     noise_level=noise_level,
                     mass_str=mass_list_str[mass_idx],
-                    base_name=base
+                    base_name=base,
+                    scan_start=left_idx,
+                    scan_end=right_idx,
                 )
                 peaks_out.extend(new_records)
 
@@ -592,16 +569,23 @@ def process_csv_for_eic(args: Tuple[str, str, Dict[str, str], str]) -> str:
         output_image_path = Path(output_image_path) if isinstance(output_image_path, str) else output_image_path
 
         base = csv_path.stem.replace(f"_peaks_{group_name}", "")
+        peakinfo_dir = csv_path.parent / "Peak Info CSVs"
+        peakinfo_dir.mkdir(parents=True, exist_ok=True)
+        peakinfo_csv_path = peakinfo_dir / f"{base}_peakinfo_{group_name}.csv"
 
-        if output_image_path.exists():
+        if output_image_path.exists() and peakinfo_csv_path.exists():
             return f"[↷] {base} (cached)"
 
         peaks = analyze_csv_and_generate_eic(str(csv_path), str(output_image_path), file_colors, group_name)
+
+        # Write peak info CSV (even if image already existed but peakinfo didn't)
+        write_peakinfo_csv(peaks, peakinfo_csv_path)
 
         return f"[✔] {base} ({len(peaks)} peaks)"
 
     except Exception as e:
         return f"[!] {Path(csv_path).name}: {str(e)[:50]}"
+
 
 
 def generate_file_colors(csv_files: List[Path]) -> Dict[str, str]:
@@ -716,6 +700,33 @@ def build_eics_for_all_groups(n_processes: int = None) -> Dict[str, List[str]]:
     print(f"Total time: {total_elapsed:.2f} seconds")
 
     return all_results
+
+def write_peakinfo_csv(peaks_out: List[Dict], out_csv_path: Path) -> None:
+    if not peaks_out:
+        return
+
+    df = pd.DataFrame(peaks_out)
+
+    # Enforce column order (and only these columns)
+    cols = [
+        "File Name", "m/z",
+        "RT_start", "RT_apex", "RT_end",
+        "Scan_start", "Scan_end",
+        "Peak Area", "Height",
+    ]
+    for c in cols:
+        if c not in df.columns:
+            df[c] = np.nan
+
+    df = df[cols]
+
+    # Sort nicely (optional)
+    df["RT_apex"] = pd.to_numeric(df["RT_apex"], errors="coerce")
+    df["Peak Area"] = pd.to_numeric(df["Peak Area"], errors="coerce")
+    df = df.sort_values(["m/z", "RT_apex", "Peak Area"], ascending=[True, True, False])
+
+    out_csv_path.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(out_csv_path, index=False)
 
 
 if __name__ == "__main__":

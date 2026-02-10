@@ -202,7 +202,6 @@ class Pipeline:
             print(f"\n  {group_name}:")
             print(f"    Filtered CSVs: {group_dir / 'EIC CSVs'}")
             print(f"    EIC Images: {group_dir / 'EIC PNGs'}")
-            print(f"    Debug Images: {group_dir / 'Debug PNGs'}")
 
         print("\n" + "=" * 80)
 
