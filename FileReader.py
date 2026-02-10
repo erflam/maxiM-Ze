@@ -1,58 +1,90 @@
+"""
+FileReader.py
+Efficiently reads mzXML files and creates filtered CSVs for mass groups.
+Optimized with Numba for high-performance peak detection.
+"""
+
 import numpy as np
 import pandas as pd
 from pathlib import Path
 from pyteomics import mzxml
-from typing import List, Tuple, Dict
+from typing import List, Tuple
 from multiprocessing import Pool, cpu_count
+from numba import njit
 import os
 import time
 
-# Import your modules
 from Config import Config
 from FileUtils import FileUtils
 
 # Configuration
 NOISE_LEVEL = 5000.0
 
-def centroid_scan(scan_idx: int, mzs: np.ndarray, intensities: np.ndarray, noise_level: float) -> List[
-    Tuple[int, float, float]]:
-    """Detect peaks in a single scan"""
-    if len(intensities) < 3:
-        return []
+
+@njit
+def fast_centroid_scan(mzs: np.ndarray, intensities: np.ndarray, noise_level: float):
+    """
+    Numba-accelerated peak detection in a single scan
+
+    Returns: Arrays of (mz, intensity) for detected peaks
+    """
+    n = len(intensities)
+    if n < 3:
+        return np.empty(0, dtype=np.float32), np.empty(0, dtype=np.float32)
 
     # Pre-filter by noise level
     mask = intensities > noise_level
     if not np.any(mask):
-        return []
+        return np.empty(0, dtype=np.float32), np.empty(0, dtype=np.float32)
 
-    mzs = mzs[mask]
-    intensities = intensities[mask]
+    mzs_filtered = mzs[mask]
+    ints_filtered = intensities[mask]
+    n_filtered = len(ints_filtered)
 
-    # Fast local maxima detection
-    peak_mask = np.zeros(len(intensities), dtype=bool)
+    if n_filtered < 3:
+        return np.empty(0, dtype=np.float32), np.empty(0, dtype=np.float32)
+
+    # Peak detection
+    peak_mask = np.zeros(n_filtered, dtype=np.bool_)
 
     # Interior points - check if greater than neighbors
-    peak_mask[1:-1] = (intensities[1:-1] > intensities[:-2]) & (intensities[1:-1] > intensities[2:])
-
-    # Add very intense peaks (>10x noise)
-    intense_mask = intensities > (noise_level * 10)
-    peak_mask = peak_mask | intense_mask
+    for i in range(1, n_filtered - 1):
+        if ints_filtered[i] > ints_filtered[i - 1] and ints_filtered[i] > ints_filtered[i + 1]:
+            peak_mask[i] = True
 
     # Check endpoints
-    if len(intensities) > 1:
-        if intensities[0] > intensities[1]:
-            peak_mask[0] = True
-        if intensities[-1] > intensities[-2]:
-            peak_mask[-1] = True
+    if ints_filtered[0] > ints_filtered[1]:
+        peak_mask[0] = True
+    if ints_filtered[-1] > ints_filtered[-2]:
+        peak_mask[-1] = True
 
-    # Return detected peaks
-    peak_indices = np.where(peak_mask)[0]
-    return [(scan_idx, float(mzs[i]), float(intensities[i])) for i in peak_indices]
+    # Return peak m/z and intensity values
+    return mzs_filtered[peak_mask], ints_filtered[peak_mask]
+
+
+@njit
+def fast_filter_by_masses(mzs: np.ndarray, intensities: np.ndarray, mass_list: np.ndarray, tolerance: float):
+    """
+    Numba-accelerated filtering of peaks by target masses
+
+    Returns: Boolean mask indicating which peaks match target masses
+    """
+    n_peaks = len(mzs)
+    n_masses = len(mass_list)
+    mask = np.zeros(n_peaks, dtype=np.bool_)
+
+    for i in range(n_peaks):
+        for j in range(n_masses):
+            if abs(mzs[i] - mass_list[j]) <= tolerance:
+                mask[i] = True
+                break
+
+    return mask
 
 
 def process_single_mzxml(args: Tuple[str, str, float]) -> str:
     """
-    Process a single mzXML file (designed for parallel execution)
+    Process a single mzXML file with Numba acceleration
 
     Args:
         args: Tuple of (input_file_path, output_csv_path, noise_level)
@@ -63,44 +95,46 @@ def process_single_mzxml(args: Tuple[str, str, float]) -> str:
     file_path, output_csv, noise_level = args
 
     try:
-        # Check if output already exists
         if os.path.exists(output_csv):
             return f"[↷] {os.path.basename(file_path)} (already exists)"
 
-        data_rows = []
+        # Pre-allocate lists
+        rt_list = []
+        mass_list = []
+        intensity_list = []
+        scan_list = []
 
         with mzxml.read(file_path) as reader:
             for scan in reader:
-                # Only process MS1 scans
                 if scan.get('msLevel', 0) == 1:
                     scan_number = int(scan['num'])
-                    rt = float(scan['retentionTime'])  # Retention time in minutes
+                    rt = float(scan['retentionTime'])
 
-                    # Convert to numpy arrays
-                    mzs = np.array(scan['m/z array'], dtype=np.float64)  # Higher precision for mass
+                    # Use float32 for efficiency
+                    mzs = np.array(scan['m/z array'], dtype=np.float32)
                     intensities = np.array(scan['intensity array'], dtype=np.float32)
 
                     if len(mzs) > 0:
-                        # Detect peaks in this scan
-                        peaks = centroid_scan(scan_number, mzs, intensities, noise_level)
+                        # Use Numba-accelerated peak detection
+                        peak_mzs, peak_ints = fast_centroid_scan(mzs, intensities, noise_level)
 
-                        # Add each peak to output data
-                        for _, mz, intensity in peaks:
-                            data_rows.append({
-                                'rt': rt,
-                                'mass': mz,
-                                'intensity': intensity,
-                                'scan': scan_number
-                            })
+                        # Batch append
+                        n_peaks = len(peak_mzs)
+                        rt_list.extend([rt] * n_peaks)
+                        mass_list.extend(peak_mzs)
+                        intensity_list.extend(peak_ints)
+                        scan_list.extend([scan_number] * n_peaks)
 
-        # Create DataFrame and save to CSV with specific formatting
-        df = pd.DataFrame(data_rows)
+        # Create DataFrame efficiently
+        df = pd.DataFrame({
+            'rt': rt_list,
+            'mass': mass_list,
+            'intensity': intensity_list,
+            'scan': scan_list
+        })
 
-        # Write with custom float formatting
-        with open(output_csv, 'w') as f:
-            f.write('rt,mass,intensity,scan\n')
-            for _, row in df.iterrows():
-                f.write(f"{row['rt']:.3f},{row['mass']:.4f},{row['intensity']:.0f},{row['scan']}\n")
+        # Fast CSV write
+        df.to_csv(output_csv, index=False, float_format='%.4f')
 
         return f"[✔] {os.path.basename(file_path)} ({len(df)} peaks)"
 
@@ -110,7 +144,7 @@ def process_single_mzxml(args: Tuple[str, str, float]) -> str:
 
 def filter_peaks_by_mass_group_parallel(args: Tuple[str, str, str, List[float], float]) -> Tuple[str, int]:
     """
-    Filter peaks from a raw CSV for a specific group (parallelizable)
+    Filter peaks from a raw CSV for a specific group with Numba acceleration
 
     Args:
         args: Tuple of (raw_csv_path, output_csv_path, group_name, mass_list, mass_tolerance)
@@ -121,47 +155,42 @@ def filter_peaks_by_mass_group_parallel(args: Tuple[str, str, str, List[float], 
     raw_csv_path, output_csv_path, group_name, mass_list, mass_tolerance = args
 
     try:
-        # Check if already exists
         if os.path.exists(output_csv_path):
-            df = pd.read_csv(output_csv_path)
-            return (group_name, len(df))
+            # Quick count without full read
+            with open(output_csv_path, 'r') as f:
+                count = sum(1 for _ in f) - 1
+            return (group_name, count)
 
-        # Read the raw CSV
-        df = pd.read_csv(raw_csv_path)
+        # Read CSV efficiently with specific dtypes
+        df = pd.read_csv(
+            raw_csv_path,
+            dtype={'rt': np.float32, 'mass': np.float32, 'intensity': np.float32, 'scan': np.int32}
+        )
 
         if len(df) == 0:
-            # Create empty file with correct columns
             with open(output_csv_path, 'w') as f:
                 f.write('rt,mass,intensity,scan\n')
             return (group_name, 0)
 
-        # Filter peaks that match any of the target masses - vectorized approach
-        mass_array = df['mass'].values
-        mask = np.zeros(len(mass_array), dtype=bool)
+        # Use Numba for fast filtering
+        mass_array = df['mass'].values.astype(np.float32)
+        target_masses = np.array(mass_list, dtype=np.float32)
 
-        for target_mass in mass_list:
-            mask |= np.abs(mass_array - target_mass) <= mass_tolerance
+        mask = fast_filter_by_masses(mass_array, mass_array, target_masses, mass_tolerance)
 
-        filtered_df = df[mask].copy()
+        filtered_df = df[mask]
 
         if len(filtered_df) > 0:
-            # Sort by retention time, then by mass
-            filtered_df = filtered_df.sort_values(['rt', 'mass']).reset_index(drop=True)
-
-            # Write with custom float formatting
-            with open(output_csv_path, 'w') as f:
-                f.write('rt,mass,intensity,scan\n')
-                for _, row in filtered_df.iterrows():
-                    f.write(f"{row['rt']:.3f},{row['mass']:.4f},{row['intensity']:.0f},{row['scan']}\n")
+            # Sort and save efficiently
+            filtered_df = filtered_df.sort_values(['rt', 'mass'])
+            filtered_df.to_csv(output_csv_path, index=False, float_format='%.4f')
         else:
-            # Create empty file
             with open(output_csv_path, 'w') as f:
                 f.write('rt,mass,intensity,scan\n')
 
         return (group_name, len(filtered_df))
 
     except Exception as e:
-        print(f"Error filtering {os.path.basename(raw_csv_path)} for {group_name}: {e}")
         return (group_name, 0)
 
 
@@ -171,28 +200,25 @@ def process_all_raw_files(noise_level: float = NOISE_LEVEL, n_processes: int = N
 
     Args:
         noise_level: Minimum intensity threshold for peak detection
-        n_processes: Number of parallel processes (default: CPU count - 1)
+        n_processes: Number of parallel processes (default: CPU count - 2 for cooler operation)
     """
-    # Get input file paths from FileUtils
     input_files = FileUtils.get_file_paths()
 
-    # Create output directory in Mass Detection folder
     output_dir = Config.BASE_DIR / Config.OUTPUT_ROOT / Config.ANALYSIS_FOLDER / "Mass Detection"
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Prepare arguments for each file
     args_list = []
     for file_path in input_files:
         base_name = os.path.splitext(os.path.basename(file_path))[0]
         output_csv = output_dir / f"{base_name}_EIC_raw.csv"
         args_list.append((file_path, str(output_csv), noise_level))
 
-    # Determine number of processes
+    # Use fewer processes to reduce heat
     if n_processes is None:
-        n_processes = max(1, cpu_count() - 1)
+        n_processes = max(1, cpu_count() - 2)
 
     print("=" * 70)
-    print("mzXML to CSV Converter - Raw Peak Detection")
+    print("mzXML to CSV Converter - Raw Peak Detection (Numba-Accelerated)")
     print("=" * 70)
     print(f"Processing {len(input_files)} files using {n_processes} processes...")
     print(f"Input directory: {Config.BASE_DIR / Config.INPUT_SUBDIR}")
@@ -200,18 +226,15 @@ def process_all_raw_files(noise_level: float = NOISE_LEVEL, n_processes: int = N
 
     start_time = time.time()
 
-    # Process files in parallel
     with Pool(processes=n_processes) as pool:
         results = pool.map(process_single_mzxml, args_list)
 
     elapsed_time = time.time() - start_time
 
-    # Print results
     print("\nRaw Processing Results:")
     for result in results:
         print(result)
 
-    # Summary statistics
     successful = sum(1 for r in results if r.startswith("[✔]"))
     cached = sum(1 for r in results if r.startswith("[↷]"))
     failed = sum(1 for r in results if r.startswith("[!]"))
@@ -227,48 +250,38 @@ def process_all_raw_files(noise_level: float = NOISE_LEVEL, n_processes: int = N
 
 def create_all_group_filtered_csvs(n_processes: int = None):
     """
-    Create filtered CSV files for all mass groups from raw data (PARALLELIZED)
+    Create filtered CSV files for all mass groups from raw data with Numba acceleration
 
     Args:
-        n_processes: Number of parallel processes (default: CPU count - 1)
+        n_processes: Number of parallel processes (default: CPU count - 2)
     """
     print("\n" + "=" * 70)
-    print("Creating Filtered CSVs for All Mass Groups (Parallel)")
+    print("Creating Filtered CSVs for All Mass Groups (Numba-Accelerated)")
     print("=" * 70)
 
-    # Get the raw data directory (Mass Detection)
     raw_dir = Config.BASE_DIR / Config.OUTPUT_ROOT / Config.ANALYSIS_FOLDER / "Mass Detection"
-
-    # Find all raw CSV files
     raw_csv_files = list(raw_dir.glob("*_EIC_raw.csv"))
 
     if not raw_csv_files:
         print(f"No raw CSV files found in {raw_dir}")
         return
 
-    # Get mass tolerance
     mass_tolerance = Config.MASS_TOLERANCE
 
-    # Determine number of processes
+    # Use fewer processes to reduce heat
     if n_processes is None:
-        n_processes = max(1, cpu_count() - 1)
+        n_processes = max(1, cpu_count() - 2)
 
-    # Prepare all filtering tasks
     filtering_args = []
 
     for group_name in Config.MASS_GROUPS.keys():
-        # Set the current group in Config
         Config.set_mass_group(group_name)
-
-        # Get the mass list for this group
         mass_list = Config.MASS_GROUPS[group_name]
 
-        # Get the output directory for this group
         group_output_dir = Config.BASE_DIR / Config.OUTPUT_ROOT / Config.ANALYSIS_FOLDER / str(
             Config.CURRENT_GROUP) / "EIC CSVs"
         group_output_dir.mkdir(parents=True, exist_ok=True)
 
-        # Add tasks for each file in this group
         for raw_csv in raw_csv_files:
             base_name = raw_csv.stem.replace("_EIC_raw", "")
             filtered_csv = group_output_dir / f"{base_name}_peaks_{group_name}.csv"
@@ -287,13 +300,11 @@ def create_all_group_filtered_csvs(n_processes: int = None):
 
     start_time = time.time()
 
-    # Process all filtering tasks in parallel
     with Pool(processes=n_processes) as pool:
         results = pool.map(filter_peaks_by_mass_group_parallel, filtering_args)
 
     elapsed_time = time.time() - start_time
 
-    # Organize results by group
     group_stats = {}
     for group_name, num_peaks in results:
         if group_name not in group_stats:
@@ -301,7 +312,6 @@ def create_all_group_filtered_csvs(n_processes: int = None):
         group_stats[group_name]['files'] += 1
         group_stats[group_name]['total_peaks'] += num_peaks
 
-    # Print summary for each group
     print("\nFiltering Results:")
     for group_name in Config.MASS_GROUPS.keys():
         if group_name in group_stats:
@@ -319,14 +329,11 @@ def process_all_groups(noise_level: float = NOISE_LEVEL, n_processes: int = None
 
     Args:
         noise_level: Minimum intensity threshold for peak detection
-        n_processes: Number of parallel processes (default: CPU count - 1)
+        n_processes: Number of parallel processes (default: CPU count - 2)
     """
     total_start_time = time.time()
 
-    # Step 1: Process all raw files (only once)
     process_all_raw_files(noise_level=noise_level, n_processes=n_processes)
-
-    # Step 2: Create filtered CSVs for all groups (PARALLELIZED)
     create_all_group_filtered_csvs(n_processes=n_processes)
 
     total_elapsed = time.time() - total_start_time
@@ -383,13 +390,11 @@ def analyze_results_for_group(group_name: str):
 
 
 if __name__ == "__main__":
-    # Process all files once and create filtered CSVs for all groups
     process_all_groups(
         noise_level=NOISE_LEVEL,
-        n_processes=None  # Auto-detect CPU cores
+        n_processes=None
     )
 
-    # Analyze results for each group
     print("\n" + "=" * 70)
     print("GROUP STATISTICS")
     print("=" * 70)
