@@ -1,20 +1,3 @@
-"""
-PixelMapping.py
-
-PURE IMAGE-ONLY pixel bounds per m/z.
-
-This works because EICBuilder.py now draws each m/z trace in a unique color.
-We detect each trace by its RGB color (with tolerance) + alpha > 0.
-
-Outputs:
-{File}_pixelmapping_{Group}.csv
-
-Columns:
-File Name, m/z, Pixel_start, Pixel_end
-"""
-
-from __future__ import annotations
-
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 
@@ -60,38 +43,94 @@ def generate_mass_colors(mass_list: List[float]) -> Dict[str, str]:
     return colors
 
 
-def find_bounds_for_color(
+def boolean_runs_to_segments(col_has: np.ndarray) -> List[Tuple[int, int]]:
+    """
+    Convert a boolean array into contiguous (start, end) segments where True.
+    """
+    segments: List[Tuple[int, int]] = []
+    w = col_has.shape[0]
+    in_run = False
+    start = 0
+
+    for x in range(w):
+        if col_has[x] and not in_run:
+            in_run = True
+            start = x
+        elif (not col_has[x]) and in_run:
+            in_run = False
+            end = x - 1
+            segments.append((start, end))
+
+    if in_run:
+        segments.append((start, w - 1))
+
+    return segments
+
+
+def merge_close_segments(segments: List[Tuple[int, int]], max_gap_px: int = 2) -> List[Tuple[int, int]]:
+    """
+    Merge segments that are separated by small gaps (anti-aliasing / tiny breaks).
+    Example: (100,120) and (123,140) with max_gap_px=2 => merge into (100,140) because gap=2.
+    """
+    if not segments:
+        return []
+
+    segments = sorted(segments, key=lambda t: t[0])
+    merged = [segments[0]]
+
+    for s, e in segments[1:]:
+        ps, pe = merged[-1]
+        gap = s - pe - 1
+        if gap <= max_gap_px:
+            merged[-1] = (ps, max(pe, e))
+        else:
+            merged.append((s, e))
+
+    return merged
+
+
+def filter_short_segments(segments: List[Tuple[int, int]], min_width_px: int = 3) -> List[Tuple[int, int]]:
+    """
+    Drop tiny segments (noise).
+    width = end-start+1 must be >= min_width_px
+    """
+    out = []
+    for s, e in segments:
+        if (e - s + 1) >= min_width_px:
+            out.append((s, e))
+    return out
+
+
+def find_segments_for_color(
     rgba: np.ndarray,
     target_rgb: Tuple[int, int, int],
     alpha_threshold: int = 1,
     rgb_tolerance: int = 40,
-) -> Optional[Tuple[int, int]]:
+    max_gap_px: int = 2,
+    min_width_px: int = 3,
+) -> List[Tuple[int, int]]:
     """
-    Returns (pixel_start, pixel_end) for pixels matching target_rgb.
+    Return a list of (Pixel_start, Pixel_end) segments for pixels matching target_rgb.
     Uses alpha to ignore transparent background and tolerance to survive anti-aliasing.
+    Produces multiple segments (for multiple peaks/isomers).
     """
-    # rgba shape: (H, W, 4)
-    rgb = rgba[:, :, :3].astype(np.int16)  # avoid overflow
+    rgb = rgba[:, :, :3].astype(np.int16)
     alpha = rgba[:, :, 3].astype(np.int16)
 
     tr, tg, tb = target_rgb
 
-    # only consider drawn pixels (alpha > threshold)
     drawn = alpha >= alpha_threshold
-
-    # color distance (L1) to tolerate anti-aliasing
     dist = np.abs(rgb[:, :, 0] - tr) + np.abs(rgb[:, :, 1] - tg) + np.abs(rgb[:, :, 2] - tb)
-
-    # match mask
     mask = drawn & (dist <= rgb_tolerance)
 
-    # per-column presence
     col_has = mask.any(axis=0)
     if not col_has.any():
-        return None
+        return []
 
-    xs = np.where(col_has)[0]
-    return int(xs.min()), int(xs.max())
+    segments = boolean_runs_to_segments(col_has)
+    segments = merge_close_segments(segments, max_gap_px=max_gap_px)
+    segments = filter_short_segments(segments, min_width_px=min_width_px)
+    return segments
 
 
 def run_for_group(group_name: str) -> None:
@@ -111,14 +150,17 @@ def run_for_group(group_name: str) -> None:
     mass_strs = [f"{m:.4f}" for m in mass_list]
     mass_colors = generate_mass_colors(mass_list)
 
+    # You can tweak these if needed:
+    RGB_TOL = 50       # 40-70 if needed
+    MAX_GAP = 3        # merge tiny breaks
+    MIN_WIDTH = 4      # drop tiny noise segments
+
     for png_path in pngs:
-        # Extract base from "EIC_{base}_plotly.png"
         stem = png_path.stem  # EIC_xxx_plotly
         if not (stem.startswith("EIC_") and stem.endswith("_plotly")):
             continue
         base = stem[len("EIC_"):-len("_plotly")]
 
-        # Read image
         with Image.open(png_path) as im:
             im = im.convert("RGBA")
             rgba = np.array(im)
@@ -128,28 +170,32 @@ def run_for_group(group_name: str) -> None:
             color_hex = mass_colors[mz_str]
             rgb = hex_to_rgb(color_hex)
 
-            bounds = find_bounds_for_color(
+            segments = find_segments_for_color(
                 rgba,
                 target_rgb=rgb,
                 alpha_threshold=1,
-                rgb_tolerance=40,   # you can tweak this if needed (30-60 range)
+                rgb_tolerance=RGB_TOL,
+                max_gap_px=MAX_GAP,
+                min_width_px=MIN_WIDTH,
             )
 
-            if bounds is None:
-                # No pixels found for this mass in this file
-                continue
-
-            px_start, px_end = bounds
-            rows.append({
-                "File Name": base,
-                "m/z": mz_str,
-                "Pixel_start": int(px_start),
-                "Pixel_end": int(px_end),
-            })
+            # Write one row per segment (for isomers / multiple peaks)
+            for seg_id, (px_start, px_end) in enumerate(segments, start=1):
+                rows.append({
+                    "File Name": base,
+                    "m/z": mz_str,
+                    "Segment_ID": int(seg_id),
+                    "Pixel_start": int(px_start),
+                    "Pixel_end": int(px_end),
+                })
 
         out_path = out_dir / f"{base}_pixelmapping_{group_name}.csv"
-        pd.DataFrame(rows, columns=["File Name", "m/z", "Pixel_start", "Pixel_end"]).to_csv(out_path, index=False)
-        print(f"[✔] {out_path.name} ({len(rows)} masses found)")
+        pd.DataFrame(
+            rows,
+            columns=["File Name", "m/z", "Segment_ID", "Pixel_start", "Pixel_end"]
+        ).to_csv(out_path, index=False)
+
+        print(f"[✔] {out_path.name} ({len(rows)} segments)")
 
 
 if __name__ == "__main__":

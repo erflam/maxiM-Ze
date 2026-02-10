@@ -17,7 +17,7 @@ from Config import Config
 from FileUtils import FileUtils
 import FileReader
 import EICBuilder
-
+import PixelMapping
 
 class Pipeline:
     """Main pipeline orchestrator for MS analysis"""
@@ -121,6 +121,25 @@ class Pipeline:
 
         print(f"\n[✔] Checkpoint 2 completed in {self.format_time(checkpoint_elapsed)}")
 
+    def run_checkpoint_3_pixel_mapping(self):
+        """
+        Checkpoint 3: Pixel mapping from EIC PNGs (pure image-only, per m/z)
+        Produces: {File}_pixelmapping_{Group}.csv
+        """
+        print("\n" + "=" * 80)
+        print("CHECKPOINT 3: PIXEL MAPPING (IMAGE ONLY)")
+        print("=" * 80)
+
+        checkpoint_start = time.time()
+
+        for group_name in Config.MASS_GROUPS.keys():
+            PixelMapping.run_for_group(group_name)
+
+        checkpoint_elapsed = time.time() - checkpoint_start
+        self.checkpoint_times['Checkpoint 3: Pixel Mapping'] = checkpoint_elapsed
+
+        print(f"\n[✔] Checkpoint 3 completed in {self.format_time(checkpoint_elapsed)}")
+
     def run_full_pipeline(
             self,
             noise_level: float = 5000.0,
@@ -138,7 +157,7 @@ class Pipeline:
         self.start_time = time.time()
 
         if checkpoints is None:
-            checkpoints = [1, 2]  # Run all checkpoints by default
+            checkpoints = [1, 2, 3]  # Run all checkpoints by default
 
         print("\n" + "=" * 80)
         print("MASS SPECTROMETRY ANALYSIS PIPELINE")
@@ -160,6 +179,9 @@ class Pipeline:
         # Checkpoint 2: EIC Building
         if 2 in checkpoints:
             self.run_checkpoint_2_eic_building(n_processes=n_processes)
+
+        if 3 in checkpoints:
+            self.run_checkpoint_3_pixel_mapping()
 
         # Print final summary
         self.print_summary()
@@ -202,6 +224,7 @@ class Pipeline:
             print(f"\n  {group_name}:")
             print(f"    Filtered CSVs: {group_dir / 'EIC CSVs'}")
             print(f"    EIC Images: {group_dir / 'EIC PNGs'}")
+            print(f"    Pixel Mapping CSVs: {group_dir / 'Pixel CSVs'}")
 
         print("\n" + "=" * 80)
 
@@ -216,7 +239,7 @@ def main():
     pipeline.run_full_pipeline(
         noise_level=5000.0,
         n_processes=None,  # Auto-detect CPU cores
-        checkpoints=[1, 2]  # Run all checkpoints
+        checkpoints=[1, 2, 3]  # Run all checkpoints
     )
 
     # ========================================
