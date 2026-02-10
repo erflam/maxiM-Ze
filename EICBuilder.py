@@ -1,7 +1,8 @@
 """
 EICBuilder.py
 Builds PNG images of Extracted Ion Chromatograms (EICs) for specific masses
-with peak detection and debug visualizations.
+with peak detection.
+Reads from pre-filtered CSV files for efficiency.
 """
 
 import os
@@ -11,21 +12,19 @@ from pathlib import Path
 from typing import List, Dict, Tuple
 from scipy.integrate import trapezoid
 from scipy.signal import find_peaks, peak_widths, savgol_filter, argrelextrema
+from scipy.ndimage import gaussian_filter1d
 import plotly.io as pio
 import plotly.graph_objects as go
-import matplotlib.pyplot as plt
 from PIL import Image
 from multiprocessing import Pool, cpu_count
+import colorsys
 
 from Config import Config
 from FileUtils import FileUtils
-from MSFileAnalyzer import MSFileAnalyzer
-from improved_peak_cutting import improved_peak_cutting
-
 
 # Peak detection parameters
-REL_HEIGHT_BY_MASS = {104.1069: 0.985, 187.0964: 0.985, 119.0896: 0.98}
-DEFAULT_REL_HEIGHT = 0.99
+DEFAULT_REL_HEIGHT = 0.98
+MAX_PEAK_DURATION = 1.5
 
 # Shoulder detection parameters
 SHOULDER_MIN_HEIGHT_FRAC = 0.02
@@ -43,6 +42,240 @@ def init_worker():
     os.environ['PLOTLY_RENDERER'] = 'json'
 
 
+def improved_peak_cutting(intensity_vals_smooth, rt_vals, peaks, width_results, specific_mass):
+    """
+    Improved peak cutting algorithm to split overlapping peaks
+
+    Args:
+        intensity_vals_smooth: Smoothed intensity values
+        rt_vals: Retention time values
+        peaks: Initial peak indices
+        width_results: Peak width results from scipy
+        specific_mass: Mass being analyzed
+
+    Returns:
+        tuple: (new_peaks, new_width_results)
+    """
+
+    MIN_APEX_SEP_MIN = 0.015
+    MAX_SEG_WIDTH_MIN = 0.8
+    MIN_SEG_WIDTH_MIN = 0.015
+
+    all_minima = set()
+    for sigma in [0.5, 1.0, 2.0]:
+        smoothed = gaussian_filter1d(intensity_vals_smooth, sigma=sigma)
+        for order in [2, 3]:
+            minima = argrelextrema(smoothed, np.less, order=order)[0]
+            all_minima.update(minima)
+
+    second_deriv = np.gradient(np.gradient(intensity_vals_smooth))
+    inflection_valleys = np.where((second_deriv[:-2] < 0) & (second_deriv[2:] > 0))[0] + 1
+    all_minima.update(inflection_valleys)
+
+    all_minima = np.array(sorted(all_minima))
+
+    if len(all_minima) == 0:
+        return peaks, width_results
+
+    rt_delta = float(np.mean(np.diff(rt_vals))) if len(rt_vals) > 1 else 0.0
+
+    def seg_time_ok(l_i, r_i):
+        if rt_delta <= 0:
+            return True
+        wmin = (r_i - l_i) * rt_delta
+        return MIN_SEG_WIDTH_MIN <= wmin <= MAX_SEG_WIDTH_MIN
+
+    def calculate_peak_quality(apex_idx, left_idx, right_idx):
+        """Calculate peak quality metrics for better selection"""
+        if right_idx <= left_idx or apex_idx < left_idx or apex_idx > right_idx:
+            return 0.0
+
+        segment = intensity_vals_smooth[left_idx:right_idx + 1]
+        apex_val = intensity_vals_smooth[apex_idx]
+
+        left_min = np.min(segment[:apex_idx - left_idx + 1]) if apex_idx > left_idx else apex_val
+        right_min = np.min(segment[apex_idx - left_idx:]) if apex_idx < right_idx else apex_val
+        prominence = apex_val - max(left_min, right_min)
+
+        left_wing = segment[:apex_idx - left_idx]
+        right_wing = segment[apex_idx - left_idx + 1:]
+        min_len = min(len(left_wing), len(right_wing))
+        if min_len > 0:
+            symmetry = np.corrcoef(left_wing[-min_len:], right_wing[:min_len][::-1])[0, 1]
+            symmetry = max(0, symmetry)
+        else:
+            symmetry = 0
+
+        return prominence * (1 + 0.3 * symmetry)
+
+    rel_height_split = 0.85
+    try:
+        width_results_split = peak_widths(intensity_vals_smooth, peaks, rel_height=rel_height_split)
+        valid_split = width_results_split[0] > 0
+    except:
+        valid_split = np.zeros(len(peaks), dtype=bool)
+        width_results_split = (np.zeros(len(peaks)), np.zeros(len(peaks)),
+                               np.zeros(len(peaks)), np.zeros(len(peaks)))
+
+    new_peaks = []
+
+    for i_pk, pk in enumerate(peaks):
+        # Determine search window
+        if valid_split[i_pk]:
+            left_ip, right_ip = width_results_split[2][i_pk], width_results_split[3][i_pk]
+        else:
+            left_ip, right_ip = width_results[2][i_pk], width_results[3][i_pk]
+
+        left_idx = max(0, int(np.floor(left_ip)))
+        right_idx = min(len(intensity_vals_smooth) - 1, int(np.ceil(right_ip)))
+
+        # Find valleys within the search window
+        internal_valleys = [v for v in all_minima if left_idx < v < right_idx]
+
+        if not internal_valleys:
+            new_peaks.append(pk)
+            continue
+
+        significant_valleys = []
+        peak_intensity = intensity_vals_smooth[pk]
+
+        for valley in internal_valleys:
+            valley_intensity = intensity_vals_smooth[valley]
+
+            local_window = slice(max(0, valley - 3), min(len(intensity_vals_smooth), valley + 4))
+            local_max = np.max(intensity_vals_smooth[local_window])
+
+            left_peak_h = np.max(intensity_vals_smooth[left_idx:valley + 1])
+            right_peak_h = np.max(intensity_vals_smooth[valley:right_idx + 1])
+            ratio = min(left_peak_h, right_peak_h) / max(left_peak_h, right_peak_h)
+            adaptive_threshold = 0.6 + (0.3 * ratio)
+
+            if valley_intensity <= adaptive_threshold * local_max:
+                valley_rt = rt_vals[valley]
+                peak_rt = rt_vals[pk]
+                if abs(valley_rt - peak_rt) >= MIN_APEX_SEP_MIN / 2:
+                    significant_valleys.append(valley)
+
+        if not significant_valleys:
+            new_peaks.append(pk)
+            continue
+
+        seg_starts = [left_idx] + significant_valleys
+        seg_ends = significant_valleys + [right_idx]
+
+        candidate_peaks = []
+
+        for seg_l, seg_r in zip(seg_starts, seg_ends):
+            if seg_r - seg_l < 3 or not seg_time_ok(seg_l, seg_r):
+                continue
+
+            local_segment = intensity_vals_smooth[seg_l:seg_r + 1]
+            local_apex_offset = np.argmax(local_segment)
+            apex_idx = seg_l + local_apex_offset
+
+            quality = calculate_peak_quality(apex_idx, seg_l, seg_r)
+
+            if quality > peak_intensity * 0.1:
+                candidate_peaks.append((apex_idx, quality, seg_l, seg_r))
+
+        if len(candidate_peaks) >= 2:
+            candidate_peaks.sort(key=lambda x: x[1], reverse=True)
+
+            selected_peaks = [candidate_peaks[0]]
+            for candidate in candidate_peaks[1:]:
+                apex_idx, quality, seg_l, seg_r = candidate
+
+                min_sep = min(abs(rt_vals[apex_idx] - rt_vals[selected[0]])
+                              for selected in selected_peaks)
+
+                if min_sep >= MIN_APEX_SEP_MIN:
+                    selected_peaks.append(candidate)
+
+            for apex_idx, _, _, _ in selected_peaks:
+                new_peaks.append(apex_idx)
+
+        elif len(candidate_peaks) == 1:
+            new_peaks.append(candidate_peaks[0][0])
+        else:
+            deepest_valley = significant_valleys[np.argmin(intensity_vals_smooth[significant_valleys])]
+
+            if deepest_valley - left_idx >= 3:
+                left_segment = intensity_vals_smooth[left_idx:deepest_valley + 1]
+                left_apex = left_idx + np.argmax(left_segment)
+                if calculate_peak_quality(left_apex, left_idx, deepest_valley) > peak_intensity * 0.05:
+                    new_peaks.append(left_apex)
+
+            if right_idx - deepest_valley >= 3:
+                right_segment = intensity_vals_smooth[deepest_valley:right_idx + 1]
+                right_apex = deepest_valley + np.argmax(right_segment)
+                if calculate_peak_quality(right_apex, deepest_valley, right_idx) > peak_intensity * 0.05:
+                    new_peaks.append(right_apex)
+
+            if not any(abs(rt_vals[p] - rt_vals[pk]) < MIN_APEX_SEP_MIN * 2 for p in new_peaks[-2:]):
+                new_peaks.append(pk)
+
+    if new_peaks:
+        new_peaks = np.unique(np.array(new_peaks, dtype=int))
+
+        try:
+            new_width_results = peak_widths(intensity_vals_smooth, new_peaks, rel_height=0.99)
+
+            valid_mask = new_width_results[0] > 0
+            new_peaks = new_peaks[valid_mask]
+            new_width_results = tuple(arr[valid_mask] for arr in new_width_results)
+
+            return new_peaks, new_width_results
+
+        except Exception as e:
+            print(f"Error recalculating widths: {e}")
+            return peaks, width_results
+
+    return peaks, width_results
+
+
+def reconstruct_intensity_profile_from_csv(csv_path: str, mass_list: List[float]) -> Tuple[
+    np.ndarray, Dict[float, np.ndarray]]:
+    """
+    Reconstruct intensity profiles for each mass from the filtered CSV
+
+    Args:
+        csv_path: Path to the filtered peaks CSV file
+        mass_list: List of target masses
+
+    Returns:
+        Tuple of (rt_values array, dict mapping mass to intensity array)
+    """
+    # Read CSV
+    df = pd.read_csv(csv_path)
+
+    if len(df) == 0:
+        return np.array([]), {}
+
+    # Get unique retention times and sort them
+    unique_rts = np.sort(df['rt'].unique())
+
+    # Initialize intensity arrays for each mass
+    intensity_by_mass = {mass: np.zeros(len(unique_rts)) for mass in mass_list}
+
+    # Create RT index mapping
+    rt_to_idx = {rt: idx for idx, rt in enumerate(unique_rts)}
+
+    # Fill in intensities
+    for _, row in df.iterrows():
+        rt = row['rt']
+        mass = row['mass']
+        intensity = row['intensity']
+
+        # Find which target mass this belongs to
+        for target_mass in mass_list:
+            if abs(mass - target_mass) <= Config.MASS_TOLERANCE:
+                rt_idx = rt_to_idx[rt]
+                intensity_by_mass[target_mass][rt_idx] += intensity
+                break
+
+    return unique_rts, intensity_by_mass
+
+
 def split_shoulders_in_window(
         rt_vals: np.ndarray,
         intensity_raw: np.ndarray,
@@ -55,7 +288,7 @@ def split_shoulders_in_window(
 ) -> List[Dict]:
     """
     Detect and split shoulder peaks within a peak window
-    
+
     Args:
         rt_vals: Retention time array
         intensity_raw: Raw intensity values
@@ -65,7 +298,7 @@ def split_shoulders_in_window(
         noise_level: Noise threshold
         mass_str: Mass as string
         base_name: File base name
-        
+
     Returns:
         List of peak dictionaries
     """
@@ -221,200 +454,63 @@ def split_shoulders_in_window(
     ]
 
 
-def generate_debug_plot(
-        base_name: str,
-        all_mass_debug_data: List[Dict],
-        output_image_path: str,
-        debug_dir: Path
-) -> None:
-    """
-    Generate debug plot showing peak detection for all masses combined
-    
-    Args:
-        base_name: File base name
-        all_mass_debug_data: Debug data for all masses
-        output_image_path: Path to main EIC image
-        debug_dir: Directory for debug plots
-    """
-    if not all_mass_debug_data or not any(
-            len(d['detected_peaks']) > 0 or len(d['rejected_peaks']) > 0 
-            for d in all_mass_debug_data):
-        return
-
-    fig_debug, axes = plt.subplots(2, 1, figsize=(20, 12), sharex=False)
-    fig_debug.suptitle(f'{base_name} - Peak Detection Debug', fontsize=16, fontweight='bold', y=0.995)
-
-    # Panel 0: EIC PNG Image at the top
-    axes[0].axis('off')
-    if os.path.exists(output_image_path):
-        try:
-            img = plt.imread(output_image_path)
-            axes[0].imshow(img, aspect='auto')
-        except Exception as e:
-            axes[0].text(0.5, 0.5, f'Could not load EIC image',
-                         ha='center', va='center', transform=axes[0].transAxes)
-    else:
-        axes[0].text(0.5, 0.5, 'EIC image not yet generated',
-                     ha='center', va='center', transform=axes[0].transAxes)
-
-    # Panel 1: Combined trace with all masses
-    ax = axes[1]
-
-    # Combine all masses into single trace
-    all_rt = all_mass_debug_data[0]['rt']
-    combined_raw = np.zeros_like(all_rt, dtype=float)
-    combined_smooth = np.zeros_like(all_rt, dtype=float)
-
-    for debug_data in all_mass_debug_data:
-        combined_raw += debug_data['raw']
-        combined_smooth += debug_data['smooth']
-
-    # Normalize to 0-1
-    max_val = max(combined_raw.max(), combined_smooth.max())
-    if max_val > 0:
-        raw_norm = combined_raw / max_val
-        smooth_norm = combined_smooth / max_val
-    else:
-        raw_norm = combined_raw
-        smooth_norm = combined_smooth
-
-    # Plot combined profiles
-    ax.plot(all_rt, raw_norm, color='lightblue', linewidth=1.5, label='Raw profile', alpha=0.7)
-    ax.plot(all_rt, smooth_norm, color='blue', linewidth=2, label='Smoothed profile')
-
-    # Collect all peaks from all masses
-    all_detected = []
-    all_rejected = []
-    all_final = []
-
-    for debug_data in all_mass_debug_data:
-        all_detected.extend(debug_data['detected_peaks'])
-        all_rejected.extend(debug_data['rejected_peaks'])
-        all_final.extend(debug_data['final_peaks'])
-
-    # Green shaded regions for detected peaks
-    for peak in all_detected:
-        ax.axvspan(all_rt[peak['left']], all_rt[peak['right']], alpha=0.15, color='green')
-
-    # Red dots at detected peak apexes
-    for i, peak in enumerate(all_detected):
-        peak_height_norm = smooth_norm[peak['idx']]
-        ax.plot(all_rt[peak['idx']], peak_height_norm, 'ro', markersize=10,
-                markeredgecolor='darkred', markeredgewidth=1.5,
-                label='Detected peaks' if i == 0 else '')
-
-    # Red shaded regions for rejected peaks with reasons
-    for peak in all_rejected:
-        ax.axvspan(all_rt[peak['left']], all_rt[peak['right']], alpha=0.15, color='red')
-        mid_rt = (all_rt[peak['left']] + all_rt[peak['right']]) / 2
-        peak_height_norm = smooth_norm[peak['idx']]
-        ax.text(mid_rt, peak_height_norm * 1.15, peak['reason'],
-                fontsize=7, ha='center', color='red', rotation=0,
-                bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.8, edgecolor='red'))
-
-    # Dark green fill for final kept peaks
-    for peak in all_final:
-        x_region = all_rt[peak['left']:peak['right'] + 1]
-        y_region = raw_norm[peak['left']:peak['right'] + 1]
-        ax.fill_between(x_region, 0, y_region, alpha=0.3, color='darkgreen')
-
-    ax.set_ylabel('Intensity (normalized)', fontsize=11)
-    ax.set_xlabel('Retention Time (min)', fontsize=11)
-    ax.set_title(f'Intensity Profile Analysis - All Masses Combined | '
-                 f'Detected: {len(all_detected)}, '
-                 f'Rejected: {len(all_rejected)}, '
-                 f'Kept: {len(all_final)}',
-                 fontsize=12, pad=10)
-    ax.set_ylim(-0.05, 1.15)
-    ax.grid(True, alpha=0.3, linestyle='--', linewidth=0.5)
-
-    # Remove duplicate labels in legend
-    handles, labels = ax.get_legend_handles_labels()
-    by_label = dict(zip(labels, handles))
-    ax.legend(by_label.values(), by_label.keys(), loc='upper right', fontsize=10, framealpha=0.9)
-
-    plt.tight_layout()
-    debug_path = debug_dir / f'{base_name}_debug.png'
-    plt.savefig(debug_path, dpi=150, bbox_inches='tight')
-    plt.close()
-    print(f"[DEBUG] Saved: {debug_path}")
-
-
-def analyze_ms_file_and_generate_eic(
-        file_path: str,
+def analyze_csv_and_generate_eic(
+        csv_path: str,
         output_image_path: str,
         file_colors: Dict[str, str],
         group_name: str
 ) -> List[Dict]:
     """
-    Analyze MS file and generate EIC visualization with peak detection
-    
+    Analyze filtered CSV and generate EIC visualization with peak detection
+
     Args:
-        file_path: Path to mzXML file
+        csv_path: Path to filtered peaks CSV
         output_image_path: Path to save PNG
         file_colors: Dictionary mapping file names to colors
         group_name: Mass group name
-        
+
     Returns:
         List of detected peak dictionaries
     """
     # Set current group
     Config.set_mass_group(group_name)
-    
-    # Skip if output already exists
-    base = os.path.splitext(os.path.basename(file_path))[0]
-    if os.path.exists(output_image_path):
-        # Try to load existing peaks
-        peaks_csv = Path(output_image_path).parent.parent / 'EIC CSVs' / f"{base}_peaks_{group_name}.csv"
-        if peaks_csv.exists():
-            try:
-                return pd.read_csv(peaks_csv).to_dict('records')
-            except:
-                pass
 
-    analyzer = MSFileAnalyzer(file_path)
+    # Convert to Path for easier manipulation
+    csv_path = Path(csv_path) if isinstance(csv_path, str) else csv_path
+    output_image_path = Path(output_image_path) if isinstance(output_image_path, str) else output_image_path
+
+    # Get base name
+    base = csv_path.stem.replace(f"_peaks_{group_name}", "")
+
+    # Skip if output already exists
+    if output_image_path.exists():
+        return []
+
     mass_list = list(Config.MASS_LIST)
     mass_list_str = [f"{m:.4f}" for m in mass_list]
 
-    # Setup debug directory
-    dirs = Config.setup_directories()
-    debug_dir = dirs['debugpng']
+    # Reconstruct intensity profiles from CSV (pass as string)
+    rt_values, intensity_by_mass = reconstruct_intensity_profile_from_csv(str(csv_path), mass_list)
 
-    # Extract intensity data for each mass
-    rt_values = []
-    intensity_by_mass = {mass: [] for mass in mass_list}
-
-    with analyzer.get_reader() as reader:
-        for scan in reader:
-            try:
-                rt = analyzer.get_retention_time(scan)
-                mzs = np.asarray(scan['m/z array'], dtype=np.float32)
-                ints = np.asarray(scan['intensity array'], dtype=np.float32)
-                
-                for mass in mass_list:
-                    mask = np.abs(np.round(mzs, 4) - mass) <= Config.MASS_TOLERANCE
-                    intensity = np.sum(ints[mask]) if np.any(mask) else 0.0
-                    intensity_by_mass[mass].append(intensity)
-                    
-                rt_values.append(rt)
-            except (KeyError, Exception) as e:
-                continue
+    if len(rt_values) == 0:
+        print(f"[!] No data in {base}")
+        return []
 
     # Create plotly figure
     fig = go.Figure()
     color = file_colors.get(base, '#1f77b4')
     peaks_out = []
     all_peak_rts = []
-    all_mass_debug_data = []
 
     # Process each mass
     for mass_idx, specific_mass in enumerate(mass_list):
-        intensity_vals = np.array(intensity_by_mass[specific_mass])
+        intensity_vals = intensity_by_mass[specific_mass]
+
         if len(intensity_vals) < 3 or np.max(intensity_vals) == 0:
             continue
 
-        rt_vals = np.array(rt_values)
-        
+        rt_vals = rt_values
+
         # Smooth the data
         window_length = min(7, len(intensity_vals))
         if window_length % 2 == 0:
@@ -432,21 +528,6 @@ def analyze_ms_file_and_generate_eic(
         max_intensity = np.max(intensity_vals_smooth)
         min_height = max(max_intensity * 0.04, noise_level * 3)
 
-        # Create debug data structure
-        debug_data = {
-            'mass': specific_mass,
-            'mass_str': mass_list_str[mass_idx],
-            'rt': rt_vals,
-            'raw': intensity_vals,
-            'smooth': intensity_vals_smooth,
-            'noise': noise_level,
-            'min_height': min_height,
-            'detected_peaks': [],
-            'rejected_peaks': [],
-            'final_peaks': []
-        }
-        all_mass_debug_data.append(debug_data)
-
         # Find peaks
         try:
             peaks, properties = find_peaks(
@@ -454,13 +535,12 @@ def analyze_ms_file_and_generate_eic(
                 height=min_height,
                 distance=1
             )
-            
+
             if len(peaks) == 0:
                 continue
 
-            # Calculate peak widths
-            rel_height = REL_HEIGHT_BY_MASS.get(round(float(specific_mass), 4), DEFAULT_REL_HEIGHT)
-            width_results = peak_widths(intensity_vals_smooth, peaks, rel_height=rel_height)
+            # Calculate peak widths using DEFAULT_REL_HEIGHT
+            width_results = peak_widths(intensity_vals_smooth, peaks, rel_height=DEFAULT_REL_HEIGHT)
 
             # Filter valid widths
             valid_width_mask = width_results[0] > 0
@@ -469,17 +549,6 @@ def analyze_ms_file_and_generate_eic(
 
             if len(peaks) == 0:
                 continue
-
-            # Record detected peaks
-            for i, idx in enumerate(peaks):
-                left_idx = max(0, int(np.floor(width_results[2][i])))
-                right_idx = min(len(rt_vals) - 1, int(np.ceil(width_results[3][i])))
-                debug_data['detected_peaks'].append({
-                    'idx': idx,
-                    'left': left_idx,
-                    'right': right_idx,
-                    'height': intensity_vals_smooth[idx]
-                })
 
             # Apply improved peak cutting
             try:
@@ -512,19 +581,11 @@ def analyze_ms_file_and_generate_eic(
                         trunc_idx = valid_idxs[valid_idxs >= left_idx].max()
                         right_idx = int(trunc_idx)
                     else:
-                        debug_data['rejected_peaks'].append({
-                            'idx': idx, 'left': left_idx, 'right': right_idx,
-                            'reason': f'Duration {duration:.3f} > {Config.MAX_PEAK_DURATION}'
-                        })
                         continue
                     rt_end = rt_vals[right_idx]
                     duration = rt_end - rt_start
 
                 if not (0.03 <= duration <= 0.75):
-                    debug_data['rejected_peaks'].append({
-                        'idx': idx, 'left': left_idx, 'right': right_idx,
-                        'reason': f'Duration {duration:.3f} outside 0.03-0.75'
-                    })
                     continue
 
                 x_peak = rt_vals[left_idx:right_idx + 1]
@@ -566,13 +627,6 @@ def analyze_ms_file_and_generate_eic(
                 )
                 peaks_out.extend(new_records)
 
-                # Record final peak
-                debug_data['final_peaks'].append({
-                    'left': left_idx,
-                    'right': right_idx,
-                    'apex': left_idx + np.argmax(intensity_vals[left_idx:right_idx + 1])
-                })
-
                 # Add to plot
                 fig.add_trace(go.Scatter(
                     x=x_peak, y=y_peak,
@@ -585,9 +639,6 @@ def analyze_ms_file_and_generate_eic(
             except Exception as e:
                 print(f"Error processing peak {i} for mass {mass_list_str[mass_idx]}: {str(e)}")
                 continue
-
-    # Generate debug plot
-    generate_debug_plot(base, all_mass_debug_data, output_image_path, debug_dir)
 
     # Check if we have any peaks to plot
     if not fig.data:
@@ -611,14 +662,14 @@ def analyze_ms_file_and_generate_eic(
 
     # Save figure
     try:
-        pio.write_image(fig, output_image_path, format='png', engine='kaleido', scale=4)
+        pio.write_image(fig, str(output_image_path), format='png', engine='kaleido', scale=4)
     except Exception as e:
         print(f"Error saving image: {str(e)}")
         try:
-            raw_png = output_image_path.replace('.png', '_raw.png')
+            raw_png = str(output_image_path).replace('.png', '_raw.png')
             pio.write_image(fig, raw_png, format='png', engine='kaleido', scale=4)
             with Image.open(raw_png) as img:
-                img.save(output_image_path, optimize=True, compress_level=9)
+                img.save(str(output_image_path), optimize=True, compress_level=9)
             os.remove(raw_png)
         except Exception as e2:
             print(f"Fallback image saving also failed: {str(e2)}")
@@ -638,165 +689,175 @@ def analyze_ms_file_and_generate_eic(
     return peaks_out
 
 
-def process_file_for_eic(args: Tuple[str, str, Dict[str, str], str]) -> str:
+def process_csv_for_eic(args: Tuple[str, str, Dict[str, str], str]) -> str:
     """
-    Process a single file to generate EIC (for parallel execution)
-    
+    Process a single CSV file to generate EIC (for parallel execution)
+
     Args:
-        args: Tuple of (file_path, output_image_path, file_colors, group_name)
-        
+        args: Tuple of (csv_path, output_image_path, file_colors, group_name)
+
     Returns:
         Status message
     """
-    file_path, output_image_path, file_colors, group_name = args
-    
+    csv_path, output_image_path, file_colors, group_name = args
+
     try:
-        base = os.path.splitext(os.path.basename(file_path))[0]
-        
+        # Convert to Path objects if they're strings
+        csv_path = Path(csv_path) if isinstance(csv_path, str) else csv_path
+        output_image_path = Path(output_image_path) if isinstance(output_image_path, str) else output_image_path
+
+        base = csv_path.stem.replace(f"_peaks_{group_name}", "")
+
         # Check if already exists
-        if os.path.exists(output_image_path):
-            peaks_csv = Path(output_image_path).parent.parent / 'EIC CSVs' / f"{base}_peaks_{group_name}.csv"
-            if peaks_csv.exists():
-                return f"[↷] {base} (cached)"
-        
-        # Generate EIC and detect peaks
-        peaks = analyze_ms_file_and_generate_eic(file_path, output_image_path, file_colors, group_name)
-        
-        # Save peaks to CSV
-        if peaks:
-            peaks_csv = Path(output_image_path).parent.parent / 'EIC CSVs' / f"{base}_peaks_{group_name}.csv"
-            peaks_csv.parent.mkdir(parents=True, exist_ok=True)
-            pd.DataFrame(peaks).to_csv(peaks_csv, index=False)
-        
+        if output_image_path.exists():
+            return f"[↷] {base} (cached)"
+
+        # Generate EIC and detect peaks (pass as string)
+        peaks = analyze_csv_and_generate_eic(str(csv_path), str(output_image_path), file_colors, group_name)
+
         return f"[✔] {base} ({len(peaks)} peaks)"
-        
+
     except Exception as e:
-        return f"[!] {os.path.basename(file_path)}: {str(e)[:50]}"
+        import traceback
+        error_details = traceback.format_exc()
+        print(f"\nFull error for {csv_path}:\n{error_details}")
+        return f"[!] {Path(csv_path).name}: {str(e)[:50]}"
 
 
-def generate_file_colors(file_paths: List[str]) -> Dict[str, str]:
+def generate_file_colors(csv_files: List[Path]) -> Dict[str, str]:
     """
     Generate unique colors for each file
-    
+
     Args:
-        file_paths: List of file paths
-        
+        csv_files: List of CSV file paths
+
     Returns:
         Dictionary mapping base names to hex colors
     """
-    import colorsys
-    
     file_colors = {}
-    n_files = len(file_paths)
-    
-    for i, fp in enumerate(file_paths):
-        base = os.path.splitext(os.path.basename(fp))[0]
+    n_files = len(csv_files)
+
+    # Get current group name to remove from filenames
+    group_name = Config.CURRENT_GROUP
+
+    for i, csv_path in enumerate(csv_files):
+        # Ensure it's a Path object
+        csv_path = Path(csv_path) if isinstance(csv_path, str) else csv_path
+        base = csv_path.stem.replace(f"_peaks_{group_name}", "")
         hue = i / max(n_files, 1)
         rgb = colorsys.hsv_to_rgb(hue, 0.7, 0.9)
-        hex_color = '#{:02x}{:02x}{:02x}'.format(int(rgb[0]*255), int(rgb[1]*255), int(rgb[2]*255))
+        hex_color = '#{:02x}{:02x}{:02x}'.format(int(rgb[0] * 255), int(rgb[1] * 255), int(rgb[2] * 255))
         file_colors[base] = hex_color
-    
+
     return file_colors
 
 
 def build_eics_for_group(group_name: str, n_processes: int = None) -> List[str]:
     """
     Build EIC PNG images for all files in a specific mass group
-    
+
     Args:
         group_name: Mass group name (e.g., 'Group 1')
         n_processes: Number of parallel processes (default: CPU count - 1)
-        
+
     Returns:
         List of status messages
     """
     # Set current group
     Config.set_mass_group(group_name)
-    
-    # Get file paths
-    input_files = FileUtils.get_file_paths()
-    
+
+    # Get CSV directory
+    csv_dir = Config.BASE_DIR / Config.OUTPUT_ROOT / Config.ANALYSIS_FOLDER / str(Config.CURRENT_GROUP) / "EIC CSVs"
+
+    # Find all filtered CSV files for this group
+    csv_files = list(csv_dir.glob(f"*_peaks_{group_name}.csv"))
+
+    if not csv_files:
+        print(f"[!] No CSV files found for {group_name} in {csv_dir}")
+        return []
+
     # Generate colors
-    file_colors = generate_file_colors(input_files)
-    
+    file_colors = generate_file_colors(csv_files)
+
     # Create output directory
     output_dir = Config.BASE_DIR / Config.OUTPUT_ROOT / Config.ANALYSIS_FOLDER / str(Config.CURRENT_GROUP) / "EIC PNGs"
     output_dir.mkdir(parents=True, exist_ok=True)
-    
+
     # Prepare arguments
     args_list = []
-    for file_path in input_files:
-        base_name = os.path.splitext(os.path.basename(file_path))[0]
+    for csv_path in csv_files:
+        base_name = csv_path.stem.replace(f"_peaks_{group_name}", "")
         output_image = output_dir / f"EIC_{base_name}_plotly.png"
-        args_list.append((file_path, str(output_image), file_colors, group_name))
-    
+        args_list.append((str(csv_path), str(output_image), file_colors, group_name))
+
     # Determine number of processes
     if n_processes is None:
         n_processes = max(1, cpu_count() - 1)
-    
-    print(f"\n{'='*70}")
+
+    print(f"\n{'=' * 70}")
     print(f"Building EIC Images for {group_name}")
-    print(f"{'='*70}")
-    print(f"Processing {len(input_files)} files using {n_processes} processes")
+    print(f"{'=' * 70}")
+    print(f"Processing {len(csv_files)} files using {n_processes} processes")
+    print(f"CSV directory: {csv_dir}")
     print(f"Output directory: {output_dir}\n")
-    
+
     import time
     start_time = time.time()
-    
+
     # Process in parallel
     with Pool(processes=n_processes, initializer=init_worker) as pool:
-        results = pool.map(process_file_for_eic, args_list)
-    
+        results = pool.map(process_csv_for_eic, args_list)
+
     elapsed_time = time.time() - start_time
-    
+
     # Print results
     print("\nEIC Generation Results:")
     for result in results:
         print(result)
-    
+
     # Summary
     successful = sum(1 for r in results if r.startswith("[✔]"))
     cached = sum(1 for r in results if r.startswith("[↷]"))
     failed = sum(1 for r in results if r.startswith("[!]"))
-    
+
     print(f"\nSummary: {successful} processed, {cached} cached, {failed} failed")
     print(f"Processing time: {elapsed_time:.2f} seconds")
-    if len(input_files) > 0:
-        print(f"Average time per file: {elapsed_time / len(input_files):.2f} seconds")
-    
+    if len(csv_files) > 0:
+        print(f"Average time per file: {elapsed_time / len(csv_files):.2f} seconds")
+
     return results
 
 
 def build_eics_for_all_groups(n_processes: int = None) -> Dict[str, List[str]]:
     """
     Build EIC PNG images for all mass groups
-    
+
     Args:
         n_processes: Number of parallel processes (default: CPU count - 1)
-        
+
     Returns:
         Dictionary mapping group names to status results
     """
     import time
-    
+
     total_start_time = time.time()
     all_results = {}
-    
-    print("\n" + "="*70)
+
+    print("\n" + "=" * 70)
     print("EIC IMAGE GENERATION - ALL GROUPS")
-    print("="*70)
-    
+    print("=" * 70)
+
     for group_name in Config.MASS_GROUPS.keys():
         results = build_eics_for_group(group_name, n_processes)
         all_results[group_name] = results
-    
+
     total_elapsed = time.time() - total_start_time
-    
-    print("\n" + "="*70)
+
+    print("\n" + "=" * 70)
     print("EIC GENERATION COMPLETE")
-    print("="*70)
+    print("=" * 70)
     print(f"Total time: {total_elapsed:.2f} seconds")
-    
+
     return all_results
 
 

@@ -14,7 +14,6 @@ from FileUtils import FileUtils
 # Configuration
 NOISE_LEVEL = 5000.0
 
-
 def centroid_scan(scan_idx: int, mzs: np.ndarray, intensities: np.ndarray, noise_level: float) -> List[
     Tuple[int, float, float]]:
     """Detect peaks in a single scan"""
