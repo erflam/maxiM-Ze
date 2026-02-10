@@ -2,11 +2,10 @@ import numpy as np
 import pandas as pd
 from pathlib import Path
 from pyteomics import mzxml
-from typing import List, Tuple
+from typing import List, Tuple, Dict
 from multiprocessing import Pool, cpu_count
 import os
 import time
-import shutil
 
 # Import your modules
 from Config import Config
@@ -14,6 +13,7 @@ from FileUtils import FileUtils
 
 # Configuration
 NOISE_LEVEL = 5000.0
+
 
 def centroid_scan(scan_idx: int, mzs: np.ndarray, intensities: np.ndarray, noise_level: float) -> List[
     Tuple[int, float, float]]:
@@ -78,7 +78,7 @@ def process_single_mzxml(args: Tuple[str, str, float]) -> str:
                     rt = float(scan['retentionTime'])  # Retention time in minutes
 
                     # Convert to numpy arrays
-                    mzs = np.array(scan['m/z array'], dtype=np.float32)
+                    mzs = np.array(scan['m/z array'], dtype=np.float64)  # Higher precision for mass
                     intensities = np.array(scan['intensity array'], dtype=np.float32)
 
                     if len(mzs) > 0:
@@ -94,9 +94,14 @@ def process_single_mzxml(args: Tuple[str, str, float]) -> str:
                                 'scan': scan_number
                             })
 
-        # Create DataFrame and save to CSV
+        # Create DataFrame and save to CSV with specific formatting
         df = pd.DataFrame(data_rows)
-        df.to_csv(output_csv, index=False, float_format='%.3f')
+
+        # Write with custom float formatting
+        with open(output_csv, 'w') as f:
+            f.write('rt,mass,intensity,scan\n')
+            for _, row in df.iterrows():
+                f.write(f"{row['rt']:.3f},{row['mass']:.4f},{row['intensity']:.0f},{row['scan']}\n")
 
         return f"[✔] {os.path.basename(file_path)} ({len(df)} peaks)"
 
@@ -104,23 +109,76 @@ def process_single_mzxml(args: Tuple[str, str, float]) -> str:
         return f"[!] {os.path.basename(file_path)}: {str(e)[:50]}"
 
 
-def process_all_files_for_group(group_name, noise_level: float = NOISE_LEVEL, n_processes: int = None):
+def filter_peaks_by_mass_group_parallel(args: Tuple[str, str, str, List[float], float]) -> Tuple[str, int]:
     """
-    Process all mzXML files for a specific mass group
+    Filter peaks from a raw CSV for a specific group (parallelizable)
 
     Args:
-        group_name: The mass group to process (e.g., 1, 2, 3, etc.)
+        args: Tuple of (raw_csv_path, output_csv_path, group_name, mass_list, mass_tolerance)
+
+    Returns:
+        Tuple of (group_name, number of peaks)
+    """
+    raw_csv_path, output_csv_path, group_name, mass_list, mass_tolerance = args
+
+    try:
+        # Check if already exists
+        if os.path.exists(output_csv_path):
+            df = pd.read_csv(output_csv_path)
+            return (group_name, len(df))
+
+        # Read the raw CSV
+        df = pd.read_csv(raw_csv_path)
+
+        if len(df) == 0:
+            # Create empty file with correct columns
+            with open(output_csv_path, 'w') as f:
+                f.write('rt,mass,intensity,scan\n')
+            return (group_name, 0)
+
+        # Filter peaks that match any of the target masses - vectorized approach
+        mass_array = df['mass'].values
+        mask = np.zeros(len(mass_array), dtype=bool)
+
+        for target_mass in mass_list:
+            mask |= np.abs(mass_array - target_mass) <= mass_tolerance
+
+        filtered_df = df[mask].copy()
+
+        if len(filtered_df) > 0:
+            # Sort by retention time, then by mass
+            filtered_df = filtered_df.sort_values(['rt', 'mass']).reset_index(drop=True)
+
+            # Write with custom float formatting
+            with open(output_csv_path, 'w') as f:
+                f.write('rt,mass,intensity,scan\n')
+                for _, row in filtered_df.iterrows():
+                    f.write(f"{row['rt']:.3f},{row['mass']:.4f},{row['intensity']:.0f},{row['scan']}\n")
+        else:
+            # Create empty file
+            with open(output_csv_path, 'w') as f:
+                f.write('rt,mass,intensity,scan\n')
+
+        return (group_name, len(filtered_df))
+
+    except Exception as e:
+        print(f"Error filtering {os.path.basename(raw_csv_path)} for {group_name}: {e}")
+        return (group_name, 0)
+
+
+def process_all_raw_files(noise_level: float = NOISE_LEVEL, n_processes: int = None):
+    """
+    Process all mzXML files once and save raw peak data to Mass Detection folder
+
+    Args:
         noise_level: Minimum intensity threshold for peak detection
         n_processes: Number of parallel processes (default: CPU count - 1)
     """
-    # Set the current group in Config
-    Config.set_mass_group(group_name)
-
     # Get input file paths from FileUtils
     input_files = FileUtils.get_file_paths()
 
-    # Create output directory using Config's directory structure
-    output_dir = Config.BASE_DIR / Config.OUTPUT_ROOT / Config.ANALYSIS_FOLDER / str(Config.CURRENT_GROUP) / "EIC CSVs"
+    # Create output directory in Mass Detection folder
+    output_dir = Config.BASE_DIR / Config.OUTPUT_ROOT / Config.ANALYSIS_FOLDER / "Mass Detection"
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Prepare arguments for each file
@@ -134,17 +192,23 @@ def process_all_files_for_group(group_name, noise_level: float = NOISE_LEVEL, n_
     if n_processes is None:
         n_processes = max(1, cpu_count() - 1)
 
-    print(f"Processing Group: {group_name}")
+    print("=" * 70)
+    print("mzXML to CSV Converter - Raw Peak Detection")
+    print("=" * 70)
     print(f"Processing {len(input_files)} files using {n_processes} processes...")
     print(f"Input directory: {Config.BASE_DIR / Config.INPUT_SUBDIR}")
     print(f"Output directory: {output_dir}\n")
+
+    start_time = time.time()
 
     # Process files in parallel
     with Pool(processes=n_processes) as pool:
         results = pool.map(process_single_mzxml, args_list)
 
+    elapsed_time = time.time() - start_time
+
     # Print results
-    print("Processing complete:")
+    print("\nRaw Processing Results:")
     for result in results:
         print(result)
 
@@ -153,14 +217,106 @@ def process_all_files_for_group(group_name, noise_level: float = NOISE_LEVEL, n_
     cached = sum(1 for r in results if r.startswith("[↷]"))
     failed = sum(1 for r in results if r.startswith("[!]"))
 
-    print(f"Summary: {successful} processed, {cached} cached, {failed} failed")
+    print(f"\nSummary: {successful} processed, {cached} cached, {failed} failed")
+    print(f"Processing time: {elapsed_time:.2f} seconds")
+
+    if len(input_files) > 0:
+        print(f"Average time per file: {elapsed_time / len(input_files):.2f} seconds")
 
     return results
 
 
+def create_all_group_filtered_csvs(n_processes: int = None):
+    """
+    Create filtered CSV files for all mass groups from raw data (PARALLELIZED)
+
+    Args:
+        n_processes: Number of parallel processes (default: CPU count - 1)
+    """
+    print("\n" + "=" * 70)
+    print("Creating Filtered CSVs for All Mass Groups (Parallel)")
+    print("=" * 70)
+
+    # Get the raw data directory (Mass Detection)
+    raw_dir = Config.BASE_DIR / Config.OUTPUT_ROOT / Config.ANALYSIS_FOLDER / "Mass Detection"
+
+    # Find all raw CSV files
+    raw_csv_files = list(raw_dir.glob("*_EIC_raw.csv"))
+
+    if not raw_csv_files:
+        print(f"No raw CSV files found in {raw_dir}")
+        return
+
+    # Get mass tolerance
+    mass_tolerance = Config.MASS_TOLERANCE
+
+    # Determine number of processes
+    if n_processes is None:
+        n_processes = max(1, cpu_count() - 1)
+
+    # Prepare all filtering tasks
+    filtering_args = []
+
+    for group_name in Config.MASS_GROUPS.keys():
+        # Set the current group in Config
+        Config.set_mass_group(group_name)
+
+        # Get the mass list for this group
+        mass_list = Config.MASS_GROUPS[group_name]
+
+        # Get the output directory for this group
+        group_output_dir = Config.BASE_DIR / Config.OUTPUT_ROOT / Config.ANALYSIS_FOLDER / str(
+            Config.CURRENT_GROUP) / "EIC CSVs"
+        group_output_dir.mkdir(parents=True, exist_ok=True)
+
+        # Add tasks for each file in this group
+        for raw_csv in raw_csv_files:
+            base_name = raw_csv.stem.replace("_EIC_raw", "")
+            filtered_csv = group_output_dir / f"{base_name}_peaks_{group_name}.csv"
+
+            filtering_args.append((
+                str(raw_csv),
+                str(filtered_csv),
+                group_name,
+                mass_list,
+                mass_tolerance
+            ))
+
+    print(f"Filtering {len(raw_csv_files)} files across {len(Config.MASS_GROUPS)} groups...")
+    print(f"Total tasks: {len(filtering_args)}")
+    print(f"Using {n_processes} processes\n")
+
+    start_time = time.time()
+
+    # Process all filtering tasks in parallel
+    with Pool(processes=n_processes) as pool:
+        results = pool.map(filter_peaks_by_mass_group_parallel, filtering_args)
+
+    elapsed_time = time.time() - start_time
+
+    # Organize results by group
+    group_stats = {}
+    for group_name, num_peaks in results:
+        if group_name not in group_stats:
+            group_stats[group_name] = {'files': 0, 'total_peaks': 0}
+        group_stats[group_name]['files'] += 1
+        group_stats[group_name]['total_peaks'] += num_peaks
+
+    # Print summary for each group
+    print("\nFiltering Results:")
+    for group_name in Config.MASS_GROUPS.keys():
+        if group_name in group_stats:
+            stats = group_stats[group_name]
+            avg_peaks = stats['total_peaks'] / stats['files'] if stats['files'] > 0 else 0
+            print(
+                f"[✔] {group_name}: {stats['files']} files, {stats['total_peaks']:,} total peaks, {avg_peaks:,.0f} avg/file")
+
+    print(f"\nFiltering time: {elapsed_time:.2f} seconds")
+
+
 def process_all_groups(noise_level: float = NOISE_LEVEL, n_processes: int = None):
     """
-    Process all mass groups defined in Config.MASS_GROUPS
+    Complete workflow: Process raw files once, then create filtered CSVs for all groups
 
     Args:
         noise_level: Minimum intensity threshold for peak detection
@@ -168,50 +324,37 @@ def process_all_groups(noise_level: float = NOISE_LEVEL, n_processes: int = None
     """
     total_start_time = time.time()
 
-    print("mzXML to CSV Converter - Parallel Processing")
-    print("Processing All Mass Groups")
+    # Step 1: Process all raw files (only once)
+    process_all_raw_files(noise_level=noise_level, n_processes=n_processes)
 
-    all_results = {}
-
-    for group_name in Config.MASS_GROUPS.keys():
-        group_start_time = time.time()
-
-        results = process_all_files_for_group(
-            group_name=group_name,
-            noise_level=noise_level,
-            n_processes=n_processes
-        )
-
-        group_elapsed = time.time() - group_start_time
-        all_results[group_name] = {
-            'results': results,
-            'time': group_elapsed
-        }
-
-        print(f"\nGroup {group_name} completed in {group_elapsed:.2f} seconds")
-        print(f"Average time per file: {group_elapsed / len(FileUtils.get_file_paths()):.2f} seconds")
+    # Step 2: Create filtered CSVs for all groups (PARALLELIZED)
+    create_all_group_filtered_csvs(n_processes=n_processes)
 
     total_elapsed = time.time() - total_start_time
 
-    print("ALL GROUPS PROCESSING SUMMARY")
-    for group_name, data in all_results.items():
-        print(f"Group {group_name}: {data['time']:.2f} seconds")
-    print(f"\nTotal processing time: {total_elapsed:.2f} seconds")
-    return all_results
+    print("\n" + "=" * 70)
+    print("COMPLETE PROCESSING SUMMARY")
+    print("=" * 70)
+    print(f"Total processing time: {total_elapsed:.2f} seconds")
+    print(f"Raw data location: {Config.BASE_DIR / Config.OUTPUT_ROOT / Config.ANALYSIS_FOLDER / 'Mass Detection'}")
+    print(
+        f"Filtered data location: {Config.BASE_DIR / Config.OUTPUT_ROOT / Config.ANALYSIS_FOLDER / '[Group Name]' / 'EIC CSVs'}")
 
 
-def analyze_results_for_group(group_name):
+def analyze_results_for_group(group_name: str):
     """Analyze the generated CSV files for a specific group and print statistics"""
     Config.set_mass_group(group_name)
     output_dir = Config.BASE_DIR / Config.OUTPUT_ROOT / Config.ANALYSIS_FOLDER / str(Config.CURRENT_GROUP) / "EIC CSVs"
 
-    csv_files = list(output_dir.glob("*_EIC_raw.csv"))
+    csv_files = list(output_dir.glob(f"*_peaks_{group_name}.csv"))
 
     if not csv_files:
-        print(f"No CSV files found for group {group_name}!")
+        print(f"\nNo CSV files found for {group_name}!")
         return
 
-    print(f"\nAnalyzing {len(csv_files)} CSV files for group {group_name}...\n")
+    print(f"\n{'=' * 70}")
+    print(f"ANALYSIS: {group_name}")
+    print(f"{'=' * 70}")
 
     total_peaks = 0
     rt_min, rt_max = float('inf'), 0
@@ -230,21 +373,26 @@ def analyze_results_for_group(group_name):
             int_min = min(int_min, df['intensity'].min())
             int_max = max(int_max, df['intensity'].max())
 
-    print(f"GROUP {group_name} STATISTICS")
     print(f"Total files processed: {len(csv_files)}")
     print(f"Total peaks detected: {total_peaks:,}")
     print(f"Average peaks per file: {total_peaks / len(csv_files):,.0f}")
-    print(f"\nRetention time range: {rt_min:.2f} - {rt_max:.2f} minutes")
-    print(f"Mass range: {mass_min:.2f} - {mass_max:.2f} m/z")
-    print(f"Intensity range: {int_min:.0f} - {int_max:.0f}")
+
+    if total_peaks > 0:
+        print(f"\nRetention time range: {rt_min:.3f} - {rt_max:.3f} minutes")
+        print(f"Mass range: {mass_min:.4f} - {mass_max:.4f} m/z")
+        print(f"Intensity range: {int_min:.0f} - {int_max:.0f}")
+
 
 if __name__ == "__main__":
-    # Process all groups
+    # Process all files once and create filtered CSVs for all groups
     process_all_groups(
         noise_level=NOISE_LEVEL,
         n_processes=None  # Auto-detect CPU cores
     )
 
     # Analyze results for each group
+    print("\n" + "=" * 70)
+    print("GROUP STATISTICS")
+    print("=" * 70)
     for group_name in Config.MASS_GROUPS.keys():
         analyze_results_for_group(group_name)
