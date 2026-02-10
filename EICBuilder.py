@@ -20,7 +20,7 @@ from multiprocessing import Pool, cpu_count
 import colorsys
 
 from Config import Config
-from FileUtils import FileUtils
+from FileUtils import FileUtils  # (unused but leaving as-is)
 
 # Peak detection parameters
 DEFAULT_REL_HEIGHT = 0.98
@@ -45,30 +45,17 @@ def init_worker():
 def improved_peak_cutting(intensity_vals_smooth, rt_vals, peaks, width_results, specific_mass):
     """
     Improved peak cutting algorithm to split overlapping peaks
-
-    Args:
-        intensity_vals_smooth: Smoothed intensity values
-        rt_vals: Retention time values
-        peaks: Initial peak indices
-        width_results: Peak width results from scipy
-        specific_mass: Mass being analyzed
-
-    Returns:
-        tuple: (new_peaks, new_width_results)
     """
-
     MIN_APEX_SEP_MIN = 0.015
     MAX_SEG_WIDTH_MIN = 0.8
     MIN_SEG_WIDTH_MIN = 0.015
 
-    # Simplified valley detection - only use one sigma
     all_minima = set()
     smoothed = gaussian_filter1d(intensity_vals_smooth, sigma=1.0)
     minima = argrelextrema(smoothed, np.less, order=2)[0]
     all_minima.update(minima)
 
     all_minima = np.array(sorted(all_minima))
-
     if len(all_minima) == 0:
         return peaks, width_results
 
@@ -81,17 +68,13 @@ def improved_peak_cutting(intensity_vals_smooth, rt_vals, peaks, width_results, 
         return MIN_SEG_WIDTH_MIN <= wmin <= MAX_SEG_WIDTH_MIN
 
     def calculate_peak_quality(apex_idx, left_idx, right_idx):
-        """Calculate peak quality metrics for better selection"""
         if right_idx <= left_idx or apex_idx < left_idx or apex_idx > right_idx:
             return 0.0
-
         segment = intensity_vals_smooth[left_idx:right_idx + 1]
         apex_val = intensity_vals_smooth[apex_idx]
-
         left_min = np.min(segment[:apex_idx - left_idx + 1]) if apex_idx > left_idx else apex_val
         right_min = np.min(segment[apex_idx - left_idx:]) if apex_idx < right_idx else apex_val
         prominence = apex_val - max(left_min, right_min)
-
         return prominence
 
     try:
@@ -99,13 +82,14 @@ def improved_peak_cutting(intensity_vals_smooth, rt_vals, peaks, width_results, 
         valid_split = width_results_split[0] > 0
     except:
         valid_split = np.zeros(len(peaks), dtype=bool)
-        width_results_split = (np.zeros(len(peaks)), np.zeros(len(peaks)),
-                               np.zeros(len(peaks)), np.zeros(len(peaks)))
+        width_results_split = (
+            np.zeros(len(peaks)), np.zeros(len(peaks)),
+            np.zeros(len(peaks)), np.zeros(len(peaks))
+        )
 
     new_peaks = []
 
     for i_pk, pk in enumerate(peaks):
-        # Determine search window
         if valid_split[i_pk]:
             left_ip, right_ip = width_results_split[2][i_pk], width_results_split[3][i_pk]
         else:
@@ -114,14 +98,11 @@ def improved_peak_cutting(intensity_vals_smooth, rt_vals, peaks, width_results, 
         left_idx = max(0, int(np.floor(left_ip)))
         right_idx = min(len(intensity_vals_smooth) - 1, int(np.ceil(right_ip)))
 
-        # Find valleys within the search window
         internal_valleys = [v for v in all_minima if left_idx < v < right_idx]
-
         if not internal_valleys:
             new_peaks.append(pk)
             continue
 
-        # Simplified valley filtering
         significant_valleys = []
         peak_intensity = intensity_vals_smooth[pk]
 
@@ -144,36 +125,26 @@ def improved_peak_cutting(intensity_vals_smooth, rt_vals, peaks, width_results, 
         seg_ends = significant_valleys + [right_idx]
 
         candidate_peaks = []
-
         for seg_l, seg_r in zip(seg_starts, seg_ends):
             if seg_r - seg_l < 3 or not seg_time_ok(seg_l, seg_r):
                 continue
-
             local_segment = intensity_vals_smooth[seg_l:seg_r + 1]
             local_apex_offset = np.argmax(local_segment)
             apex_idx = seg_l + local_apex_offset
-
             quality = calculate_peak_quality(apex_idx, seg_l, seg_r)
-
             if quality > peak_intensity * 0.1:
                 candidate_peaks.append((apex_idx, quality))
 
         if len(candidate_peaks) >= 2:
             candidate_peaks.sort(key=lambda x: x[1], reverse=True)
-
             selected_peaks = [candidate_peaks[0]]
             for candidate in candidate_peaks[1:]:
                 apex_idx, quality = candidate
-
-                min_sep = min(abs(rt_vals[apex_idx] - rt_vals[selected[0]])
-                              for selected in selected_peaks)
-
+                min_sep = min(abs(rt_vals[apex_idx] - rt_vals[selected[0]]) for selected in selected_peaks)
                 if min_sep >= MIN_APEX_SEP_MIN:
                     selected_peaks.append(candidate)
-
             for apex_idx, _ in selected_peaks:
                 new_peaks.append(apex_idx)
-
         elif len(candidate_peaks) == 1:
             new_peaks.append(candidate_peaks[0][0])
         else:
@@ -181,36 +152,23 @@ def improved_peak_cutting(intensity_vals_smooth, rt_vals, peaks, width_results, 
 
     if new_peaks:
         new_peaks = np.unique(np.array(new_peaks, dtype=int))
-
         try:
             new_width_results = peak_widths(intensity_vals_smooth, new_peaks, rel_height=0.99)
-
             valid_mask = new_width_results[0] > 0
             new_peaks = new_peaks[valid_mask]
             new_width_results = tuple(arr[valid_mask] for arr in new_width_results)
-
             return new_peaks, new_width_results
-
-        except Exception as e:
+        except:
             return peaks, width_results
 
     return peaks, width_results
 
 
-def reconstruct_intensity_profile_from_csv(csv_path: str, mass_list: List[float]) -> Tuple[
-    np.ndarray, Dict[float, np.ndarray]]:
+def reconstruct_intensity_profile_from_csv(csv_path: str, mass_list: List[float]) -> Tuple[np.ndarray, Dict[float, np.ndarray]]:
     """
     Reconstruct intensity profiles for each mass from the filtered CSV
-
-    Args:
-        csv_path: Path to the filtered peaks CSV file
-        mass_list: List of target masses
-
-    Returns:
-        Tuple of (rt_values array, dict mapping mass to intensity array)
     """
     df = pd.read_csv(csv_path)
-
     if len(df) == 0:
         return np.array([]), {}
 
@@ -315,7 +273,6 @@ def split_shoulders_in_window(
         smaller = min(cand_h, main_h)
         if smaller <= 0:
             continue
-
         if valley_h > (SHOULDER_VALLEY_DROP_FRAC * smaller):
             continue
 
@@ -363,50 +320,118 @@ def split_shoulders_in_window(
     ]
 
 
+def rt_to_pixel_x(rt: float, x_min: float, x_max: float, img_width: int) -> int:
+    """
+    Convert a retention time (RT) to an x-axis pixel coordinate
+    in the exported EIC PNG.
+    """
+    if img_width <= 1 or x_max <= x_min:
+        return 0
+
+    frac = (rt - x_min) / (x_max - x_min)
+    px = int(round(frac * (img_width - 1)))
+    return max(0, min(img_width - 1, px))
+
+
+def write_peakinfo_csv(peaks_out: List[Dict], out_csv_path: Path) -> None:
+    if not peaks_out:
+        return
+
+    df = pd.DataFrame(peaks_out)
+
+    cols = [
+        "File Name", "m/z",
+        "RT_start", "RT_apex", "RT_end",
+        "Scan_start", "Scan_end",
+        "Peak Area", "Height",
+    ]
+    for c in cols:
+        if c not in df.columns:
+            df[c] = np.nan
+
+    df = df[cols]
+
+    df["RT_apex"] = pd.to_numeric(df["RT_apex"], errors="coerce")
+    df["Peak Area"] = pd.to_numeric(df["Peak Area"], errors="coerce")
+    df = df.sort_values(["m/z", "RT_apex", "Peak Area"], ascending=[True, True, False])
+
+    out_csv_path.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(out_csv_path, index=False)
+
+def generate_mass_colors(mass_list: List[float]) -> Dict[str, str]:
+    """
+    Generate distinct DARK colors per m/z (repeatable).
+    Uses HSV with low value to keep traces dark.
+    """
+    import colorsys
+
+    mass_strs = [f"{m:.4f}" for m in mass_list]
+    n = max(1, len(mass_strs))
+
+    colors = {}
+    for i, mz_str in enumerate(mass_strs):
+        hue = i / n
+        saturation = 0.75   # medium saturation
+        value = 0.40        # DARK colors (important)
+        r, g, b = colorsys.hsv_to_rgb(hue, saturation, value)
+        colors[mz_str] = '#{:02x}{:02x}{:02x}'.format(
+            int(r * 255),
+            int(g * 255),
+            int(b * 255)
+        )
+
+    return colors
+
 def analyze_csv_and_generate_eic(
         csv_path: str,
         output_image_path: str,
         file_colors: Dict[str, str],
         group_name: str
-) -> List[Dict]:
+) -> Tuple[List[Dict], List[Dict]]:
     """
     Analyze filtered CSV and generate EIC visualization with peak detection
+
+    Returns:
+        (peaks_out, pixel_rows)
     """
     Config.set_mass_group(group_name)
+
+    # ALWAYS initialize these so they exist on every return path
+    peaks_out: List[Dict] = []
+    pixel_rows: List[Dict] = []
 
     csv_path = Path(csv_path) if isinstance(csv_path, str) else csv_path
     output_image_path = Path(output_image_path) if isinstance(output_image_path, str) else output_image_path
 
     base = csv_path.stem.replace(f"_peaks_{group_name}", "")
 
+    # If image already exists, we skip generating it (and mapping needs the image),
+    # so return empty outputs (process_csv_for_eic handles writing if needed).
     if output_image_path.exists():
-        return []
+        return peaks_out, pixel_rows
 
     mass_list = list(Config.MASS_LIST)
     mass_list_str = [f"{m:.4f}" for m in mass_list]
 
     rt_values, intensity_by_mass = reconstruct_intensity_profile_from_csv(str(csv_path), mass_list)
-
     if len(rt_values) == 0:
-        return []
+        return peaks_out, pixel_rows
 
     fig = go.Figure()
-    color = file_colors.get(base, '#1f77b4')
-    peaks_out = []
-    all_peak_rts = []
+    mass_colors = generate_mass_colors(list(Config.MASS_LIST))
+    all_peak_rts: List[float] = []
 
     for mass_idx, specific_mass in enumerate(mass_list):
         intensity_vals = intensity_by_mass[specific_mass]
-
         if len(intensity_vals) < 3 or np.max(intensity_vals) == 0:
             continue
 
         rt_vals = rt_values
 
-        # Smooth the data
         window_length = min(7, len(intensity_vals))
         if window_length % 2 == 0:
             window_length -= 1
+
         if window_length >= 3:
             try:
                 intensity_vals_smooth = savgol_filter(intensity_vals, window_length=window_length, polyorder=2)
@@ -420,17 +445,15 @@ def analyze_csv_and_generate_eic(
         min_height = max(max_intensity * 0.04, noise_level * 3)
 
         try:
-            peaks, properties = find_peaks(
+            peaks, _properties = find_peaks(
                 intensity_vals_smooth,
                 height=min_height,
                 distance=1
             )
-
             if len(peaks) == 0:
                 continue
 
             width_results = peak_widths(intensity_vals_smooth, peaks, rel_height=DEFAULT_REL_HEIGHT)
-
             valid_width_mask = width_results[0] > 0
             peaks = peaks[valid_width_mask]
             width_results = tuple(wr[valid_width_mask] for wr in width_results)
@@ -444,7 +467,6 @@ def analyze_csv_and_generate_eic(
                 )
             except:
                 pass
-
         except:
             continue
 
@@ -475,12 +497,10 @@ def analyze_csv_and_generate_eic(
                 x_peak = rt_vals[left_idx:right_idx + 1]
                 y_peak = intensity_vals[left_idx:right_idx + 1]
 
-                # Simplified tail cropping
+                # Tail cropping
                 if len(y_peak) >= 12:
                     apex_idx_local = np.argmax(y_peak)
                     peak_height = y_peak[apex_idx_local]
-
-                    # Look for flat tail
                     if apex_idx_local < len(y_peak) - 5:
                         tail = y_peak[apex_idx_local + 1:]
                         if np.max(tail) < 0.02 * peak_height:
@@ -506,22 +526,30 @@ def analyze_csv_and_generate_eic(
                 )
                 peaks_out.extend(new_records)
 
+                mz_str = mass_list_str[mass_idx]
+                mz_color = mass_colors.get(mz_str, "#ffffff")
+
                 fig.add_trace(go.Scatter(
                     x=x_peak, y=y_peak,
                     mode='lines',
-                    line=dict(color=color, width=3),
+                    line=dict(color=mz_color, width=3),
                     showlegend=False
                 ))
+
                 all_peak_rts.extend(x_peak.tolist())
 
             except:
                 continue
 
-    if not fig.data:
-        return []
+    if not fig.data or len(all_peak_rts) == 0:
+        return peaks_out, pixel_rows
+
+    # Store x-axis range used for PNG
+    x_min = min(all_peak_rts) - 0.1
+    x_max = max(all_peak_rts) + 0.1
 
     fig.update_xaxes(
-        range=[min(all_peak_rts) - 0.1, max(all_peak_rts) + 0.1],
+        range=[x_min, x_max],
         showgrid=False, zeroline=False, showticklabels=False
     )
     fig.update_yaxes(
@@ -534,20 +562,26 @@ def analyze_csv_and_generate_eic(
         plot_bgcolor='rgba(0,0,0,0)'
     )
 
+    # Try to write PNG
+    wrote_png = False
     try:
         pio.write_image(fig, str(output_image_path), format='png', engine='kaleido', scale=4)
-    except Exception as e:
+        wrote_png = True
+    except:
+        # fallback route
         try:
             raw_png = str(output_image_path).replace('.png', '_raw.png')
             pio.write_image(fig, raw_png, format='png', engine='kaleido', scale=4)
             with Image.open(raw_png) as img:
                 img.save(str(output_image_path), optimize=True, compress_level=9)
             os.remove(raw_png)
+            wrote_png = True
         except:
-            pass
+            wrote_png = False
 
     del fig
 
+    # De-dup peaks_out (your original logic)
     if peaks_out:
         df = pd.DataFrame(peaks_out)
         if all(col in df.columns for col in ['m/z', 'RT_apex', 'Peak Area']):
@@ -557,7 +591,37 @@ def analyze_csv_and_generate_eic(
             df = df.drop_duplicates(subset=['m/z', 'RT_apex'], keep='first')
             peaks_out = df.to_dict('records')
 
-    return peaks_out
+    # Build pixel mapping ONLY if the PNG exists
+    if wrote_png and output_image_path.exists():
+        try:
+            with Image.open(output_image_path) as im:
+                img_width, _ = im.size
+
+            rows = []
+            for rec in peaks_out:
+                try:
+                    rt_s = float(rec["RT_start"])
+                    rt_e = float(rec["RT_end"])
+                    px_s = rt_to_pixel_x(rt_s, x_min, x_max, img_width)
+                    px_e = rt_to_pixel_x(rt_e, x_min, x_max, img_width)
+                    if px_e < px_s:
+                        px_s, px_e = px_e, px_s
+
+                    rows.append({
+                        "File Name": rec["File Name"],
+                        "m/z": rec["m/z"],
+                        "RT_start": rt_s,
+                        "RT_end": rt_e,
+                        "Pixel_start": int(px_s),
+                        "Pixel_end": int(px_e),
+                    })
+                except:
+                    continue
+            pixel_rows = rows
+        except:
+            pixel_rows = []
+
+    return peaks_out, pixel_rows
 
 
 def process_csv_for_eic(args: Tuple[str, str, Dict[str, str], str]) -> str:
@@ -569,35 +633,47 @@ def process_csv_for_eic(args: Tuple[str, str, Dict[str, str], str]) -> str:
         output_image_path = Path(output_image_path) if isinstance(output_image_path, str) else output_image_path
 
         base = csv_path.stem.replace(f"_peaks_{group_name}", "")
+
+        # Peak Info CSV location (your chosen folder)
         peakinfo_dir = csv_path.parent / "Peak Info CSVs"
         peakinfo_dir.mkdir(parents=True, exist_ok=True)
         peakinfo_csv_path = peakinfo_dir / f"{base}_peakinfo_{group_name}.csv"
 
-        if output_image_path.exists() and peakinfo_csv_path.exists():
+        # Pixel CSV location (use Config folder)
+        pixel_dir = Config.BASE_DIR / Config.OUTPUT_ROOT / Config.ANALYSIS_FOLDER / str(Config.CURRENT_GROUP) / "Pixel CSVs"
+        pixel_dir.mkdir(parents=True, exist_ok=True)
+        pixel_csv_path = pixel_dir / f"{base}_pixelRT_{group_name}.csv"
+
+        # If everything already exists, skip
+        if output_image_path.exists() and peakinfo_csv_path.exists() and pixel_csv_path.exists():
             return f"[↷] {base} (cached)"
 
-        peaks = analyze_csv_and_generate_eic(str(csv_path), str(output_image_path), file_colors, group_name)
+        peaks, pixel_rows = analyze_csv_and_generate_eic(
+            str(csv_path),
+            str(output_image_path),
+            file_colors,
+            group_name
+        )
 
-        # Write peak info CSV (even if image already existed but peakinfo didn't)
+        # Write pixel mapping CSV (start/end only + RTs)
+        if pixel_rows:
+            pd.DataFrame(pixel_rows).to_csv(pixel_csv_path, index=False)
+        else:
+            pd.DataFrame(
+                columns=["File Name", "m/z", "RT_start", "RT_end", "Pixel_start", "Pixel_end"]
+            ).to_csv(pixel_csv_path, index=False)
+
+        # Write peak info CSV
         write_peakinfo_csv(peaks, peakinfo_csv_path)
 
         return f"[✔] {base} ({len(peaks)} peaks)"
 
     except Exception as e:
-        return f"[!] {Path(csv_path).name}: {str(e)[:50]}"
-
+        return f"[!] {Path(csv_path).name}: {str(e)[:70]}"
 
 
 def generate_file_colors(csv_files: List[Path]) -> Dict[str, str]:
-    """
-    Generate DARK colors for each file
-
-    Args:
-        csv_files: List of CSV file paths
-
-    Returns:
-        Dictionary mapping base names to dark hex colors
-    """
+    """Generate DARK colors for each file"""
     file_colors = {}
     n_files = len(csv_files)
     group_name = Config.CURRENT_GROUP
@@ -606,10 +682,9 @@ def generate_file_colors(csv_files: List[Path]) -> Dict[str, str]:
         csv_path = Path(csv_path) if isinstance(csv_path, str) else csv_path
         base = csv_path.stem.replace(f"_peaks_{group_name}", "")
 
-        # Generate dark colors: low saturation (0.6-0.8) and low value (0.3-0.5)
         hue = i / max(n_files, 1)
-        saturation = 0.7  # Medium saturation for rich colors
-        value = 0.4  # Low value for dark colors
+        saturation = 0.7
+        value = 0.4
 
         rgb = colorsys.hsv_to_rgb(hue, saturation, value)
         hex_color = '#{:02x}{:02x}{:02x}'.format(
@@ -700,33 +775,6 @@ def build_eics_for_all_groups(n_processes: int = None) -> Dict[str, List[str]]:
     print(f"Total time: {total_elapsed:.2f} seconds")
 
     return all_results
-
-def write_peakinfo_csv(peaks_out: List[Dict], out_csv_path: Path) -> None:
-    if not peaks_out:
-        return
-
-    df = pd.DataFrame(peaks_out)
-
-    # Enforce column order (and only these columns)
-    cols = [
-        "File Name", "m/z",
-        "RT_start", "RT_apex", "RT_end",
-        "Scan_start", "Scan_end",
-        "Peak Area", "Height",
-    ]
-    for c in cols:
-        if c not in df.columns:
-            df[c] = np.nan
-
-    df = df[cols]
-
-    # Sort nicely (optional)
-    df["RT_apex"] = pd.to_numeric(df["RT_apex"], errors="coerce")
-    df["Peak Area"] = pd.to_numeric(df["Peak Area"], errors="coerce")
-    df = df.sort_values(["m/z", "RT_apex", "Peak Area"], ascending=[True, True, False])
-
-    out_csv_path.parent.mkdir(parents=True, exist_ok=True)
-    df.to_csv(out_csv_path, index=False)
 
 
 if __name__ == "__main__":
