@@ -108,7 +108,6 @@ def find_segments_for_color(
     segments = filter_short_segments(segments, min_width_px=min_width_px)
     return segments
 
-
 def _normalize_base_for_png_lookup(base: str, group_tag: str) -> str:
     if base.startswith("EIC_"):
         base = base[len("EIC_") :]

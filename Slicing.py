@@ -1,8 +1,6 @@
-# Slicing.py
 import os
 from pathlib import Path
 from typing import Dict, List, Tuple
-
 import cv2
 import numpy as np
 import pandas as pd
@@ -10,16 +8,12 @@ from PIL import Image
 
 from Config import Config
 
-
-# ----------------------------
-# Color utilities (must match)
-# ----------------------------
+# Color utilities
 def hex_to_rgb(hex_color: str) -> Tuple[int, int, int]:
     s = hex_color.strip().lstrip("#")
     if len(s) != 6:
         raise ValueError(f"Bad hex color: {hex_color}")
     return int(s[0:2], 16), int(s[2:4], 16), int(s[4:6], 16)
-
 
 def generate_mass_colors(mass_list: List[float]) -> Dict[str, str]:
     """
@@ -41,9 +35,7 @@ def generate_mass_colors(mass_list: List[float]) -> Dict[str, str]:
     return colors
 
 
-# ----------------------------
 # Mask building (transparent bg)
-# ----------------------------
 def build_color_mask_rgba(
     rgba: np.ndarray,
     target_rgb: Tuple[int, int, int],
