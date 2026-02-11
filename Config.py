@@ -5,7 +5,7 @@ class Config:
     BASE_DIR = Path.home() / "Desktop/maxiMiZe Tests"
     INPUT_SUBDIR = Path("maxiMiZe Files")
     OUTPUT_ROOT = Path("maxiMiZe Checkpoints")
-    ANALYSIS_FOLDER = "maxiMZe Tests 0211 5"
+    ANALYSIS_FOLDER = "maxiMZe Tests 0211 14"
 
     # Analysis parameters
     MASS_GROUPS = {
@@ -37,7 +37,6 @@ class Config:
     def setup_directories(cls):
         """Setup and return all required output directories."""
         dirs = {
-            'MassDetection': cls.BASE_DIR / cls.OUTPUT_ROOT / cls.ANALYSIS_FOLDER/ "Mass Detection",
             'png': cls.BASE_DIR / cls.OUTPUT_ROOT / cls.ANALYSIS_FOLDER / cls.CURRENT_GROUP / "EIC PNGs",
             'debugpng': cls.BASE_DIR / cls.OUTPUT_ROOT / cls.ANALYSIS_FOLDER / cls.CURRENT_GROUP / "Debug PNGs",
             'csv': cls.BASE_DIR / cls.OUTPUT_ROOT / cls.ANALYSIS_FOLDER / cls.CURRENT_GROUP / "EIC CSVs",

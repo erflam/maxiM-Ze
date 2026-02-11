@@ -1,11 +1,17 @@
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional
+import os
+from typing import Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
 from PIL import Image
 
 from Config import Config
+
+
+def _group_tag(group_name: str) -> str:
+    """Convert 'Group 1' -> 'Group1' (must match your EICBuilder naming)."""
+    return str(group_name).replace(" ", "")
 
 
 def hex_to_rgb(hex_color: str) -> Tuple[int, int, int]:
@@ -18,37 +24,43 @@ def hex_to_rgb(hex_color: str) -> Tuple[int, int, int]:
     return r, g, b
 
 
-def generate_mass_colors(mass_list: List[float]) -> Dict[str, str]:
+def _dark_hex_palette(n: int) -> List[str]:
     """
     MUST MATCH EICBuilder.py EXACTLY.
-    Generates the same DARK colors per m/z.
+    Your EICBuilder uses:
+      s = 0.85
+      v = 0.25
+      hue = i/n
     """
     import colorsys
 
-    mass_strs = [f"{m:.4f}" for m in mass_list]
-    n = max(1, len(mass_strs))
-
-    colors = {}
-    for i, mz_str in enumerate(mass_strs):
-        hue = i / n
-        saturation = 0.75
-        value = 0.40
-        r, g, b = colorsys.hsv_to_rgb(hue, saturation, value)
-        colors[mz_str] = '#{:02x}{:02x}{:02x}'.format(
-            int(r * 255),
-            int(g * 255),
-            int(b * 255)
-        )
-
+    if n <= 0:
+        return []
+    colors: List[str] = []
+    for i in range(n):
+        h = (i / n) % 1.0
+        s = 0.85
+        v = 0.25
+        r, g, b = colorsys.hsv_to_rgb(h, s, v)
+        colors.append(f"#{int(r*255):02x}{int(g*255):02x}{int(b*255):02x}")
     return colors
 
 
+def generate_mass_colors(mass_list: List[float]) -> Dict[str, str]:
+    """
+    MUST MATCH EICBuilder.py behavior:
+      - same ordering as mass_list
+      - color per index in that list
+      - key is mz_str formatted to 4 decimals
+    """
+    mass_strs = [f"{m:.4f}" for m in mass_list]
+    palette = _dark_hex_palette(len(mass_strs))
+    return {mass_strs[i]: palette[i] for i in range(len(mass_strs))}
+
+
 def boolean_runs_to_segments(col_has: np.ndarray) -> List[Tuple[int, int]]:
-    """
-    Convert a boolean array into contiguous (start, end) segments where True.
-    """
     segments: List[Tuple[int, int]] = []
-    w = col_has.shape[0]
+    w = int(col_has.shape[0])
     in_run = False
     start = 0
 
@@ -68,10 +80,6 @@ def boolean_runs_to_segments(col_has: np.ndarray) -> List[Tuple[int, int]]:
 
 
 def merge_close_segments(segments: List[Tuple[int, int]], max_gap_px: int = 2) -> List[Tuple[int, int]]:
-    """
-    Merge segments that are separated by small gaps (anti-aliasing / tiny breaks).
-    Example: (100,120) and (123,140) with max_gap_px=2 => merge into (100,140) because gap=2.
-    """
     if not segments:
         return []
 
@@ -90,11 +98,7 @@ def merge_close_segments(segments: List[Tuple[int, int]], max_gap_px: int = 2) -
 
 
 def filter_short_segments(segments: List[Tuple[int, int]], min_width_px: int = 3) -> List[Tuple[int, int]]:
-    """
-    Drop tiny segments (noise).
-    width = end-start+1 must be >= min_width_px
-    """
-    out = []
+    out: List[Tuple[int, int]] = []
     for s, e in segments:
         if (e - s + 1) >= min_width_px:
             out.append((s, e))
@@ -110,9 +114,8 @@ def find_segments_for_color(
     min_width_px: int = 3,
 ) -> List[Tuple[int, int]]:
     """
-    Return a list of (Pixel_start, Pixel_end) segments for pixels matching target_rgb.
-    Uses alpha to ignore transparent background and tolerance to survive anti-aliasing.
-    Produces multiple segments (for multiple peaks/isomers).
+    IMPORTANT: Your background is fully transparent.
+    So we only consider pixels where alpha >= alpha_threshold.
     """
     rgb = rgba[:, :, :3].astype(np.int16)
     alpha = rgba[:, :, 3].astype(np.int16)
@@ -133,69 +136,113 @@ def find_segments_for_color(
     return segments
 
 
-def run_for_group(group_name: str) -> None:
+def _normalize_base_for_png_lookup(base: str, group_tag: str) -> str:
+    """
+    Fixes the exact issue you saw:
+      EIC_EIC_<base>_<tag>_<tag>.png
+
+    This ensures we always build: EIC_{BASE}_{tag}.png
+    """
+    # remove extension already done by caller
+    if base.startswith("EIC_"):
+        base = base[len("EIC_") :]
+
+    # remove trailing _GroupX if present
+    suffix = f"_{group_tag}"
+    if base.endswith(suffix):
+        base = base[: -len(suffix)]
+
+    return base
+
+
+def process_file_checkpoint4(fp: str, dirs: Dict[str, str], group_name: str) -> str:
+    """
+    Checkpoint 4: Pixel mapping per PNG.
+    Writes: {base}_pixelmapping_{GroupTag}.csv into dirs['pixel']
+    Reads:  EIC_{base}_{GroupTag}.png from dirs['png']
+    """
     Config.set_mass_group(group_name)
+    tag = _group_tag(group_name)
 
-    group_dir = Config.BASE_DIR / Config.OUTPUT_ROOT / Config.ANALYSIS_FOLDER / str(Config.CURRENT_GROUP)
-    png_dir = group_dir / "EIC PNGs"
-    out_dir = group_dir / "Pixel CSVs"
-    out_dir.mkdir(parents=True, exist_ok=True)
+    # base name from whatever got passed in
+    base = os.path.splitext(os.path.basename(fp))[0]
+    base = _normalize_base_for_png_lookup(base, tag)
 
-    pngs = sorted(png_dir.glob("EIC_*_plotly.png"))
-    if not pngs:
-        print(f"[!] No PNGs found in: {png_dir}")
-        return
+    png_path = os.path.join(dirs["png"], f"EIC_{base}_{tag}.png")
+    out_path = os.path.join(dirs["pixel"], f"{base}_pixelmapping_{tag}.csv")
 
+    if not os.path.exists(png_path):
+        return f"[!] Missing PNG: {os.path.basename(png_path)}"
+
+    # If you want caching, uncomment:
+    # if os.path.exists(out_path):
+    #     return f"[↷] {os.path.basename(out_path)} (cached)"
+
+    # mass colors MUST MATCH EICBuilder
     mass_list = list(Config.MASS_LIST)
     mass_strs = [f"{m:.4f}" for m in mass_list]
     mass_colors = generate_mass_colors(mass_list)
 
-    # You can tweak these if needed:
-    RGB_TOL = 50       # 40-70 if needed
-    MAX_GAP = 3        # merge tiny breaks
-    MIN_WIDTH = 4      # drop tiny noise segments
+    # These are the same knobs you were using; adjust if needed
+    RGB_TOL = 60        # tolerance for anti-aliasing
+    MAX_GAP = 3         # merge tiny breaks
+    MIN_WIDTH = 4       # drop tiny noise segments
+    ALPHA_TH = 1        # background is transparent
 
-    for png_path in pngs:
-        stem = png_path.stem  # EIC_xxx_plotly
-        if not (stem.startswith("EIC_") and stem.endswith("_plotly")):
-            continue
-        base = stem[len("EIC_"):-len("_plotly")]
+    with Image.open(png_path) as im:
+        rgba = np.array(im.convert("RGBA"))
 
-        with Image.open(png_path) as im:
-            im = im.convert("RGBA")
-            rgba = np.array(im)
+    rows: List[Dict[str, object]] = []
+    for mz_str in mass_strs:
+        color_hex = mass_colors[mz_str]
+        rgb = hex_to_rgb(color_hex)
 
-        rows = []
-        for mz_str in mass_strs:
-            color_hex = mass_colors[mz_str]
-            rgb = hex_to_rgb(color_hex)
+        segments = find_segments_for_color(
+            rgba,
+            target_rgb=rgb,
+            alpha_threshold=ALPHA_TH,
+            rgb_tolerance=RGB_TOL,
+            max_gap_px=MAX_GAP,
+            min_width_px=MIN_WIDTH,
+        )
 
-            segments = find_segments_for_color(
-                rgba,
-                target_rgb=rgb,
-                alpha_threshold=1,
-                rgb_tolerance=RGB_TOL,
-                max_gap_px=MAX_GAP,
-                min_width_px=MIN_WIDTH,
-            )
-
-            # Write one row per segment (for isomers / multiple peaks)
-            for seg_id, (px_start, px_end) in enumerate(segments, start=1):
-                rows.append({
+        for seg_id, (px_start, px_end) in enumerate(segments, start=1):
+            rows.append(
+                {
                     "File Name": base,
                     "m/z": mz_str,
                     "Segment_ID": int(seg_id),
                     "Pixel_start": int(px_start),
                     "Pixel_end": int(px_end),
-                })
+                }
+            )
 
-        out_path = out_dir / f"{base}_pixelmapping_{group_name}.csv"
-        pd.DataFrame(
-            rows,
-            columns=["File Name", "m/z", "Segment_ID", "Pixel_start", "Pixel_end"]
-        ).to_csv(out_path, index=False)
+    pd.DataFrame(
+        rows,
+        columns=["File Name", "m/z", "Segment_ID", "Pixel_start", "Pixel_end"],
+    ).to_csv(out_path, index=False)
 
-        print(f"[✔] {out_path.name} ({len(rows)} segments)")
+    return f"[✔] {os.path.basename(out_path)} ({len(rows)} segments)"
+
+
+def run_for_group(group_name: str) -> None:
+    Config.set_mass_group(group_name)
+    dirs = Config.setup_directories()
+
+    # IMPORTANT: use the same "files list" you already use in pipeline
+    # Pixel mapping only needs the base name to locate the PNG.
+    # We'll just iterate mzXML names from your existing FileUtils list elsewhere,
+    # but for standalone mode, we can scan the png directory.
+    png_dir = dirs["png"]
+    pngs = sorted(Path(png_dir).glob(f"EIC_*_{_group_tag(group_name)}.png"))
+    if not pngs:
+        print(f"[!] No PNGs found for {group_name} in {png_dir}")
+        return
+
+    for p in pngs:
+        # Pass png path; normalization will handle prefix/suffix safely
+        msg = process_file_checkpoint4(str(p), dirs, group_name)
+        print(msg)
 
 
 if __name__ == "__main__":

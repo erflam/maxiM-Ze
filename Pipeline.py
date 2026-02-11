@@ -9,6 +9,8 @@ from FileUtils import FileUtils
 
 from FileReader import process_file_checkpoint1
 from EICBuilder import process_file_checkpoint2
+from Resolving import process_file_checkpoint3, count_peaks_per_file_summary
+from PixelMapping import process_file_checkpoint4
 
 
 def init_worker():
@@ -91,6 +93,59 @@ class Pipeline:
         elapsed = time.time() - start_time
         print(f'Checkpoint 2 completed in {elapsed:.2f} seconds!')
 
+    def run_group_checkpoint3(self, dirs, group_name):
+        files_to_process = [fp for fp in self.file_paths if fp and os.path.exists(fp)]
+        if not files_to_process:
+            print("No valid files found.")
+            return
+
+        start_time = time.time()
+        args = [(fp, dirs, group_name) for fp in files_to_process]
+
+        with Pool(processes=max(1, cpu_count() - 1), initializer=init_worker) as pool:
+            results = pool.starmap(process_file_checkpoint3, args)
+
+        for r in results:
+            print(r)
+
+        # Summary after resolving
+        print(count_peaks_per_file_summary(dirs, group_name))
+
+        elapsed = time.time() - start_time
+        print(f'Checkpoint 3 completed in {elapsed:.2f} seconds!')
+
+    def run_group_checkpoint4(self, dirs, group_name):
+        png_dir = dirs['png']
+        group_tag = str(group_name).replace(" ", "")  # "Group 1" -> "Group1"
+
+        pngs = [
+            os.path.join(png_dir, f)
+            for f in os.listdir(png_dir)
+            if f.startswith("EIC_") and f.endswith(f"_{group_tag}.png")
+        ]
+
+        if not pngs:
+            print(f"[!] No PNGs found for {group_name} in {png_dir}")
+            print("    (Tip) Here are the first 10 files in that folder:")
+            try:
+                for x in sorted(os.listdir(png_dir))[:10]:
+                    print("    -", x)
+            except Exception:
+                pass
+            return
+
+        start_time = time.time()
+        args = [(png, dirs, group_name) for png in pngs]
+
+        with Pool(processes=max(1, cpu_count() - 1), initializer=init_worker) as pool:
+            results = pool.starmap(process_file_checkpoint4, args)
+
+        for r in results:
+            print(r)
+
+        elapsed = time.time() - start_time
+        print(f"Checkpoint 4 (Pixel Mapping) completed in {elapsed:.2f} seconds!")
+
     def run(self):
         total_start = time.time()
 
@@ -104,6 +159,8 @@ class Pipeline:
 
             self.run_group_checkpoint1(dirs, group_name)
             self.run_group_checkpoint2(dirs, group_name)
+            self.run_group_checkpoint3(dirs, group_name)
+            self.run_group_checkpoint4(dirs, group_name)
 
         total_elapsed = time.time() - total_start
         print("\n" + "=" * 70)
@@ -120,4 +177,3 @@ if __name__ == "__main__":
     # Use clean_run() for profiling to delete all previous outputs
     # Use run() for normal execution that skips existing files
     pipeline.clean_run()
-
