@@ -11,7 +11,7 @@ from FileReader import process_file_checkpoint1
 from EICBuilder import process_file_checkpoint2
 from Resolving import process_file_checkpoint3, count_peaks_per_file_summary
 from PixelMapping import process_file_checkpoint4
-
+from Slicing import process_file_checkpoint5
 
 def init_worker():
     import matplotlib
@@ -114,6 +114,24 @@ class Pipeline:
         elapsed = time.time() - start_time
         print(f'Checkpoint 3 completed in {elapsed:.2f} seconds!')
 
+    def run_group_checkpoint5(self, dirs, group_name):
+        files_to_process = [fp for fp in self.file_paths if fp and os.path.exists(fp)]
+        if not files_to_process:
+            print("No valid files found.")
+            return
+
+        start_time = time.time()
+        args = [(fp, dirs, group_name) for fp in files_to_process]
+
+        with Pool(processes=max(1, cpu_count() - 1), initializer=init_worker) as pool:
+            results = pool.starmap(process_file_checkpoint5, args)
+
+        for r in results:
+            print(r)
+
+        elapsed = time.time() - start_time
+        print(f'Checkpoint 5 completed in {elapsed:.2f} seconds!')
+
     def run_group_checkpoint4(self, dirs, group_name):
         png_dir = dirs['png']
         group_tag = str(group_name).replace(" ", "")  # "Group 1" -> "Group1"
@@ -161,6 +179,7 @@ class Pipeline:
             self.run_group_checkpoint2(dirs, group_name)
             self.run_group_checkpoint3(dirs, group_name)
             self.run_group_checkpoint4(dirs, group_name)
+            self.run_group_checkpoint5(dirs, group_name)
 
         total_elapsed = time.time() - total_start
         print("\n" + "=" * 70)
