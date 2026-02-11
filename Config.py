@@ -5,12 +5,12 @@ class Config:
     BASE_DIR = Path.home() / "Desktop/maxiMiZe Tests"
     INPUT_SUBDIR = Path("maxiMiZe Files")
     OUTPUT_ROOT = Path("maxiMiZe Checkpoints")
-    ANALYSIS_FOLDER = "maxiMZe Tests 0211 14"
+    ANALYSIS_FOLDER = "maxiMZe Tests 0211 15"
 
     # Analysis parameters
     MASS_GROUPS = {
-        'Group 1': [169.0356, 182.0811, 297.1672, 132.1019],
-        'Group 2': [247.1540, 104.1069, 167.0896],
+        'Group1': [169.0356, 182.0811, 297.1672, 132.1019],
+        'Group2': [247.1540, 104.1069, 167.0896],
         #'Group 3': [104.0706, 86.0964, 269.1358],
         #'Group 4': [206.1005, 393.2859, 233.1383],
         #'Group 5': [235.1652, 187.0964, 261.1697],
@@ -20,10 +20,10 @@ class Config:
         #'Group 9': [179.0484, 409.1871, 292.2119],
         #'Group 10': [158.9640, 314.2327, 280.1391],
     }
-    MASS_LIST = MASS_GROUPS["Group 1"]  # Default to first group for backwards compatibility
+    MASS_LIST = MASS_GROUPS["Group1"]  # Default to first group for backwards compatibility
     MASS_TOLERANCE = 0.0005
     MAX_PEAK_DURATION = 1.5
-    CURRENT_GROUP = "Group 1"  # Track current group being processed
+    CURRENT_GROUP = "Group1"  # Track current group being processed
 
     @classmethod
     def set_mass_group(cls, group_name):
