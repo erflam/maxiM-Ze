@@ -8,9 +8,10 @@ from scipy.ndimage import gaussian_filter1d
 import plotly.io as pio
 import plotly.graph_objects as go
 from PIL import Image
-import time
 import os
 from Config import Config
+import colorsys
+
 
 REL_HEIGHT_BY_MASS = {104.1069: 0.985, 187.0964: 0.985, 119.0896: 0.98}
 DEFAULT_REL_HEIGHT = 0.99
@@ -21,6 +22,18 @@ SHOULDER_MIN_SEP_MIN = 0.06
 SHOULDER_VALLEY_DROP_FRAC = 0.85
 SHOULDER_LOCALMAX_ORDER = 2
 
+def _dark_hex_palette(n: int):
+    """Generate n distinct dark-ish hex colors."""
+    if n <= 0:
+        return []
+    colors = []
+    for i in range(n):
+        h = (i / n) % 1.0
+        s = 0.85
+        v = 0.25  # darker
+        r, g, b = colorsys.hsv_to_rgb(h, s, v)
+        colors.append(f"#{int(r*255):02x}{int(g*255):02x}{int(b*255):02x}")
+    return colors
 
 def improved_peak_cutting(intensity_vals_smooth, rt_vals, peaks, width_results, specific_mass):
     MIN_APEX_SEP_MIN = 0.015
@@ -217,7 +230,11 @@ def analyze_ms_file_plotly(file_path, output_image_path, file_colors):
                 continue
 
     fig = go.Figure()
-    color = file_colors[base]
+
+    # One distinct dark color per mass
+    mass_colors = _dark_hex_palette(len(mass_list))
+    mass_color_map = {mass_list[i]: mass_colors[i] for i in range(len(mass_list))}
+
     peaks_out = []
     all_peak_rts = []
 
@@ -494,7 +511,7 @@ def analyze_ms_file_plotly(file_path, output_image_path, file_colors):
                 fig.add_trace(go.Scatter(
                     x=x_peak, y=y_peak,
                     mode='lines',
-                    line=dict(color=color, width=3),
+                    line=dict(color=mass_color_map[specific_mass], width=3),
                     showlegend=False
                 ))
                 all_peak_rts.extend(x_peak.tolist())
@@ -555,7 +572,8 @@ def process_file_checkpoint2(fp, dirs, file_colors, group_name):
         base = os.path.splitext(os.path.basename(fp))[0]
         group_tag = Config.CURRENT_GROUP.replace(" ", "")
 
-        png_path = os.path.join(dirs['png'], f"EIC_{base}_plotly.png")
+        group_tag = Config.CURRENT_GROUP.replace(" ", "")
+        png_path = os.path.join(dirs['png'], f"EIC_{base}_{group_tag}.png")
         peaks_csv = os.path.join(dirs['csv'], f"{base}_peaks_{group_tag}.csv")
 
         if os.path.exists(png_path) and os.path.exists(peaks_csv):
