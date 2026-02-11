@@ -111,24 +111,6 @@ class Pipeline:
         elapsed = time.time() - start_time
         print(f'Checkpoint 3 completed in {elapsed:.2f} seconds!')
 
-    def run_group_checkpoint5(self, dirs, group_name):
-        files_to_process = [fp for fp in self.file_paths if fp and os.path.exists(fp)]
-        if not files_to_process:
-            print("No valid files found.")
-            return
-
-        start_time = time.time()
-        args = [(fp, dirs, group_name) for fp in files_to_process]
-
-        with Pool(processes=max(1, cpu_count() - 1), initializer=init_worker) as pool:
-            results = pool.starmap(process_file_checkpoint5, args)
-
-        for r in results:
-            print(r)
-
-        elapsed = time.time() - start_time
-        print(f'Checkpoint 5 completed in {elapsed:.2f} seconds!')
-
     def run_group_checkpoint4(self, dirs, group_name):
         png_dir = dirs['png']
         group_tag = str(group_name).replace(" ", "")  # "Group 1" -> "Group1"
@@ -161,6 +143,10 @@ class Pipeline:
         elapsed = time.time() - start_time
         print(f"Checkpoint 4 (Pixel Mapping) completed in {elapsed:.2f} seconds!")
 
+    def run_group_checkpoint5(self, dirs, group_name):
+        """Checkpoint 5: Slice PNG images based on pixel mapping"""
+        process_file_checkpoint5(self, dirs, group_name)
+
     def run(self):
         total_start = time.time()
 
@@ -177,9 +163,12 @@ class Pipeline:
             self.run_group_checkpoint5(dirs, group_name)
 
         total_elapsed = time.time() - total_start
+        print("🐊" * 33)
         print("=" * 70)
         print(f"ALL GROUPS COMPLETE in {total_elapsed:.2f} seconds")
         print("=" * 70)
+        print("🐊" * 33)
+        print("Go Gators! Go Garrett Lab!")
 
 if __name__ == "__main__":
     import multiprocessing
