@@ -5,7 +5,6 @@ from multiprocessing import Pool, cpu_count
 
 from Config import Config
 from FileUtils import FileUtils
-
 from FileReader import process_file_checkpoint1
 from EICBuilder import process_file_checkpoint2
 from Resolving import process_file_checkpoint3, count_peaks_per_file_summary
