@@ -5,7 +5,6 @@ import pandas as pd
 import numpy as np
 from numba import njit, prange
 from pyteomics import mzml, mzxml
-import time
 
 class MSFileAnalyzer:
     def __init__(self, file_path):
