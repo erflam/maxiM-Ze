@@ -1,13 +1,11 @@
 from pathlib import Path
 import os
 from typing import Dict, List, Tuple
-
 import numpy as np
 import pandas as pd
 from PIL import Image
 
 from Config import Config
-
 
 def _group_tag(group_name: str) -> str:
     """Convert 'Group 1' -> 'Group1' (must match your EICBuilder naming)."""
