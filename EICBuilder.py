@@ -1,4 +1,3 @@
-# EICBuilder.py
 from FileReader import *
 import numpy as np
 import pandas as pd
@@ -11,7 +10,6 @@ from PIL import Image
 import os
 from Config import Config
 import colorsys
-
 
 REL_HEIGHT_BY_MASS = {104.1069: 0.985, 187.0964: 0.985, 119.0896: 0.98}
 DEFAULT_REL_HEIGHT = 0.99
@@ -181,7 +179,6 @@ def improved_peak_cutting(intensity_vals_smooth, rt_vals, peaks, width_results, 
 
     return peaks, width_results
 
-
 def analyze_ms_file_plotly(file_path, output_image_path, file_colors):
     """Analyze MS file and generate plotly visualization (no debugging)."""
 
@@ -231,7 +228,7 @@ def analyze_ms_file_plotly(file_path, output_image_path, file_colors):
 
     fig = go.Figure()
 
-    # One distinct dark color per mass
+    # One dark color per mass
     mass_colors = _dark_hex_palette(len(mass_list))
     mass_color_map = {mass_list[i]: mass_colors[i] for i in range(len(mass_list))}
 
@@ -563,7 +560,6 @@ def analyze_ms_file_plotly(file_path, output_image_path, file_colors):
             peaks_out = df.to_dict('records')
 
     return peaks_out
-
 
 def process_file_checkpoint2(fp, dirs, file_colors, group_name):
     """Checkpoint 2: Build EIC PNG + peaks CSV (group-specific filename)."""
