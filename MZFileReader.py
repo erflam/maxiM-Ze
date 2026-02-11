@@ -7,7 +7,7 @@ from numba import njit, prange
 from pyteomics import mzml, mzxml
 import time
 
-class MSFileAnalyzer:
+class MSFileReader:
     def __init__(self, file_path):
         self.file_path = file_path
         self.base_name = os.path.splitext(os.path.basename(file_path))[0]
@@ -125,7 +125,7 @@ class MSFileAnalyzer:
         self._cached_eic = pd.DataFrame(records)
         return self._cached_eic
 
-class MSFileAnalyzerOptimized(MSFileAnalyzer):
+class MSFileReaderOptimized(MSFileReader):
     """Optimized version of MSFileAnalyzer with better memory management"""
 
     def extract_eic(self):
