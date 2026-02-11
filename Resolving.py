@@ -1,4 +1,3 @@
-# Resolving.py
 import os
 import numpy as np
 import pandas as pd
@@ -7,11 +6,9 @@ from PIL import Image
 
 from Config import Config
 
-
 def _group_tag(group_name: str) -> str:
     # Your disk filenames use Group1 / Group2 (no spaces)
     return group_name.replace(" ", "")
-
 
 def _paths_for_file(base: str, dirs: dict, group_name: str):
     tag = _group_tag(group_name)
@@ -23,7 +20,6 @@ def _paths_for_file(base: str, dirs: dict, group_name: str):
     # OUTPUTS
     pixel_csv = os.path.join(dirs["pixel"], f"{base}_peaks_pix_{tag}.csv")
     return peaks_csv, png_path, pixel_csv
-
 
 def process_file_checkpoint3(file_path: str, dirs: dict, group_name: str) -> str:
     """
@@ -39,7 +35,7 @@ def process_file_checkpoint3(file_path: str, dirs: dict, group_name: str) -> str
     base = os.path.splitext(os.path.basename(file_path))[0]
     peaks_csv, png_path, pixel_csv = _paths_for_file(base, dirs, group_name)
 
-    # === PARAMETERS (exactly from your merged pipeline checkpoint2) =========
+    # Parameters
     MIN_RT_DIFF = 0.095
     MIN_PIXEL_SEP = 6
     VALLEY_DROP_MIN = 0.40
@@ -48,7 +44,7 @@ def process_file_checkpoint3(file_path: str, dirs: dict, group_name: str) -> str
 
     KERNEL_3x3 = np.ones((3, 3), np.uint8)
 
-    # === FUNCTIONS (same logic as your merged code) =========================
+    # Functions
     def estimate_plot_bounds(h, w):
         t = int(MARGIN_FRAC * h)
         l = int(MARGIN_FRAC * w)
@@ -154,7 +150,7 @@ def process_file_checkpoint3(file_path: str, dirs: dict, group_name: str) -> str
         yR = profile_smooth[xR]
         return vx, float(vy), float(yL), float(yR)
 
-    # === MAIN ===============================================================
+    # Main Loop
     if os.path.exists(pixel_csv):
         return f"[↷] {base} ({group_name}) pixel csv cached"
 
@@ -353,7 +349,6 @@ def process_file_checkpoint3(file_path: str, dirs: dict, group_name: str) -> str
 
     df_out.to_csv(pixel_csv, index=False)
     return f"[✔] {base} ({group_name}): wrote {len(df_out)} rows to {os.path.basename(pixel_csv)}"
-
 
 def count_peaks_per_file_summary(dirs: dict, group_name: str) -> str:
     Config.set_mass_group(group_name)
