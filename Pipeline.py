@@ -1,4 +1,3 @@
-# Pipeline.py
 import os
 import time
 import shutil
@@ -19,7 +18,6 @@ def init_worker():
     import os
     os.environ['KALEIDO_DISABLE'] = '1'
     os.environ['PLOTLY_RENDERER'] = 'json'
-
 
 class Pipeline:
     def __init__(self):
@@ -168,9 +166,7 @@ class Pipeline:
         total_start = time.time()
 
         for group_name in Config.MASS_GROUPS.keys():
-            print("\n" + "=" * 70)
             print(f"Running group: {group_name}")
-            print("=" * 70)
 
             Config.set_mass_group(group_name)
             dirs = Config.setup_directories()
@@ -182,17 +178,14 @@ class Pipeline:
             self.run_group_checkpoint5(dirs, group_name)
 
         total_elapsed = time.time() - total_start
-        print("\n" + "=" * 70)
+        print("=" * 70)
         print(f"ALL GROUPS COMPLETE in {total_elapsed:.2f} seconds")
         print("=" * 70)
-
 
 if __name__ == "__main__":
     import multiprocessing
     multiprocessing.set_start_method("spawn", force=True)
-
     pipeline = Pipeline()
-
     # Use clean_run() for profiling to delete all previous outputs
     # Use run() for normal execution that skips existing files
     pipeline.clean_run()
