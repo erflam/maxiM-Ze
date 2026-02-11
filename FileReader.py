@@ -1,4 +1,3 @@
-# FileReader.py
 import os
 import re
 from Config import Config
@@ -7,7 +6,6 @@ import numpy as np
 from numba import njit, prange
 from pyteomics import mzml, mzxml
 import time
-
 
 class MSFileAnalyzer:
     def __init__(self, file_path):
@@ -186,7 +184,6 @@ class MSFileAnalyzerOptimized(MSFileAnalyzer):
             'intensity': intensity_values
         })
         return self._cached_eic
-
 
 def process_file_checkpoint1(fp, dirs, group_name):
     """Checkpoint 1: Extract EIC raw CSV with scan numbers, group-specific filename."""
