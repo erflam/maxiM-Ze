@@ -303,7 +303,7 @@ def process_file_checkpoint5(fp: str, dirs: Dict[str, str], group_name: str) -> 
     png_path = Path(dirs["png"]) / f"EIC_{base}_{group_tag}.png"
 
     # PixelMapping output (you currently write these into Pixel CSVs folder)
-    pixelmap_csv = Path(dirs["pixel"]) / f"{base}_pixelmapping_{group_name}.csv"
+    pixelmap_csv = Path(dirs["pixel"]) / f"{base}_pixelmapping_{group_tag}.csv"
 
     out_dir = Path(dirs["slice"])
     out_dir.mkdir(parents=True, exist_ok=True)
