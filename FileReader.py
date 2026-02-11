@@ -90,12 +90,11 @@ class MSFileAnalyzer:
                 for scan in reader:
                     try:
                         rt = self.get_retention_time(scan)
+                        scan_num = scan.get('num', None)
 
-                        # Handle dtype conversion for m/z and intensity arrays
                         mzs = self._convert_array_dtype(scan['m/z array'])
                         ints = self._convert_array_dtype(scan['intensity array'])
 
-                        # Use parallel version for large arrays
                         if len(mzs) > 10000:
                             intensities = self.fast_eic_extraction_parallel(
                                 mzs, ints, mass_list, Config.MASS_TOLERANCE
@@ -105,16 +104,16 @@ class MSFileAnalyzer:
                                 mzs, ints, mass_list, Config.MASS_TOLERANCE
                             )
 
-                        # Only add non-zero intensities to reduce memory
                         for m, i in zip(mass_list, intensities):
                             if i > 0:
                                 records.append({
+                                    'scan': scan_num,
                                     'rt': rt,
                                     'mass': m,
                                     'intensity': i
                                 })
 
-                    except KeyError as e:
+                    except KeyError:
                         continue
                     except Exception as e:
                         print(f"Skipping scan due to error: {str(e)}")
@@ -136,9 +135,10 @@ class MSFileAnalyzerOptimized(MSFileAnalyzer):
         if self._cached_eic is not None:
             return self._cached_eic
 
-        # Use string version of Config masses for output!
         mass_list = list(Config.MASS_LIST)
         mass_list_str = [f"{m:.4f}" for m in Config.MASS_LIST]
+
+        scan_values = []
         rt_values = []
         intensity_values = []
         mass_indices = []
@@ -148,9 +148,11 @@ class MSFileAnalyzerOptimized(MSFileAnalyzer):
                 for scan in reader:
                     try:
                         rt = self.get_retention_time(scan)
+                        scan_num = scan.get('num', None)
+
                         mzs = self._convert_array_dtype(scan['m/z array'])
                         ints = self._convert_array_dtype(scan['intensity array'])
-                        # Use parallel version for large arrays
+
                         if len(mzs) > 10000:
                             intensities = self.fast_eic_extraction_parallel(
                                 mzs, ints, np.array(mass_list, dtype=np.float32), Config.MASS_TOLERANCE
@@ -159,22 +161,26 @@ class MSFileAnalyzerOptimized(MSFileAnalyzer):
                             intensities = self.fast_eic_extraction(
                                 mzs, ints, np.array(mass_list, dtype=np.float32), Config.MASS_TOLERANCE
                             )
+
                         for idx, i in enumerate(intensities):
                             if i > 0:
+                                scan_values.append(scan_num)
                                 rt_values.append(rt)
                                 intensity_values.append(i)
                                 mass_indices.append(idx)
+
                     except KeyError:
                         continue
                     except Exception as e:
                         print(f"Skipping scan due to error: {str(e)}")
                         continue
+
         except Exception as e:
             print(f"Fatal error processing {self.file_path}: {str(e)}")
             raise
 
-        # HERE: Use list of strings, not the (possibly imprecise) float mass!
         self._cached_eic = pd.DataFrame({
+            'scan': scan_values,
             'rt': rt_values,
             'mass': [mass_list_str[i] for i in mass_indices],
             'intensity': intensity_values
@@ -182,29 +188,21 @@ class MSFileAnalyzerOptimized(MSFileAnalyzer):
         return self._cached_eic
 
 
-def process_file_checkpoint1(fp, dirs):
-    """Checkpoint 1: Extract EIC raw CSV only (verbatim block from Unified_Pipeline.process_file_optimized)."""
+def process_file_checkpoint1(fp, dirs, group_name):
+    """Checkpoint 1: Extract EIC raw CSV with scan numbers, group-specific filename."""
+    Config.set_mass_group(group_name)
     try:
-        # Get base name once and reuse
         base = os.path.splitext(os.path.basename(fp))[0]
+        group_tag = Config.CURRENT_GROUP.replace(" ", "")
+        raw_csv = os.path.join(dirs['csv'], f"{base}_EIC_raw_{group_tag}.csv")
 
-        # Create file paths upfront
-        raw_csv = os.path.join(dirs['csv'], f"{base}_EIC_raw.csv")
-
-        # Quick batch existence check
         if os.path.exists(raw_csv):
             return f"[↷] {base} (raw cached)"
 
-        # Process the file with optimized memory usage
         analyzer = MSFileAnalyzerOptimized(fp)
-
-        # Extract EIC data only if needed
         df_raw = analyzer.extract_eic()
-        # Use faster CSV writing with reduced precision
         df_raw.to_csv(raw_csv, index=False, float_format='%.3f')
         del df_raw
-
-        # Free analyzer memory immediately
         del analyzer
 
         return f"[✔] {base} (raw)"

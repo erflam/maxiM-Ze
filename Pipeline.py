@@ -1,267 +1,123 @@
-"""
-Pipeline.py
-Main orchestration script for the mass spectrometry analysis pipeline.
-
-Pipeline checkpoints:
-1. FileReader: Process mzXML files and create filtered CSVs for each mass group
-2. EICBuilder: Generate EIC PNG images with peak detection for each mass group
-3. (Future checkpoints can be added here)
-"""
-
+# Pipeline.py
+import os
 import time
 import shutil
-from pathlib import Path
-from typing import Optional, List
+from multiprocessing import Pool, cpu_count
 
 from Config import Config
 from FileUtils import FileUtils
-import FileReader
-import EICBuilder
-import PixelMapping
+
+from FileReader import process_file_checkpoint1
+from EICBuilder import process_file_checkpoint2
+
+
+def init_worker():
+    import matplotlib
+    matplotlib.use('Agg')
+    import os
+    os.environ['KALEIDO_DISABLE'] = '1'
+    os.environ['PLOTLY_RENDERER'] = 'json'
+
 
 class Pipeline:
-    """Main pipeline orchestrator for MS analysis"""
+    def __init__(self):
+        self.config = Config()
+        self.file_paths = FileUtils.get_file_paths()
+        self.file_colors = {
+            os.path.splitext(os.path.basename(fp))[0]: FileUtils.random_dark_hex_color()
+            for fp in self.file_paths
+        }
 
-    def __init__(self, clean_run: bool = False):
-        """
-        Initialize the pipeline
+    def _delete_group_outputs(self, group_name):
+        Config.set_mass_group(group_name)
+        dirs = Config.setup_directories()
 
-        Args:
-            clean_run: If True, delete all existing output before starting
-        """
-        self.start_time = None
-        self.checkpoint_times = {}
-        self.clean_run = clean_run
+        for key, dir_path in dirs.items():
+            if dir_path and os.path.exists(dir_path):
+                shutil.rmtree(dir_path)
+                print(f"Deleted [{group_name}] {key}: {dir_path}")
 
-        if self.clean_run:
-            self.clean_output_directory()
+    def clean_run(self):
+        """Deletes all previous outputs for ALL groups, then runs fresh."""
+        import shutil
 
-    def clean_output_directory(self):
-        """Delete all existing output to start fresh"""
-        output_root = Config.BASE_DIR / Config.OUTPUT_ROOT / Config.ANALYSIS_FOLDER
-
-        if output_root.exists():
-            print("\n" + "=" * 80)
-            print("CLEAN RUN: Removing existing output")
-            print("=" * 80)
-            print(f"Deleting: {output_root}")
-
-            try:
-                shutil.rmtree(output_root)
-                print("[✔] Output directory cleaned successfully")
-            except Exception as e:
-                print(f"[!] Error cleaning output directory: {e}")
-                raise
-        else:
-            print("\n[i] No existing output found (clean start)")
-
-    def format_time(self, seconds: float) -> str:
-        """
-        Format time in a human-readable way
-
-        Args:
-            seconds: Time in seconds
-
-        Returns:
-            Formatted time string
-        """
-        if seconds < 60:
-            return f"{seconds:.2f} seconds"
-        elif seconds < 3600:
-            minutes = seconds / 60
-            return f"{minutes:.2f} minutes ({seconds:.2f} seconds)"
-        else:
-            hours = seconds / 3600
-            minutes = (seconds % 3600) / 60
-            return f"{hours:.2f} hours ({minutes:.2f} minutes, {seconds:.2f} seconds)"
-
-    def run_checkpoint_1_file_reading(self, noise_level: float = 5000.0, n_processes: Optional[int] = None):
-        """
-        Checkpoint 1: Read mzXML files and create filtered CSVs for all groups
-
-        Args:
-            noise_level: Minimum intensity threshold for peak detection
-            n_processes: Number of parallel processes (default: CPU count - 1)
-        """
-        print("\n" + "=" * 80)
-        print("CHECKPOINT 1: FILE READING & PEAK DETECTION")
-        print("=" * 80)
-
-        checkpoint_start = time.time()
-
-        # Run FileReader to process all files and create filtered CSVs for all groups
-        FileReader.process_all_groups(
-            noise_level=noise_level,
-            n_processes=n_processes
-        )
-
-        checkpoint_elapsed = time.time() - checkpoint_start
-        self.checkpoint_times['Checkpoint 1: File Reading'] = checkpoint_elapsed
-
-        print(f"\n[✔] Checkpoint 1 completed in {self.format_time(checkpoint_elapsed)}")
-
-    def run_checkpoint_2_eic_building(self, n_processes: Optional[int] = None):
-        """
-        Checkpoint 2: Build EIC PNG images with peak detection for all groups
-
-        Args:
-            n_processes: Number of parallel processes (default: CPU count - 1)
-        """
-        print("\n" + "=" * 80)
-        print("CHECKPOINT 2: EIC IMAGE GENERATION")
-        print("=" * 80)
-
-        checkpoint_start = time.time()
-
-        # Run EICBuilder to generate PNG images for all groups
-        EICBuilder.build_eics_for_all_groups(n_processes=n_processes)
-
-        checkpoint_elapsed = time.time() - checkpoint_start
-        self.checkpoint_times['Checkpoint 2: EIC Building'] = checkpoint_elapsed
-
-        print(f"\n[✔] Checkpoint 2 completed in {self.format_time(checkpoint_elapsed)}")
-
-    def run_checkpoint_3_pixel_mapping(self):
-        """
-        Checkpoint 3: Pixel mapping from EIC PNGs (pure image-only, per m/z)
-        Produces: {File}_pixelmapping_{Group}.csv
-        """
-        print("\n" + "=" * 80)
-        print("CHECKPOINT 3: PIXEL MAPPING (IMAGE ONLY)")
-        print("=" * 80)
-
-        checkpoint_start = time.time()
+        print("\nCLEAN RUN: deleting all previous outputs...\n")
 
         for group_name in Config.MASS_GROUPS.keys():
-            PixelMapping.run_for_group(group_name)
+            Config.set_mass_group(group_name)
+            dirs = Config.setup_directories()
 
-        checkpoint_elapsed = time.time() - checkpoint_start
-        self.checkpoint_times['Checkpoint 3: Pixel Mapping'] = checkpoint_elapsed
+            for dir_path in dirs.values():
+                if dir_path and os.path.exists(dir_path):
+                    shutil.rmtree(dir_path)
+                    print(f"Deleted {dir_path}")
 
-        print(f"\n[✔] Checkpoint 3 completed in {self.format_time(checkpoint_elapsed)}")
+        print("\nAll outputs deleted. Starting fresh run...\n")
+        self.run()
 
-    def run_full_pipeline(
-            self,
-            noise_level: float = 5000.0,
-            n_processes: Optional[int] = None,
-            checkpoints: Optional[List[int]] = None
-    ):
-        """
-        Run the complete analysis pipeline for all groups
+    def run_group_checkpoint1(self, dirs, group_name):
+        files_to_process = [fp for fp in self.file_paths if fp and os.path.exists(fp)]
+        if not files_to_process:
+            print("No valid files found.")
+            return
 
-        Args:
-            noise_level: Minimum intensity threshold for peak detection
-            n_processes: Number of parallel processes (default: CPU count - 1)
-            checkpoints: List of checkpoint numbers to run (default: all checkpoints [1, 2])
-        """
-        self.start_time = time.time()
+        start_time = time.time()
+        args = [(fp, dirs, group_name) for fp in files_to_process]
 
-        if checkpoints is None:
-            checkpoints = [1, 2, 3]  # Run all checkpoints by default
+        with Pool(processes=max(1, cpu_count() - 1), initializer=init_worker) as pool:
+            results = pool.starmap(process_file_checkpoint1, args)
 
-        print("\n" + "=" * 80)
-        print("MASS SPECTROMETRY ANALYSIS PIPELINE")
-        print("=" * 80)
-        print(f"Clean Run: {'YES (starting fresh)' if self.clean_run else 'NO (incremental)'}")
-        print(f"Analysis Folder: {Config.ANALYSIS_FOLDER}")
-        print(f"Base Directory: {Config.BASE_DIR}")
-        print(f"Input Directory: {Config.BASE_DIR / Config.INPUT_SUBDIR}")
-        print(f"Output Root: {Config.BASE_DIR / Config.OUTPUT_ROOT / Config.ANALYSIS_FOLDER}")
-        print(f"Number of Groups: {len(Config.MASS_GROUPS)}")
-        print(f"Groups: {', '.join(Config.MASS_GROUPS.keys())}")
-        print(f"Checkpoints to run: {checkpoints}")
-        print("=" * 80)
+        for r in results:
+            print(r)
 
-        # Checkpoint 1: File Reading
-        if 1 in checkpoints:
-            self.run_checkpoint_1_file_reading(noise_level=noise_level, n_processes=n_processes)
+        elapsed = time.time() - start_time
+        print(f'Checkpoint 1 completed in {elapsed:.2f} seconds!')
 
-        # Checkpoint 2: EIC Building
-        if 2 in checkpoints:
-            self.run_checkpoint_2_eic_building(n_processes=n_processes)
+    def run_group_checkpoint2(self, dirs, group_name):
+        files_to_process = [fp for fp in self.file_paths if fp and os.path.exists(fp)]
+        if not files_to_process:
+            print("No valid files found.")
+            return
 
-        if 3 in checkpoints:
-            self.run_checkpoint_3_pixel_mapping()
+        start_time = time.time()
+        args = [(fp, dirs, self.file_colors, group_name) for fp in files_to_process]
 
-        # Print final summary
-        self.print_summary()
+        with Pool(processes=max(1, cpu_count() - 1), initializer=init_worker) as pool:
+            results = pool.starmap(process_file_checkpoint2, args)
 
-    def print_summary(self):
-        """Print pipeline execution summary"""
-        total_elapsed = time.time() - self.start_time
+        for r in results:
+            print(r)
 
-        print("\n" + "=" * 80)
-        print("PIPELINE EXECUTION SUMMARY")
-        print("=" * 80)
-        print()
+        elapsed = time.time() - start_time
+        print(f'Checkpoint 2 completed in {elapsed:.2f} seconds!')
 
-        # Print individual checkpoint times
-        for checkpoint_name, checkpoint_time in self.checkpoint_times.items():
-            print(f"{checkpoint_name}:")
-            print(f"  Time: {self.format_time(checkpoint_time)}")
-            print()
-
-        # Print total time
-        print("-" * 80)
-        print(f"Total Pipeline Time: {self.format_time(total_elapsed)}")
-        print("-" * 80)
-
-        # Calculate percentage breakdown if multiple checkpoints ran
-        if len(self.checkpoint_times) > 1:
-            print("\nTime Breakdown:")
-            for checkpoint_name, checkpoint_time in self.checkpoint_times.items():
-                percentage = (checkpoint_time / total_elapsed) * 100
-                print(f"  {checkpoint_name}: {percentage:.1f}%")
-
-        print("=" * 80)
-
-        # Print output locations
-        print("\nOutput Locations:")
-        print(f"  Raw Peak Data: {Config.BASE_DIR / Config.OUTPUT_ROOT / Config.ANALYSIS_FOLDER / 'Mass Detection'}")
+    def run(self):
+        total_start = time.time()
 
         for group_name in Config.MASS_GROUPS.keys():
-            group_dir = Config.BASE_DIR / Config.OUTPUT_ROOT / Config.ANALYSIS_FOLDER / group_name
-            print(f"\n  {group_name}:")
-            print(f"    Filtered CSVs: {group_dir / 'EIC CSVs'}")
-            print(f"    EIC Images: {group_dir / 'EIC PNGs'}")
-            print(f"    Pixel Mapping CSVs: {group_dir / 'Pixel CSVs'}")
+            print("\n" + "=" * 70)
+            print(f"Running group: {group_name}")
+            print("=" * 70)
 
-        print("\n" + "=" * 80)
+            Config.set_mass_group(group_name)
+            dirs = Config.setup_directories()
 
+            self.run_group_checkpoint1(dirs, group_name)
+            self.run_group_checkpoint2(dirs, group_name)
 
-def main():
-    """Main entry point for the pipeline"""
-
-    # ========================================
-    # OPTION 1: Full clean run (start fresh) - ALL GROUPS
-    # ========================================
-    pipeline = Pipeline(clean_run=True)
-    pipeline.run_full_pipeline(
-        noise_level=5000.0,
-        n_processes=None,  # Auto-detect CPU cores
-        checkpoints=[1, 2, 3]  # Run all checkpoints
-    )
-
-    # ========================================
-    # OPTION 2: Incremental run (use existing data where possible) - ALL GROUPS
-    # ========================================
-    # pipeline = Pipeline(clean_run=False)
-    # pipeline.run_full_pipeline(
-    #     noise_level=5000.0,
-    #     n_processes=None,
-    #     checkpoints=[1, 2]
-    # )
-
-    # ========================================
-    # OPTION 3: Run only specific checkpoints - ALL GROUPS
-    # ========================================
-    # pipeline = Pipeline(clean_run=False)
-    # pipeline.run_full_pipeline(
-    #     noise_level=5000.0,
-    #     n_processes=None,
-    #     checkpoints=[2]  # Only run Checkpoint 2 (EIC building)
-    # )
+        total_elapsed = time.time() - total_start
+        print("\n" + "=" * 70)
+        print(f"ALL GROUPS COMPLETE in {total_elapsed:.2f} seconds")
+        print("=" * 70)
 
 
 if __name__ == "__main__":
-    main()
+    import multiprocessing
+    multiprocessing.set_start_method("spawn", force=True)
+
+    pipeline = Pipeline()
+
+    # Use clean_run() for profiling to delete all previous outputs
+    # Use run() for normal execution that skips existing files
+    pipeline.clean_run()
+
