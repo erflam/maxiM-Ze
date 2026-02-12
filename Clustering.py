@@ -1,150 +1,127 @@
 # Clustering.py
-# ------------------------------------------------------------
-# Shape-similarity clustering + optional post-clustering repair
-# for Peak Patches PNGs named like:
-#   {base}_mz{mz}_Peak{N}_{GroupTag}.png
+# Align / cluster Peak patches by SHAPE similarity + build summary tables + optional RT/mass recluster + final Excel export
 #
-# Outputs (per group) to dirs["clustering"]:
-#   - peak_alignment.csv
-#   - alignment_summary_group_{group}.csv
-#   - unclustered_peaks_group_{group}.csv
-#   - Feature_list_{group}.csv (if recluster is enabled and can run)
+# Expected patch filenames (stem, no .png):
+#   {file_base}_mz{mz}_Peak{peaknum}_{GroupTag}
+# Example:
+#   OE_EF_IsmailBaseline_POS_C007_0002_mz187.0964_Peak2_Group1.png
 #
-# Also includes: export_all_group_summaries_to_excel()
-# ------------------------------------------------------------
+# Expected pixel CSV per file (in dirs["pixel"]):
+#   {file_base}_peaks_pix.csv
+# Must contain columns: peak_num, RT_start, RT_apex, RT_end, pixel_start, pixel_end, height, area
 
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional, Any
+from typing import Dict, List, Optional, Tuple
 
+import cv2
 import numpy as np
 import pandas as pd
-import cv2
 from scipy.stats import pearsonr
 
 from Config import Config
 
 
-# -----------------------------
-# Params
-# -----------------------------
-@dataclass(frozen=True)
-class ClusteringParams:
-    similarity_threshold: float = 0.75     # Pearson corr threshold
-    rt_resolution_threshold: float = 0.01  # minutes; below => treat as unresolved (optional)
-    target_size: Tuple[int, int] = (50, 50)
-    verbose: bool = True
-
-
-@dataclass(frozen=True)
-class ReclusterParams:
-    min_coverage: float = 0.95  # fraction of files
-    rt_tol: float = 0.10        # minutes
-    mass_tol: float = 0.0001    # m/z
-    verbose: bool = True
-
-
-# -----------------------------
+# ----------------------------
 # Filename parsing
-# -----------------------------
-_PATCH_RE = re.compile(
-    r"^(?P<base>.+?)_mz(?P<mz>\d+(?:\.\d+)?)_Peak(?P<peak>\d+)_(?P<group>[^_]+)\.png$"
-)
+# ----------------------------
 
-def parse_patch_filename(stem: str) -> Optional[Tuple[str, float, int, str]]:
+_PATCH_RE = re.compile(r"(.+)_mz(\d+\.\d+)_Peak(\d+)_(Group\d+)$")
+
+
+def parse_patch_stem(stem: str) -> Optional[Tuple[str, float, int, str]]:
     """
-    stem: filename without extension
-    returns: (base, mz, peak_num, group_tag)
+    Returns: (file_base, mz, peak_num, group_tag)
     """
-    m = _PATCH_RE.match(stem + ".png")  # easiest reuse: add .png to satisfy regex
+    m = _PATCH_RE.match(stem)
     if not m:
         return None
-    base = m.group("base")
-    mz = float(m.group("mz"))
-    peak_num = int(m.group("peak"))
-    group_tag = m.group("group")
-    return base, mz, peak_num, group_tag
+    file_base, mz_s, peak_s, group_tag = m.groups()
+    return file_base, float(mz_s), int(peak_s), group_tag
 
 
-def _group_tag(group_name: str) -> str:
-    return str(group_name).replace(" ", "")
+# ----------------------------
+# Core peak objects
+# ----------------------------
+
+@dataclass
+class PeakInfo:
+    peak_id: str          # patch stem
+    file_base: str
+    mz: float
+    peak_num: int
+    group_tag: str
+
+    rt_start: float
+    rt_apex: float
+    rt_end: float
+    pixel_start: float
+    pixel_end: float
+    peak_height: float
+    peak_area: float
+
+    image: np.ndarray     # grayscale
 
 
-# -----------------------------
-# Robust column access for peaks_pix_{tag}.csv
-# -----------------------------
-def _col(df: pd.DataFrame, *names: str) -> str:
+# ----------------------------
+# Similarity helpers
+# ----------------------------
+
+def _profile_from_image(img_gray: np.ndarray, target_size=(50, 50)) -> Optional[np.ndarray]:
     """
-    Return the first column name that exists in df among provided names.
-    Raises KeyError if none exist.
+    Produces a normalized 1D intensity profile for correlation.
+    Returns None if profile is constant/invalid.
     """
-    for n in names:
-        if n in df.columns:
-            return n
-    raise KeyError(f"Missing columns (tried {names}); available={list(df.columns)}")
-
-
-def load_peak_row(peaks_pix_csv: Path, peak_num: int) -> Optional[pd.Series]:
-    if not peaks_pix_csv.exists():
-        return None
     try:
-        df = pd.read_csv(peaks_pix_csv)
-        pn_col = _col(df, "peak_num", "Peak_num", "PeakNum")
-        row = df[df[pn_col].astype(int) == int(peak_num)]
-        if row.empty:
+        img_resized = cv2.resize(img_gray, target_size, interpolation=cv2.INTER_AREA)
+        img_smooth = cv2.GaussianBlur(img_resized, (3, 3), 0)
+        profile = np.mean(img_smooth, axis=0).astype(np.float64)
+
+        if np.std(profile) < 1e-10:
             return None
-        return row.iloc[0]
+
+        # Min-max normalize
+        mn, mx = float(profile.min()), float(profile.max())
+        profile = (profile - mn) / (mx - mn + 1e-10)
+
+        if np.std(profile) < 1e-10:
+            return None
+
+        return profile
     except Exception:
         return None
 
 
-# -----------------------------
-# Shape similarity
-# -----------------------------
-def _normalized_profile_from_img(gray_img: np.ndarray, target_size: Tuple[int, int]) -> Optional[np.ndarray]:
+def filter_by_shape_similarity(
+    peaks: List[PeakInfo],
+    similarity_threshold: float = 0.75,
+    target_size=(50, 50),
+    debug_print: bool = True,
+) -> List[PeakInfo]:
     """
-    Convert image -> smoothed, normalized 1D profile (mean over rows).
-    Returns None if profile is constant/invalid.
-    """
-    img_resized = cv2.resize(gray_img, target_size, interpolation=cv2.INTER_AREA)
-    img_smooth = cv2.GaussianBlur(img_resized, (3, 3), 0)
-    profile = np.mean(img_smooth.astype(np.float64), axis=0)
-
-    if np.std(profile) < 1e-10:
-        return None
-    profile = (profile - profile.min()) / (profile.max() - profile.min() + 1e-10)
-    if np.std(profile) < 1e-10:
-        return None
-    return profile
-
-
-def check_peak_similarity(peaks: List[Dict[str, Any]], params: ClusteringParams) -> List[Dict[str, Any]]:
-    """
-    Keep peaks whose 1D profiles correlate well with a reference profile.
-    Reference is the peak with highest avg correlation to others.
+    Keeps peaks whose profile correlates with the most representative peak (highest avg corr).
     """
     if not peaks:
         return []
 
     profiles: List[np.ndarray] = []
-    valid_peaks: List[Dict[str, Any]] = []
+    valid_peaks: List[PeakInfo] = []
 
-    for peak in peaks:
-        prof = _normalized_profile_from_img(peak["image"], params.target_size)
+    for p in peaks:
+        prof = _profile_from_image(p.image, target_size=target_size)
         if prof is None:
-            if params.verbose:
-                print(f"  - {peak['peak_id']}: skipped (constant profile)")
+            if debug_print:
+                print(f"  - {p.peak_id}: skipped (constant/invalid profile)")
             continue
         profiles.append(prof)
-        valid_peaks.append(peak)
+        valid_peaks.append(p)
 
     if len(valid_peaks) <= 1:
         return valid_peaks
 
-    # correlations matrix
     n = len(valid_peaks)
     corr_mat = np.zeros((n, n), dtype=np.float64)
 
@@ -153,403 +130,364 @@ def check_peak_similarity(peaks: List[Dict[str, Any]], params: ClusteringParams)
             if i == j:
                 continue
             try:
-                corr = float(pearsonr(profiles[i], profiles[j])[0])
-                if np.isnan(corr):
-                    corr = 0.0
+                r = pearsonr(profiles[i], profiles[j])[0]
+                if r is None or np.isnan(r):
+                    r = 0.0
             except Exception:
-                corr = 0.0
-            corr_mat[i, j] = corr
+                r = 0.0
+            corr_mat[i, j] = r
 
     avg_corr = np.nanmean(corr_mat, axis=1)
-    ref_idx = int(np.nanargmax(avg_corr)) if np.any(~np.isnan(avg_corr)) else 0
-    ref_prof = profiles[ref_idx]
+    ref_idx = int(np.nanargmax(avg_corr)) if len(avg_corr) else 0
+    ref_profile = profiles[ref_idx]
 
-    if params.verbose:
+    if debug_print:
         print("\nSimilarity scores:")
 
-    kept: List[Dict[str, Any]] = []
-    for idx, peak in enumerate(valid_peaks):
+    kept: List[PeakInfo] = []
+    for i, p in enumerate(valid_peaks):
         try:
-            corr = float(pearsonr(ref_prof, profiles[idx])[0])
-            if np.isnan(corr):
-                corr = 0.0
-            if params.verbose:
-                print(f"  - {peak['peak_id']}: {corr:.3f}")
-            if corr >= params.similarity_threshold:
-                kept.append(peak)
+            r = pearsonr(ref_profile, profiles[i])[0]
+            if r is None or np.isnan(r):
+                r = 0.0
+                if debug_print:
+                    print(f"  - {p.peak_id}: nan")
+            else:
+                if debug_print:
+                    print(f"  - {p.peak_id}: {r:.3f}")
+
+            if float(r) >= float(similarity_threshold):
+                kept.append(p)
         except Exception as e:
-            if params.verbose:
-                print(f"  - {peak['peak_id']}: error ({e})")
-            continue
+            if debug_print:
+                print(f"  - {p.peak_id}: error ({e})")
 
     return kept
 
 
-# -----------------------------
-# Resolution grouping (optional)
-# -----------------------------
-def check_peak_resolution(peaks_in_file: List[Dict[str, Any]], params: ClusteringParams) -> Dict[str, Any]:
+# ----------------------------
+# Loading patches + pixel metadata
+# ----------------------------
+
+def load_peaks_from_patch_dir(
+    patch_dir: Path,
+    pixel_dir: Path,
+    expected_group_tag: str,
+) -> Dict[float, Dict[str, List[PeakInfo]]]:
     """
-    Groups peaks that are too close in RT into unresolved groups.
-    Returns {'resolved': bool, 'groups': List[List[int]]} where indices refer to peaks sorted by rt_apex.
+    Returns structure:
+      mass_peaks[mz][file_base] -> list of PeakInfo
+    Only loads patches that match expected_group_tag.
     """
-    if len(peaks_in_file) < 2:
-        return {"resolved": True, "groups": [[0]]}
+    mass_peaks: Dict[float, Dict[str, List[PeakInfo]]] = {}
 
-    peaks_sorted = sorted(peaks_in_file, key=lambda x: x["rt_apex"])
-
-    current_group = [0]
-    groups: List[List[int]] = []
-
-    for i in range(len(peaks_sorted) - 1):
-        rt_diff = peaks_sorted[i + 1]["rt_apex"] - peaks_sorted[i]["rt_apex"]
-        if rt_diff < params.rt_resolution_threshold:
-            current_group.append(i + 1)
-        else:
-            groups.append(current_group)
-            current_group = [i + 1]
-
-    if current_group:
-        groups.append(current_group)
-
-    return {"resolved": len(groups) == len(peaks_sorted), "groups": groups, "sorted": peaks_sorted}
-
-
-# -----------------------------
-# Main clustering step (pipeline)
-# -----------------------------
-def process_file_clustering(
-    dirs: Dict[str, str],
-    group_name: str,
-    params: ClusteringParams = ClusteringParams(),
-) -> str:
-    """
-    Expects dirs:
-      - dirs["patch"]      : Peak Patches folder (input PNGs)
-      - dirs["pixel"]      : per-file peaks_pix_{tag}.csv folder
-      - dirs["clustering"] : output folder
-    """
-    group_tag = _group_tag(group_name)
-
-    patch_dir = Path(dirs["patch"])
-    pixel_dir = Path(dirs["pixel"])
-    cluster_dir = Path(dirs["clustering"])
-    cluster_dir.mkdir(parents=True, exist_ok=True)
-
-    if not patch_dir.exists():
-        return f"[!] Missing patch dir: {patch_dir}"
-
-    # Collect peaks grouped by mass -> file_base
-    mass_peaks: Dict[float, Dict[str, List[Dict[str, Any]]]] = {}
-
-    # Parse all patch PNGs for this group
-    patch_files = sorted(patch_dir.glob(f"*_{group_tag}.png"))
-    if not patch_files:
-        return f"[!] No patch PNGs found for {group_name} in {patch_dir}"
-
-    for patch_file in patch_files:
-        parsed = parse_patch_filename(patch_file.stem)
+    for patch_file in patch_dir.glob("*.png"):
+        stem = patch_file.stem
+        parsed = parse_patch_stem(stem)
         if parsed is None:
             continue
-        file_base, mz, peak_num, gtag = parsed
-        if gtag != group_tag:
+
+        file_base, mz, peak_num, group_tag = parsed
+        if group_tag != expected_group_tag:
             continue
 
-        peaks_pix_csv = pixel_dir / f"{file_base}_peaks_pix_{group_tag}.csv"
-        row = load_peak_row(peaks_pix_csv, peak_num)
-        if row is None:
-            # If missing meta, skip (could also warn)
+        pix_csv = pixel_dir / f"{file_base}_peaks_pix.csv"
+        if not pix_csv.exists():
             continue
 
         try:
-            rt_start_col = _col(row.to_frame().T, "RT_start", "rt_start")
-            rt_apex_col  = _col(row.to_frame().T, "RT_apex", "rt_apex")
-            rt_end_col   = _col(row.to_frame().T, "RT_end", "rt_end")
-        except KeyError:
-            # At minimum we need rt_apex for ordering; if missing, skip
+            df = pd.read_csv(pix_csv)
+            row = df[df["peak_num"] == peak_num]
+            if row.empty:
+                continue
+            row = row.iloc[0]
+        except Exception:
             continue
-
-        # pixel columns (support both cases)
-        pstart_col = _col(row.to_frame().T, "Pixel_start", "pixel_start")
-        pend_col   = _col(row.to_frame().T, "Pixel_end", "pixel_end")
-
-        h_col = None
-        a_col = None
-        for cand in ("height", "Height", "peak_height"):
-            if cand in row.index:
-                h_col = cand
-                break
-        for cand in ("area", "Area", "peak_area"):
-            if cand in row.index:
-                a_col = cand
-                break
 
         img = cv2.imread(str(patch_file), cv2.IMREAD_GRAYSCALE)
         if img is None:
             continue
 
-        peak_info = {
-            "peak_id": patch_file.stem,
-            "file": file_base,
-            "peak_num": int(peak_num),
-            "mz": float(mz),
-            "rt_start": float(row[rt_start_col]),
-            "rt_apex": float(row[rt_apex_col]),
-            "rt_end": float(row[rt_end_col]),
-            "pixel_start": float(row[pstart_col]),
-            "pixel_end": float(row[pend_col]),
-            "peak_height": float(row[h_col]) if h_col is not None else np.nan,
-            "peak_area": float(row[a_col]) if a_col is not None else np.nan,
-            "image": img,
-        }
+        p = PeakInfo(
+            peak_id=stem,
+            file_base=file_base,
+            mz=float(mz),
+            peak_num=int(peak_num),
+            group_tag=group_tag,
 
-        mass_peaks.setdefault(float(mz), {}).setdefault(file_base, []).append(peak_info)
+            rt_start=float(row["RT_start"]),
+            rt_apex=float(row["RT_apex"]),
+            rt_end=float(row["RT_end"]),
+            pixel_start=float(row["pixel_start"]),
+            pixel_end=float(row["pixel_end"]),
+            peak_height=float(row["height"]) if "height" in df.columns else float("nan"),
+            peak_area=float(row["area"]) if "area" in df.columns else float("nan"),
 
-    if not mass_peaks:
-        return f"[!] No usable peaks found to cluster for {group_name} (check peaks_pix_{group_tag}.csv presence)"
+            image=img,
+        )
 
-    # Optional: handle unresolved peaks by merging close RT peaks (ported from your old code)
-    for mz in list(mass_peaks.keys()):
-        for file_base, peaks in list(mass_peaks[mz].items()):
-            # sort by rt for resolution check
-            res = check_peak_resolution(peaks, params)
-            peaks_sorted = res.get("sorted", sorted(peaks, key=lambda x: x["rt_apex"]))
+        mass_peaks.setdefault(float(mz), {}).setdefault(file_base, []).append(p)
 
-            if not res["resolved"]:
-                if params.verbose:
-                    print(f"\nHandling unresolved peaks in {file_base} for mz {mz:.4f}")
-                # Merge each unresolved group with >1 peaks
-                merged = list(peaks_sorted)
-                for grp in res["groups"]:
-                    if len(grp) <= 1:
-                        continue
-                    group_peaks = [peaks_sorted[i] for i in grp]
-                    # weighted apex by height (fallback weight=1 if nan)
-                    weights = np.array([
-                        (p["peak_height"] if np.isfinite(p["peak_height"]) else 1.0) for p in group_peaks
-                    ], dtype=np.float64)
-                    weights = np.where(weights <= 0, 1.0, weights)
-                    apex = float(np.sum([p["rt_apex"] for p in group_peaks] * weights) / np.sum(weights))
+    # Sort within each file by RT apex
+    for mz in mass_peaks:
+        for fb in mass_peaks[mz]:
+            mass_peaks[mz][fb].sort(key=lambda x: x.rt_apex)
 
-                    combined = {
-                        "peak_id": f"{file_base}_mz{mz:.4f}_combined_" + "_".join(str(p["peak_num"]) for p in group_peaks),
-                        "file": file_base,
-                        "peak_num": int(group_peaks[0]["peak_num"]),
-                        "mz": float(mz),
-                        "rt_start": float(min(p["rt_start"] for p in group_peaks)),
-                        "rt_apex": apex,
-                        "rt_end": float(max(p["rt_end"] for p in group_peaks)),
-                        "pixel_start": float(min(p["pixel_start"] for p in group_peaks)),
-                        "pixel_end": float(max(p["pixel_end"] for p in group_peaks)),
-                        "peak_height": float(np.nanmax([p["peak_height"] for p in group_peaks])),
-                        "peak_area": float(np.nansum([p["peak_area"] for p in group_peaks])),
-                        "image": group_peaks[0]["image"],
-                        "component_peaks": group_peaks,
-                    }
+    return mass_peaks
 
-                    # mark group slots None then place combined at first index
-                    for i in grp:
-                        merged[i] = None
-                    merged[grp[0]] = combined
 
-                mass_peaks[mz][file_base] = [p for p in merged if p is not None]
+# ----------------------------
+# Summary building
+# ----------------------------
 
-    cluster_results: List[Dict[str, Any]] = []
+def build_alignment_summary(
+    cluster_results: List[dict],
+    group_tag: str,
+) -> pd.DataFrame:
+    """
+    Produces a wide table:
+      mass, isomer_position, component_number, peak_count, peak_files,
+      rt_apex_aligned, rt_start_aligned, rt_end_aligned, is_component,
+      <sample>_height, <sample>_area...
+    """
+    if not cluster_results:
+        # Still return a valid empty df
+        return pd.DataFrame(columns=[
+            "mass", "isomer_position", "component_number",
+            "peak_count", "peak_files",
+            "rt_apex_aligned", "rt_start_aligned", "rt_end_aligned",
+            "is_component"
+        ])
+
+    df = pd.DataFrame(cluster_results)
+
+    # component_number/is_component always exist for consistency
+    if "component_number" not in df.columns:
+        df["component_number"] = 0
+    if "is_component" not in df.columns:
+        df["is_component"] = False
+
+    # Wide height/area pivots
+    heights = df.pivot_table(
+        index=["mass", "isomer_position", "component_number"],
+        columns="file",
+        values="peak_height",
+        aggfunc="first"
+    )
+    heights.columns = [f"{c}_height" for c in heights.columns]
+
+    areas = df.pivot_table(
+        index=["mass", "isomer_position", "component_number"],
+        columns="file",
+        values="peak_area",
+        aggfunc="first"
+    )
+    areas.columns = [f"{c}_area" for c in areas.columns]
+
+    # Summary rows
+    summary = df.groupby(["mass", "isomer_position", "component_number"]).agg(
+        peak_count=("file", "count"),
+        peak_files=("file", lambda x: ", ".join(sorted(set(map(str, x))))),
+        rt_apex_aligned=("rt_apex_aligned", "first"),
+        rt_start_aligned=("rt_start_aligned", "first"),
+        rt_end_aligned=("rt_end_aligned", "first"),
+        is_component=("is_component", "first"),
+    )
+
+    final = pd.concat([summary, heights, areas], axis=1).reset_index()
+
+    # Force 4-decimal string mass for stable output
+    final["mass"] = final["mass"].apply(lambda x: f"{float(x):.4f}")
+
+    # Column ordering: summary first, then heights, then areas
+    base_cols = [
+        "mass", "isomer_position", "component_number",
+        "peak_count", "peak_files",
+        "rt_apex_aligned", "rt_start_aligned", "rt_end_aligned",
+        "is_component"
+    ]
+    height_cols = sorted([c for c in final.columns if c.endswith("_height")])
+    area_cols = sorted([c for c in final.columns if c.endswith("_area")])
+
+    final = final[base_cols + height_cols + area_cols]
+    return final
+
+
+# ----------------------------
+# Public API: clustering per group
+# ----------------------------
+
+def cluster_group(
+    dirs: dict,
+    group_name: str,
+    similarity_threshold: float = 0.75,
+    target_size=(50, 50),
+    debug_print: bool = True,
+) -> str:
+    """
+    Runs shape-based clustering for ONE group.
+    Writes:
+      - peak_alignment.csv
+      - unclustered_peaks_group_{group_tag}.csv
+      - alignment_summary_group_{group_tag}.csv
+    Returns status string.
+    """
+    group_tag = str(group_name).replace(" ", "")  # ALWAYS use Group1 format in filenames
+
+    patch_dir = Path(dirs["patch"])
+    pixel_dir = Path(dirs["pixel"])
+    cluster_dir = Path(dirs["clustering"])
+    cluster_dir.mkdir(exist_ok=True, parents=True)
+
+    mass_peaks = load_peaks_from_patch_dir(
+        patch_dir=patch_dir,
+        pixel_dir=pixel_dir,
+        expected_group_tag=group_tag,
+    )
+
+    all_patch_stems = {p.stem for p in patch_dir.glob(f"*_{group_tag}.png")}
+
     processed_peaks: set[str] = set()
+    cluster_results: List[dict] = []
 
-    # Process each mz separately
     for mz in sorted(mass_peaks.keys()):
-        if params.verbose:
+        if debug_print:
             print(f"\nProcessing mz {mz:.4f}")
 
-        # sort peaks by rt per file
-        for file_base in mass_peaks[mz]:
-            mass_peaks[mz][file_base].sort(key=lambda x: x["rt_apex"])
+        # Determine max isomers across files for this mz
+        max_isomers = 0
+        for fb, peaks in mass_peaks[mz].items():
+            max_isomers = max(max_isomers, len(peaks))
 
-        max_isomers = max(len(v) for v in mass_peaks[mz].values()) if mass_peaks[mz] else 0
-        if params.verbose:
+        if debug_print:
             print(f"Maximum isomers found: {max_isomers}")
 
         for isomer_pos in range(max_isomers):
-            isomer_peaks: List[Dict[str, Any]] = []
-            for file_base in mass_peaks[mz]:
-                file_peaks = mass_peaks[mz][file_base]
-                if isomer_pos < len(file_peaks):
-                    isomer_peaks.append(file_peaks[isomer_pos])
+            isomer_peaks: List[PeakInfo] = []
+            for fb, peaks in mass_peaks[mz].items():
+                if isomer_pos < len(peaks):
+                    isomer_peaks.append(peaks[isomer_pos])
 
-            if len(isomer_peaks) < 1:
+            if not isomer_peaks:
                 continue
 
-            if params.verbose:
+            if debug_print:
                 print(f"\nValidating isomer position {isomer_pos + 1} peaks:")
                 for p in isomer_peaks:
-                    print(f"  - {p['peak_id']} (RT: {p['rt_apex']:.2f})")
+                    print(f"  - {p.peak_id} (RT: {p.rt_apex:.2f})")
 
-            validated = check_peak_similarity(isomer_peaks, params)
-            if len(validated) < len(isomer_peaks) and params.verbose:
+            validated = filter_by_shape_similarity(
+                isomer_peaks,
+                similarity_threshold=similarity_threshold,
+                target_size=target_size,
+                debug_print=debug_print,
+            )
+
+            if len(validated) < len(isomer_peaks) and debug_print:
                 print(f"Warning: {len(isomer_peaks) - len(validated)} peaks excluded (low similarity)")
 
             if not validated:
                 continue
 
             for p in validated:
-                processed_peaks.add(p["peak_id"])
+                processed_peaks.add(p.peak_id)
 
-            # Averages from validated
-            avg_rt_start = float(np.mean([p["rt_start"] for p in validated]))
-            avg_rt_apex = float(np.mean([p["rt_apex"] for p in validated]))
-            avg_rt_end = float(np.mean([p["rt_end"] for p in validated]))
-            avg_pixel_start = float(np.mean([p["pixel_start"] for p in validated]))
-            avg_pixel_end = float(np.mean([p["pixel_end"] for p in validated]))
+            # Compute aligned averages using validated peaks only
+            avg_rt_start = float(np.mean([p.rt_start for p in validated]))
+            avg_rt_apex = float(np.mean([p.rt_apex for p in validated]))
+            avg_rt_end = float(np.mean([p.rt_end for p in validated]))
+            avg_px_start = float(np.mean([p.pixel_start for p in validated]))
+            avg_px_end = float(np.mean([p.pixel_end for p in validated]))
 
             for p in validated:
-                result = {
+                cluster_results.append({
                     "mass": float(mz),
                     "isomer_position": int(isomer_pos + 1),
-                    "file": p["file"],
-                    "peak_num": int(p["peak_num"]),
-                    "rt_start": float(p["rt_start"]),
-                    "rt_apex": float(p["rt_apex"]),
-                    "rt_end": float(p["rt_end"]),
+                    "component_number": 0,
+                    "is_component": False,
+
+                    "file": p.file_base,
+                    "peak_id": p.peak_id,
+                    "peak_num": int(p.peak_num),
+
+                    "rt_start": p.rt_start,
+                    "rt_apex": p.rt_apex,
+                    "rt_end": p.rt_end,
+
                     "rt_start_aligned": avg_rt_start,
                     "rt_apex_aligned": avg_rt_apex,
                     "rt_end_aligned": avg_rt_end,
-                    "pixel_start": float(p["pixel_start"]),
-                    "pixel_end": float(p["pixel_end"]),
-                    "pixel_start_aligned": avg_pixel_start,
-                    "pixel_end_aligned": avg_pixel_end,
-                    "peak_height": float(p["peak_height"]) if np.isfinite(p["peak_height"]) else np.nan,
-                    "peak_area": float(p["peak_area"]) if np.isfinite(p["peak_area"]) else np.nan,
-                }
 
-                if "component_peaks" in p:
-                    for i, comp in enumerate(p["component_peaks"]):
-                        result[f"component_{i+1}_height"] = comp.get("peak_height", np.nan)
-                        result[f"component_{i+1}_area"] = comp.get("peak_area", np.nan)
-                        result[f"component_{i+1}_rt"] = comp.get("rt_apex", np.nan)
+                    "pixel_start": p.pixel_start,
+                    "pixel_end": p.pixel_end,
+                    "pixel_start_aligned": avg_px_start,
+                    "pixel_end_aligned": avg_px_end,
 
-                cluster_results.append(result)
+                    "peak_height": p.peak_height,
+                    "peak_area": p.peak_area,
+                })
 
     # Unclustered peaks report
-    all_patch_stems = {p.stem for p in patch_dir.glob(f"*_{group_tag}.png")}
     unclustered = sorted(all_patch_stems - processed_peaks)
-    if unclustered:
-        if params.verbose:
-            print("\nWARNING: The following peaks were not clustered:")
-            for pk in unclustered:
-                print(f"  - {pk}")
-        pd.DataFrame({"peak_id": unclustered}).to_csv(
-            cluster_dir / f"unclustered_peaks_group_{group_tag}.csv", index=False
-        )
+    if unclustered and debug_print:
+        print("\nWARNING: The following peaks were not clustered:")
+        for u in unclustered:
+            print(f"  - {u}")
 
-    # Save raw alignment list
+    unclustered_csv = cluster_dir / f"unclustered_peaks_group_{group_tag}.csv"
+    pd.DataFrame({"peak_id": unclustered}).to_csv(unclustered_csv, index=False)
+
+    # Save raw per-peak alignment list
     df_results = pd.DataFrame(cluster_results)
     df_results.to_csv(cluster_dir / "peak_alignment.csv", index=False)
 
-    # Build summary similar to your old pipeline (with component handling)
-    expanded_results: List[Dict[str, Any]] = []
-    for r in cluster_results:
-        if any(k.startswith("component_") and k.endswith("_height") for k in r.keys()):
-            base_r = {k: v for k, v in r.items() if not k.startswith("component_")}
-            num_components = sum(1 for k in r.keys() if k.startswith("component_") and k.endswith("_height"))
-            for i in range(num_components):
-                comp_r = dict(base_r)
-                comp_r["peak_height"] = r.get(f"component_{i+1}_height", np.nan)
-                comp_r["peak_area"] = r.get(f"component_{i+1}_area", np.nan)
-                comp_r["rt_apex"] = r.get(f"component_{i+1}_rt", np.nan)
-                comp_r["is_component"] = True
-                comp_r["component_number"] = i + 1
-                expanded_results.append(comp_r)
-        else:
-            r2 = dict(r)
-            r2["is_component"] = False
-            r2["component_number"] = 0
-            expanded_results.append(r2)
+    # Build + save alignment summary
+    summary_df = build_alignment_summary(cluster_results, group_tag=group_tag)
+    summary_csv = cluster_dir / f"alignment_summary_group_{group_tag}.csv"
+    summary_df.to_csv(summary_csv, index=False, float_format="%.4f")
 
-    df_exp = pd.DataFrame(expanded_results)
-
-    if df_exp.empty:
-        # still write an empty summary so export step won't crash
-        out_summary = cluster_dir / f"alignment_summary_group_{group_tag}.csv"
-        pd.DataFrame().to_csv(out_summary, index=False)
-        return f"[✔] Clustering {group_tag}: no clustered peaks (empty summary written)"
-
-    peak_heights = df_exp.pivot(
-        index=["mass", "isomer_position", "component_number"],
-        columns="file",
-        values="peak_height",
-    ).round(0)
-    peak_heights.columns = [f"{c}_height" for c in peak_heights.columns]
-
-    peak_areas = df_exp.pivot(
-        index=["mass", "isomer_position", "component_number"],
-        columns="file",
-        values="peak_area",
-    ).round(0)
-    peak_areas.columns = [f"{c}_area" for c in peak_areas.columns]
-
-    summary = df_exp.groupby(["mass", "isomer_position", "component_number"]).agg(
-        file=("file", "count"),
-        peak_files=("file", lambda x: ", ".join(sorted(x))),
-        rt_apex_aligned=("rt_apex_aligned", "first"),
-        rt_start_aligned=("rt_start_aligned", "first"),
-        rt_end_aligned=("rt_end_aligned", "first"),
-        is_component=("is_component", "first"),
-    ).round(4)
-    summary = summary.rename(columns={"file": "peak_count"})
-
-    final_summary = pd.concat([summary, peak_heights, peak_areas], axis=1)
-
-    # reorder columns
-    cols = list(summary.columns)
-    sample_cols = [c for c in final_summary.columns if c not in cols]
-    height_cols = sorted([c for c in sample_cols if c.endswith("_height")])
-    area_cols = sorted([c for c in sample_cols if c.endswith("_area")])
-    final_summary = final_summary[cols + height_cols + area_cols]
-
-    # reset index and force mass formatting like old patch
-    final_summary = final_summary.reset_index()
-    final_summary["mass"] = final_summary["mass"].apply(lambda x: f"{float(x):.4f}")
-    final_summary = final_summary.set_index(["mass", "isomer_position"])
-
-    out_summary = cluster_dir / f"alignment_summary_group_{group_tag}.csv"
-    final_summary.to_csv(out_summary, float_format="%.4f")
-
-    if params.verbose:
+    if debug_print:
         print("\nAlignment Summary:")
-        print(final_summary.to_string())
-        print(f"\n[✔] Results saved to {out_summary}")
+        # don't explode the console too much
+        print(summary_df.head(20).to_string(index=False))
+        print(f"\n[✔] Results saved to {summary_csv}")
 
-    return (f"[✔] Clustering {group_tag}: "
-            f"patches={len(all_patch_stems)}, clustered={len(processed_peaks)}, "
-            f"unclustered={len(unclustered)} | summary={out_summary.name}")
+    return (f"[✔] Clustering {group_tag}: patches={len(all_patch_stems)}, "
+            f"clustered={len(processed_peaks)}, unclustered={len(unclustered)} | "
+            f"summary={summary_csv.name}")
 
 
-# -----------------------------
-# Post-clustering repair step (forced attach)
-# -----------------------------
-def process_file_recluster(
-    dirs: Dict[str, str],
+# ----------------------------
+# Recluster / force-attach (RT+mass only) — FIXED for new peak_id format
+# ----------------------------
+
+def recluster_group(
+    dirs: dict,
     group_name: str,
-    params: ReclusterParams = ReclusterParams(),
 ) -> str:
     """
+    Post-clustering repair step (RT+mass only; NO shape check).
     Reads:
-      - alignment_summary_group_{group}.csv
-      - unclustered_peaks_group_{group}.csv
+      - alignment_summary_group_{group_tag}.csv
+      - unclustered_peaks_group_{group_tag}.csv
     Writes:
-      - Feature_list_{group}.csv
+      - Feature_list_{group_tag}.csv
     """
-    group_tag = _group_tag(group_name)
+    group_tag = str(group_name).replace(" ", "")
+
     pixel_dir = Path(dirs["pixel"])
     cluster_dir = Path(dirs["clustering"])
-    cluster_dir.mkdir(parents=True, exist_ok=True)
+    cluster_dir.mkdir(exist_ok=True, parents=True)
 
-    unclustered_csv = cluster_dir / f"unclustered_peaks_group_{group_tag}.csv"
+    FORCE_MIN_COVERAGE = float(getattr(Config, "FORCE_MIN_COVERAGE", 0.95))  # fraction (0-1)
+    FORCE_RT_TOL = float(getattr(Config, "FORCE_RT_TOL", 0.1))              # minutes
+    FORCE_MASS_TOL = float(getattr(Config, "FORCE_MASS_TOL", 0.0001))       # m/z
+
     summary_csv = cluster_dir / f"alignment_summary_group_{group_tag}.csv"
+    unclustered_csv = cluster_dir / f"unclustered_peaks_group_{group_tag}.csv"
 
     if not summary_csv.exists():
-        return f"[!] Recluster: missing summary: {summary_csv.name}"
+        return f"[!] Recluster {group_tag}: missing summary {summary_csv.name}"
 
     df_summary = pd.read_csv(summary_csv)
 
@@ -561,77 +499,73 @@ def process_file_recluster(
 
     height_cols = [c for c in df_summary.columns if c.endswith("_height")]
     area_cols = [c for c in df_summary.columns if c.endswith("_area")]
-    sample_names = sorted({c[:-7] for c in height_cols})
-
+    sample_names = sorted({c[:-7] for c in height_cols})  # strip _height
     total_files = len(sample_names)
+
     if total_files == 0 or "peak_count" not in df_summary.columns:
-        out = cluster_dir / f"Feature_list_{group_tag}.csv"
-        df_summary.to_csv(out, index=False)
-        return f"[✔] Recluster {group_tag}: wrote Feature_list (no forcing possible) -> {out.name}"
+        feature_list_path = cluster_dir / f"Feature_list_{group_tag}.csv"
+        df_summary.to_csv(feature_list_path, index=False)
+        return f"[✔] Recluster {group_tag}: wrote Feature_list (no sample columns)"
 
     if "mass" not in df_summary.columns or "rt_apex_aligned" not in df_summary.columns:
-        out = cluster_dir / f"Feature_list_{group_tag}.csv"
-        df_summary.to_csv(out, index=False)
-        return f"[✔] Recluster {group_tag}: wrote Feature_list (missing columns) -> {out.name}"
+        feature_list_path = cluster_dir / f"Feature_list_{group_tag}.csv"
+        df_summary.to_csv(feature_list_path, index=False)
+        return f"[✔] Recluster {group_tag}: wrote Feature_list (missing mass/rt columns)"
 
     df_summary["_coverage"] = df_summary["peak_count"].astype(float) / float(total_files)
-    mass_series = pd.to_numeric(df_summary["mass"], errors="coerce")
-    rt_series = pd.to_numeric(df_summary["rt_apex_aligned"], errors="coerce")
+    mass_series = df_summary["mass"].astype(float)
+    rt_series = df_summary["rt_apex_aligned"].astype(float)
 
     if not unclustered_csv.exists():
-        df_summary.drop(columns=["_coverage"], errors="ignore").to_csv(
-            cluster_dir / f"Feature_list_{group_tag}.csv", index=False
-        )
-        return f"[✔] Recluster {group_tag}: no unclustered file; Feature_list written"
+        feature_list_path = cluster_dir / f"Feature_list_{group_tag}.csv"
+        df_summary.drop(columns=["_coverage"], errors="ignore").to_csv(feature_list_path, index=False)
+        return f"[✔] Recluster {group_tag}: wrote Feature_list (no unclustered file)"
 
     df_uncl = pd.read_csv(unclustered_csv)
     if df_uncl.empty or "peak_id" not in df_uncl.columns:
-        df_summary.drop(columns=["_coverage"], errors="ignore").to_csv(
-            cluster_dir / f"Feature_list_{group_tag}.csv", index=False
-        )
-        return f"[✔] Recluster {group_tag}: no unclustered peaks; Feature_list written"
+        feature_list_path = cluster_dir / f"Feature_list_{group_tag}.csv"
+        df_summary.drop(columns=["_coverage"], errors="ignore").to_csv(feature_list_path, index=False)
+        return f"[✔] Recluster {group_tag}: wrote Feature_list (no unclustered peaks)"
 
-    def parse_peak_id_new(peak_id: str) -> Optional[Tuple[str, float, int]]:
-        """
-        Expects patch stem:
-          {base}_mz{mz}_Peak{N}_{GroupTag}
-        """
-        m = re.match(r"(.+)_mz(\d+\.\d+)_Peak(\d+)_" + re.escape(group_tag) + r"$", peak_id)
-        if not m:
-            return None
-        return m.group(1), float(m.group(2)), int(m.group(3))
+    def parse_new_peak_id(peak_id: str) -> Optional[Tuple[str, float, int, str]]:
+        parsed = parse_patch_stem(peak_id)
+        return parsed
 
-    def load_peak_meta(file_base: str, peak_num: int) -> Optional[Dict[str, float]]:
-        pix_csv = pixel_dir / f"{file_base}_peaks_pix_{group_tag}.csv"
-        row = load_peak_row(pix_csv, peak_num)
-        if row is None:
+    def load_peak_meta(file_base: str, peak_num: int) -> Optional[dict]:
+        pix_csv = pixel_dir / f"{file_base}_peaks_pix.csv"
+        if not pix_csv.exists():
             return None
         try:
-            rt_apex_col = _col(row.to_frame().T, "RT_apex", "rt_apex")
-        except KeyError:
+            dfp = pd.read_csv(pix_csv)
+            row = dfp[dfp["peak_num"] == peak_num]
+            if row.empty:
+                return None
+            row = row.iloc[0]
+            return {
+                "rt_apex": float(row["RT_apex"]),
+                "peak_height": float(row["height"]) if "height" in dfp.columns else np.nan,
+                "peak_area": float(row["area"]) if "area" in dfp.columns else np.nan,
+            }
+        except Exception:
             return None
-        h_col = "height" if "height" in row.index else ("Height" if "Height" in row.index else None)
-        a_col = "area" if "area" in row.index else ("Area" if "Area" in row.index else None)
-        return {
-            "rt_apex": float(row[rt_apex_col]),
-            "peak_height": float(row[h_col]) if h_col else np.nan,
-            "peak_area": float(row[a_col]) if a_col else np.nan,
-        }
 
     forced_events = []
 
     for peak_id in df_uncl["peak_id"].dropna().astype(str).tolist():
-        parsed = parse_peak_id_new(peak_id)
+        parsed = parse_new_peak_id(peak_id)
         if parsed is None:
             continue
-        file_base, peak_mass, peak_num = parsed
 
-        # Summary columns are sample-based (file_base_height/area)
-        sample_key = file_base
-        hcol = f"{sample_key}_height"
-        acol = f"{sample_key}_area"
-        if hcol not in df_summary.columns or acol not in df_summary.columns:
+        file_base, peak_mass, peak_num, peak_group_tag = parsed
+        if peak_group_tag != group_tag:
             continue
+
+        # Summary uses sample columns by file_base (not full peak_id)
+        if f"{file_base}_height" not in df_summary.columns or f"{file_base}_area" not in df_summary.columns:
+            continue
+
+        hcol = f"{file_base}_height"
+        acol = f"{file_base}_area"
 
         meta = load_peak_meta(file_base, peak_num)
         if meta is None:
@@ -640,9 +574,9 @@ def process_file_recluster(
         peak_rt = float(meta["rt_apex"])
 
         candidates = df_summary.index[
-            (df_summary["_coverage"] >= params.min_coverage) &
-            (mass_series.sub(float(peak_mass)).abs() <= params.mass_tol) &
-            (rt_series.sub(float(peak_rt)).abs() <= params.rt_tol) &
+            (df_summary["_coverage"] >= FORCE_MIN_COVERAGE) &
+            (mass_series.sub(float(peak_mass)).abs() <= FORCE_MASS_TOL) &
+            (rt_series.sub(float(peak_rt)).abs() <= FORCE_RT_TOL) &
             (df_summary[hcol].isna()) &
             (df_summary[acol].isna())
         ].tolist()
@@ -650,91 +584,110 @@ def process_file_recluster(
         if len(candidates) != 1:
             continue
 
-        target_idx = candidates[0]
-        if not (pd.isna(df_summary.loc[target_idx, hcol]) and pd.isna(df_summary.loc[target_idx, acol])):
-            continue
+        idx = candidates[0]
 
-        df_summary.loc[target_idx, hcol] = meta["peak_height"]
-        df_summary.loc[target_idx, acol] = meta["peak_area"]
+        # Apply forced attachment
+        df_summary.loc[idx, hcol] = meta["peak_height"]
+        df_summary.loc[idx, acol] = meta["peak_area"]
 
+        # Update peak_files / peak_count if present
         if "peak_files" in df_summary.columns:
-            existing_pf = df_summary.loc[target_idx, "peak_files"]
-            files_list = []
-            if isinstance(existing_pf, str) and existing_pf.strip():
-                files_list = [x.strip() for x in existing_pf.split(",") if x.strip()]
-            if file_base not in files_list:
-                files_list.append(file_base)
-            df_summary.loc[target_idx, "peak_files"] = ", ".join(sorted(files_list))
+            existing = df_summary.loc[idx, "peak_files"]
+            files = [x.strip() for x in str(existing).split(",") if x.strip()] if isinstance(existing, str) else []
+            if file_base not in files:
+                files.append(file_base)
+            df_summary.loc[idx, "peak_files"] = ", ".join(sorted(set(files)))
 
         try:
-            df_summary.loc[target_idx, "peak_count"] = int(df_summary.loc[target_idx, "peak_count"]) + 1
+            df_summary.loc[idx, "peak_count"] = int(df_summary.loc[idx, "peak_count"]) + 1
         except Exception:
             pass
 
-        existing_forced = df_summary.loc[target_idx, "forced_files"]
+        # forced flags
         forced_list = []
+        existing_forced = df_summary.loc[idx, "forced_files"]
         if isinstance(existing_forced, str) and existing_forced.strip():
             forced_list = [x.strip() for x in existing_forced.split(",") if x.strip()]
         if peak_id not in forced_list:
             forced_list.append(peak_id)
-        df_summary.loc[target_idx, "forced_files"] = ", ".join(forced_list)
-        df_summary.loc[target_idx, "has_forced"] = True
+
+        df_summary.loc[idx, "forced_files"] = ", ".join(forced_list)
+        df_summary.loc[idx, "has_forced"] = True
 
         forced_events.append({
             "peak_id": peak_id,
-            "file": file_base,
+            "file_base": file_base,
             "mass": float(peak_mass),
             "rt_apex": float(peak_rt),
-            "target_row": int(target_idx),
+            "target_row": int(idx),
         })
 
-    df_summary.drop(columns=["_coverage"], inplace=True, errors="ignore")
+    df_summary.drop(columns=["_coverage"], errors="ignore", inplace=True)
 
-    out = cluster_dir / f"Feature_list_{group_tag}.csv"
-    df_summary.to_csv(out, index=False, float_format="%.4f")
+    feature_list_path = cluster_dir / f"Feature_list_{group_tag}.csv"
+    df_summary.to_csv(feature_list_path, index=False, float_format="%.4f")
 
-    if params.verbose:
-        print(f"\n[✔] Feature_list saved → {out}")
-        if forced_events:
-            print(f"[✔] Forced attachments: {len(forced_events)}")
-        else:
-            print("[ℹ] No unambiguous forced attachments were made.")
-
-    return f"[✔] Recluster {group_tag}: Feature_list={out.name}, forced={len(forced_events)}"
+    return f"[✔] Recluster {group_tag}: Feature_list={feature_list_path.name}, forced={len(forced_events)}"
 
 
-# -----------------------------
-# Excel export (final)
-# -----------------------------
+# ----------------------------
+# FINAL Excel export (FIXED to handle Group1 vs Group 1 folder/name mismatches)
+# ----------------------------
+
 def export_all_group_summaries_to_excel():
     output_root = Config.BASE_DIR / Config.OUTPUT_ROOT / Config.ANALYSIS_FOLDER
     excel_path = output_root / f"MassSelectionSummary_{Config.ANALYSIS_FOLDER}.xlsx"
 
     print(f"\n[Excel Export] Saving all group summaries to {excel_path}\n")
 
+    def group_variants(g: str) -> List[str]:
+        g = str(g)
+        # Always include both the original key and no-space version
+        no_space = g.replace(" ", "")
+        out = []
+        if g not in out:
+            out.append(g)
+        if no_space not in out:
+            out.append(no_space)
+        return out
+
     with pd.ExcelWriter(excel_path, engine="xlsxwriter") as writer:
         for group_name in Config.MASS_GROUPS.keys():
-            cluster_dir = output_root / group_name / "Clustering"
+            variants = group_variants(group_name)
 
-            summary_csv = cluster_dir / f"alignment_summary_group_{group_name}.csv"
-            unresolved_csv = cluster_dir / f"unresolved_peaks_group_{group_name}.csv"
-            unclustered_csv = cluster_dir / f"unclustered_peaks_group_{group_name}.csv"
+            # Find the first variant that has a summary or feature list
+            found = None  # (variant, cluster_dir)
+            for gv in variants:
+                cluster_dir = output_root / gv / "Clustering"
+                if (cluster_dir / f"Feature_list_{gv}.csv").exists() or (cluster_dir / f"alignment_summary_group_{gv}.csv").exists():
+                    found = (gv, cluster_dir)
+                    break
+
+            if found is None:
+                print(f"[!] Skipping {group_name}: no clustering outputs found for variants {variants}")
+                continue
+
+            gv, cluster_dir = found
+
+            summary_csv = cluster_dir / f"alignment_summary_group_{gv}.csv"
+            unresolved_csv = cluster_dir / f"unresolved_peaks_group_{gv}.csv"
+            unclustered_csv = cluster_dir / f"unclustered_peaks_group_{gv}.csv"
 
             if not summary_csv.exists():
-                print(f"[!] Skipping {group_name}: summary file not found.")
+                print(f"[!] Skipping {group_name}: summary file not found in {cluster_dir}")
                 continue
 
             sheet_name = str(group_name)
             current_row = 0
 
-            # Prefer Feature_list for export (fallback to alignment summary)
-            feature_csv = cluster_dir / f"Feature_list_{group_name}.csv"
+            feature_csv = cluster_dir / f"Feature_list_{gv}.csv"
             chosen_csv = feature_csv if feature_csv.exists() else summary_csv
 
             df_summary = pd.read_csv(chosen_csv)
             df_summary.to_excel(writer, sheet_name=sheet_name, startrow=current_row, index=False)
             print(f"[✔] Sheet '{sheet_name}' → Summary ({len(df_summary)} rows) [{chosen_csv.name}]")
 
+            # Forced formatting (bold + red)
             worksheet = writer.sheets[sheet_name]
             workbook = writer.book
             forced_fmt = workbook.add_format({"bold": True, "font_color": "red"})
@@ -751,21 +704,14 @@ def export_all_group_summaries_to_excel():
                     if not isinstance(forced_files, str) or not forced_files.strip():
                         continue
 
-                    forced_samples_raw = [x.strip() for x in forced_files.split(",") if x.strip()]
+                    forced_peak_ids = [x.strip() for x in forced_files.split(",") if x.strip()]
 
-                    # UPDATED normalize for both old and new naming
-                    def normalize_forced_token(tok: str) -> str:
-                        # old: {file_base}_mass{...}_peak{...}
-                        m1 = re.match(r"(.+)_mass\d+\.\d+_peak\d+$", tok)
-                        if m1:
-                            return m1.group(1)
-                        # new: {file_base}_mz{...}_Peak{...}_{GroupTag}
-                        m2 = re.match(r"(.+)_mz\d+\.\d+_Peak\d+_.+$", tok)
-                        if m2:
-                            return m2.group(1)
-                        return tok
+                    # Convert forced peak ids -> file_base (your summary columns are file_base_height/area)
+                    def forced_to_file_base(tok: str) -> str:
+                        parsed = parse_patch_stem(tok)
+                        return parsed[0] if parsed else tok
 
-                    forced_samples = [normalize_forced_token(s) for s in forced_samples_raw]
+                    forced_samples = [forced_to_file_base(x) for x in forced_peak_ids]
                     excel_row = current_row + 1 + i
 
                     worksheet.write(excel_row, col_peak_files, row.get("peak_files", ""), forced_fmt)
@@ -788,9 +734,9 @@ def export_all_group_summaries_to_excel():
                     print(f"    ↳ Unresolved peaks added ({len(df_unresolved)} rows)")
                     current_row += len(df_unresolved) + 2
                 else:
-                    print("    ↳ Skipped unresolved peaks: file is empty")
+                    print(f"    ↳ Skipped unresolved peaks: file is empty")
             else:
-                print("    ↳ No unresolved peaks file found")
+                print(f"    ↳ No unresolved peaks file found")
 
             # Unclustered peaks
             if unclustered_csv.exists():
@@ -800,8 +746,8 @@ def export_all_group_summaries_to_excel():
                     print(f"    ↳ Unclustered peaks added ({len(df_unclustered)} rows)")
                     current_row += len(df_unclustered) + 2
                 else:
-                    print("    ↳ Skipped unclustered peaks: file is empty")
+                    print(f"    ↳ Skipped unclustered peaks: file is empty")
             else:
-                print("    ↳ No unclustered peaks file found")
+                print(f"    ↳ No unclustered peaks file found")
 
     print(f"\n[✔] Excel export complete → {excel_path}")
