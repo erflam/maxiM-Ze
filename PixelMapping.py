@@ -154,16 +154,23 @@ def process_file_checkpoint4(fp: str, dirs: Dict[str, str], group_name: str) -> 
             min_width_px=MIN_WIDTH,
         )
 
-        for seg_id, (px_start, px_end) in enumerate(segments, start=1):
+        for (px_start, px_end) in segments:
             rows.append(
                 {
                     "File Name": base,
                     "m/z": mz_str,
-                    "Segment_ID": int(seg_id),
+                    "Segment_ID": None,  # we will assign later
                     "Pixel_start": int(px_start),
                     "Pixel_end": int(px_end),
                 }
             )
+
+        # Sort all segments by Pixel_start (left to right)
+        rows.sort(key=lambda r: r["Pixel_start"])
+
+        # Assign Segment_ID = 1, 2, 3, 4, ...
+        for i, r in enumerate(rows, start=1):
+            r["Segment_ID"] = i
 
     pd.DataFrame(
         rows,
