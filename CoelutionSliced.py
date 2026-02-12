@@ -279,7 +279,7 @@ def rename_patch_to_peak_numbers(
         # Two-phase rename to avoid collisions
         temp_moves = []
         for i, (seg, pnum, mz, old_path) in enumerate(items, start=1):
-            new_name = f"{base}_mz{mz}_Peak{i}_{group_tag}.png"
+            new_name = f"{base}_mass{mz}_Peak{i}_{group_tag}.png"
             new_path = patch_dir / new_name
 
             if new_path.exists() and not overwrite:
