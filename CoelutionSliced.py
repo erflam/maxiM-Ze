@@ -1,23 +1,3 @@
-# CoelutionSliced.py
-# ------------------------------------------------------------
-# Reslice coeluting peak slice images into N slices using
-# lowest-valley logic (image-based), guided by:
-#   ALL_coelu_matches_{tag}.csv
-#
-# Inputs:
-#   dirs["coelu_slices"] -> directory "Peak Coelu Slices"
-#   dirs["coelu_csv"]    -> directory "Peak Coelu CSV"
-#
-# Output:
-#   dirs["coelu_sliced"] -> directory "Coelu Slices Sliced"
-#
-# CSV must contain at least:
-#   slice_filename, Peak_num_cluster
-#
-# ------------------------------------------------------------
-
-from __future__ import annotations
-
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 
@@ -290,9 +270,9 @@ def process_file_coelution_sliced(dirs: Dict[str, str], group_name: str) -> str:
     """
     tag = _group_tag(group_name)
 
-    coelu_slices_dir = Path(dirs["coelu_slices"])
-    coelu_csv_dir = Path(dirs["coelu_csv"])
-    out_dir = Path(dirs["coelu_sliced"])
+    coelu_slices_dir = Path(dirs["coelu"])
+    coelu_csv_dir = Path(dirs["coelu csv"])
+    out_dir = Path(dirs["coelu sliced"])
     out_dir.mkdir(parents=True, exist_ok=True)
 
     csv_path = coelu_csv_dir / f"ALL_coelu_matches_{tag}.csv"
@@ -338,10 +318,23 @@ def process_file_coelution_sliced(dirs: Dict[str, str], group_name: str) -> str:
 
         pieces = _split_into_n(img, n=n_peaks)
 
-        if len(pieces) != n_peaks:
+        expected = n_peaks
+        produced = len(pieces)
+
+        if produced != expected:
             warnings += 1
-            if DEBUG_PRINT:
-                print(f"[⚠️] {slice_path.name}: wanted {n_peaks}, got {len(pieces)} (saving anyway)")
+
+            if produced < expected:
+                print(
+                    f"[WARN] {slice_path.name}: expected {expected} slices "
+                    f"(peaks={peak_nums}), but only produced {produced}. "
+                    f"Saved what was produced."
+                )
+            else:
+                print(
+                    f"[WARN] {slice_path.name}: produced MORE slices than expected "
+                    f"({produced} > {expected})."
+                )
 
         # Save left->right pieces using Peak_num_cluster for names
         for i, piece in enumerate(pieces):
