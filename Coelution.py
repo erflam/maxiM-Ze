@@ -6,7 +6,7 @@ import pandas as pd
 
 @dataclass(frozen=True)
 class CoelutionParams:
-    pixel_tolerance: int = 8
+    pixel_tolerance: int = 25
     mz_round_decimals: int = 4      # match peaks <-> mapping robustly
     mz_fname_decimals: int = 4      # filename formatting (dot style)
     verbose: bool = False
