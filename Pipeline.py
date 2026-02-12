@@ -10,6 +10,7 @@ from EICBuilder import process_file_checkpoint2
 from Resolving import process_file_checkpoint3, count_peaks_per_file_summary
 from PixelMapping import process_file_checkpoint4
 from Slicing import process_file_checkpoint5
+from Coelution import run_group_coelution
 
 def init_worker():
     import matplotlib
@@ -150,6 +151,9 @@ class Pipeline:
         elapsed = time.time() - start_time
         print(f"Checkpoint 5 (Slicing based on Pixel Mapping) completed in {elapsed:.2f} seconds!")
 
+    def run_group_checkpoint6(self, dirs, group_name):
+        run_group_coelution(dirs=dirs, group_name=group_name)
+
     def run(self):
         total_start = time.time()
 
@@ -164,6 +168,7 @@ class Pipeline:
             self.run_group_checkpoint3(dirs, group_name)
             self.run_group_checkpoint4(dirs, group_name)
             self.run_group_checkpoint5(dirs, group_name)
+            self.run_group_checkpoint6(dirs, group_name)
 
         total_elapsed = time.time() - total_start
         print("🐊" * 33)
