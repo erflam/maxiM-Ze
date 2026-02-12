@@ -2,9 +2,7 @@ import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Tuple
-
 import pandas as pd
-
 
 @dataclass(frozen=True)
 class CoelutionParams:
@@ -13,21 +11,46 @@ class CoelutionParams:
     mz_fname_decimals: int = 4      # filename formatting (dot style)
     verbose: bool = False
 
-
 def _to_bool(s: pd.Series) -> pd.Series:
     if s.dtype == bool:
         return s
     return s.astype(str).str.strip().str.lower().isin({"true", "1", "yes", "y", "t"})
 
-
 def _mz_key(series: pd.Series, decimals: int) -> pd.Series:
     return pd.to_numeric(series, errors="coerce").round(decimals)
-
 
 def _mz_to_fname_dot(mz: float, decimals: int) -> str:
     """Matches your slice filenames: mz187.0964 (dot, fixed decimals)."""
     return f"{float(mz):.{decimals}f}"
 
+def copy_non_coeluting_to_patch(
+    *,
+    slice_dir: Path,
+    coelu_dir: Path,
+    patch_dir: Path,
+    dry_run: bool = False
+) -> Tuple[int, int]:
+    """
+    Copy PNGs that exist in slice_dir but NOT in coelu_dir into patch_dir.
+    Returns (copied_count, skipped_count).
+    """
+    patch_dir.mkdir(parents=True, exist_ok=True)
+
+    slice_pngs = list(slice_dir.glob("*.png"))
+    coelu_names = {p.name for p in coelu_dir.glob("*.png")}
+
+    copied = 0
+    skipped = 0
+
+    for p in slice_pngs:
+        if p.name not in coelu_names:
+            if not dry_run:
+                shutil.copy2(p, patch_dir / p.name)
+            copied += 1
+        else:
+            skipped += 1
+
+    return copied, skipped
 
 def collect_for_base(
     *,
@@ -94,7 +117,7 @@ def collect_for_base(
     if m.empty:
         return 0, 0, pd.DataFrame()
 
-    # 1) Choose segments based on coeluting + lead peaks within tolerance to Pixel_start
+    # Choose segments based on coeluting + lead peaks within tolerance to Pixel_start
     lead = p.loc[p["_is_coelu"] & p["_is_lead"]].copy()
     if lead.empty:
         if params.verbose:
@@ -123,7 +146,6 @@ def collect_for_base(
     # Deduplicate segments (one per mz+seg). Keep smallest delta.
     chosen = chosen.sort_values("_delta_to_seg_start").drop_duplicates(subset=["_mz_key", "_seg_id"]).copy()
 
-    # 2) Copy slices for each chosen segment and build segment metadata
     out_slice_dir.mkdir(parents=True, exist_ok=True)
 
     copied = 0
@@ -160,7 +182,6 @@ def collect_for_base(
                 "delta_pixels": float(seg["_delta_to_seg_start"]),
                 "slice_filename": slice_filename,
                 "slice_found": bool(slice_found),
-                # IMPORTANT: cluster_id that triggered this segment
                 "trigger_cluster_id": seg["cluster_id"],
             }
         )
@@ -168,26 +189,17 @@ def collect_for_base(
     seg_df = pd.DataFrame(seg_rows)
     if seg_df.empty:
         return copied, missing_png, pd.DataFrame()
-
-    # 3) Include ALL peaks in the same cluster_id(s) (regardless of overlap)
     trigger_clusters = set(seg_df["trigger_cluster_id"].astype(str).tolist())
-
     peaks_in_clusters = peaks.loc[peaks["cluster_id"].astype(str).isin(trigger_clusters)].copy()
-    # ---- NEW: make Peak_num_cluster (1,2,3...) within each cluster_id ----
-    # We sort peaks inside each cluster by pixel_start so "first" means earliest peak.
     peaks_in_clusters["_cluster_sort_pixel"] = pd.to_numeric(
         peaks_in_clusters["Pixel_start"], errors="coerce"
     )
-
     peaks_in_clusters = peaks_in_clusters.sort_values(
         ["cluster_id", "_cluster_sort_pixel"], kind="stable"
     )
-
     peaks_in_clusters["Peak_num_cluster"] = (
             peaks_in_clusters.groupby("cluster_id").cumcount() + 1
     )
-    # ---- END NEW ----
-
     if peaks_in_clusters.empty:
         return copied, missing_png, pd.DataFrame()
 
@@ -223,7 +235,6 @@ def collect_for_base(
 
     rows_df = pd.DataFrame(out_rows)
     return copied, missing_png, rows_df
-
 
 def run_group_coelution(
     *,
@@ -275,7 +286,6 @@ def run_group_coelution(
         if not df.empty:
             all_rows.append(df)
 
-    # ONE combined CSV only
     out_csv_dir.mkdir(parents=True, exist_ok=True)
     combined_path = out_csv_dir / f"ALL_coelu_matches_{tag}.csv"
 
@@ -293,13 +303,26 @@ def run_group_coelution(
 
         combined.to_csv(combined_path, index=False)
     else:
-        # create empty but with expected headers
+        # Create empty but with expected headers
         pd.DataFrame(columns=[
             "base", "m/z", "Segment_ID", "Pixel_start", "Pixel_end",
             "delta_pixels", "slice_filename", "slice_found", "Peak_num_cluster",
             "RT_apex", "peak_pixel_start", "peak_pixel_end",
             "peak_type", "cluster_id", "is_cluster_lead", "peak_num",
         ]).to_csv(combined_path, index=False)
+
+    # Copy NON-coeluting slices to Peak Patches
+    patch_dir = Path(dirs["patch"])
+
+    c2, s2 = copy_non_coeluting_to_patch(
+        slice_dir=slice_dir,
+        coelu_dir=out_slice_dir,
+        patch_dir=patch_dir,
+        dry_run=dry_run,
+    )
+
+    if params.verbose or c2 > 0:
+        print(f"Patch sync (non-coeluting): copied={c2}, skipped_coelu={s2} -> {patch_dir}")
 
     print(
         f"Coelution complete for {group_name} (tag={tag}): "

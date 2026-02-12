@@ -1,31 +1,21 @@
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
-
+import shutil
 import numpy as np
 import pandas as pd
 import cv2
 from scipy.signal import find_peaks
 from scipy.signal import savgol_filter
+import re
 
-
-# -----------------------------
-# Tuning knobs (safe defaults)
-# -----------------------------
-SAVGOL_WINDOW_FRAC = 0.025   # smoothing window as fraction of width
+SAVGOL_WINDOW_FRAC = 0.025
 SAVGOL_POLY = 3
-
-PROM_FRAC = 0.05            # peak prominence fraction
-MIN_SEP_FRAC = 0.10         # min peak spacing fraction of width
-
-NOISE_DIST_PIXELS = 15      # suppress tiny "double peaks"
+PROM_FRAC = 0.05
+MIN_SEP_FRAC = 0.10
+NOISE_DIST_PIXELS = 15
 NOISE_INT_DIFF_RATIO = 0.10
+DEBUG_PRINT = True
 
-DEBUG_PRINT = True          # set False to quiet logs
-
-
-# -----------------------------
-# Helpers: smoothing + peaks
-# -----------------------------
 def _smooth_1d(y: np.ndarray) -> np.ndarray:
     n = len(y)
     if n < 5:
@@ -42,7 +32,6 @@ def _smooth_1d(y: np.ndarray) -> np.ndarray:
     poly = min(SAVGOL_POLY, win - 1)
     return savgol_filter(y.astype(np.float64, copy=False), window_length=win, polyorder=poly)
 
-
 def detect_peaks(profile_smooth: np.ndarray,
                  prom_frac: float = PROM_FRAC,
                  min_height_frac: float = 0.05,
@@ -56,7 +45,6 @@ def detect_peaks(profile_smooth: np.ndarray,
 
     peaks, props = find_peaks(profile_smooth, prominence=prom, distance=dist, height=min_height)
     return np.array(peaks, dtype=int)
-
 
 def filter_peaks(peaks: np.ndarray, profile_smooth: np.ndarray) -> np.ndarray:
     if peaks is None or len(peaks) <= 1:
@@ -85,10 +73,6 @@ def filter_peaks(peaks: np.ndarray, profile_smooth: np.ndarray) -> np.ndarray:
 
     return np.array(final_peaks, dtype=int)
 
-
-# -----------------------------
-# Helpers: profile extraction
-# -----------------------------
 def _interpolate_nans_1d(y: np.ndarray) -> np.ndarray:
     x = np.arange(len(y))
     mask = ~np.isnan(y)
@@ -98,12 +82,7 @@ def _interpolate_nans_1d(y: np.ndarray) -> np.ndarray:
     y2[~mask] = np.interp(x[~mask], x[mask], y2[mask])
     return y2
 
-
 def extract_height_profile_from_alpha(img_rgba: np.ndarray) -> np.ndarray:
-    """
-    Builds a 1D profile across x by measuring the median y-position of non-transparent pixels.
-    Then converts to height-from-bottom so peaks are "high".
-    """
     if img_rgba.ndim != 3 or img_rgba.shape[2] < 4:
         raise ValueError("RGBA image required for alpha-based profiling.")
 
@@ -126,12 +105,7 @@ def extract_height_profile_from_alpha(img_rgba: np.ndarray) -> np.ndarray:
     height_from_bottom = (H - 1) - y_med
     return height_from_bottom.astype(np.float64)
 
-
 def _profile_and_peaks(img: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Returns (profile_smooth, peaks) for a piece.
-    Prefers alpha-based profiling when RGBA.
-    """
     if img.ndim == 3 and img.shape[2] == 4:
         profile_raw = extract_height_profile_from_alpha(img)
     else:
@@ -155,7 +129,6 @@ def _profile_and_peaks(img: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
             peaks = peaks2
 
     return profile_smooth, (np.array(peaks, dtype=int) if peaks is not None else np.array([], dtype=int))
-
 
 def find_split_index_from_profile(profile_smooth: np.ndarray, peaks: np.ndarray) -> int:
     """
@@ -188,10 +161,6 @@ def find_split_index_from_profile(profile_smooth: np.ndarray, peaks: np.ndarray)
 
     return int(W // 2)
 
-
-# -----------------------------
-# Splitting logic
-# -----------------------------
 def _split_once_by_valley(img: np.ndarray) -> Tuple[np.ndarray, Optional[np.ndarray], bool]:
     W = img.shape[1]
     if W < 3:
@@ -208,14 +177,7 @@ def _split_once_by_valley(img: np.ndarray) -> Tuple[np.ndarray, Optional[np.ndar
     right = img[:, valley_idx:]
     return left, right, True
 
-
 def _split_into_n(img: np.ndarray, n: int, max_iters: int = 50) -> List[np.ndarray]:
-    """
-    Repeatedly split by valleys until we get n pieces (or can't split anymore).
-    Strategy:
-      - always split the piece that still looks like it has >=2 peaks
-      - among those, pick the widest one
-    """
     if n <= 1:
         return [img]
 
@@ -252,22 +214,91 @@ def _split_into_n(img: np.ndarray, n: int, max_iters: int = 50) -> List[np.ndarr
 
     return pieces
 
-
-# -----------------------------
-# Main entrypoint for pipeline
-# -----------------------------
 def _group_tag(group_name: str) -> str:
     return str(group_name).replace(" ", "")
 
+def copy_coelu_sliced_to_patch(
+    *,
+    coelu_sliced_dir: Path,
+    patch_dir: Path,
+    overwrite: bool = False,
+) -> Tuple[int, int]:
+    patch_dir.mkdir(parents=True, exist_ok=True)
+
+    copied = 0
+    skipped = 0
+
+    for p in coelu_sliced_dir.glob("*.png"):
+        dst = patch_dir / p.name
+        if dst.exists() and not overwrite:
+            skipped += 1
+            continue
+        shutil.copy2(p, dst)
+        copied += 1
+
+    return copied, skipped
+
+def rename_patch_to_peak_numbers(
+    *,
+    dirs: Dict[str, str],
+    group_name: str,
+    overwrite: bool = False,
+) -> Tuple[int, int]:
+    patch_dir = Path(dirs["patch"])
+    group_tag = str(group_name).replace(" ", "")
+
+    pat = re.compile(
+        r"^(?P<base>.+?)_mz(?P<mz>\d+(?:\.\d+)?)_seg(?P<seg>\d+)_(?P<group>[^_]+)(?:_p(?P<p>\d+))?\.png$"
+    )
+
+    files = []
+    for p in patch_dir.glob("*.png"):
+        m = pat.match(p.name)
+        if not m:
+            continue
+        if m.group("group") != group_tag:
+            continue
+        seg = int(m.group("seg"))
+        pnum = int(m.group("p")) if m.group("p") else 1
+        files.append((m.group("base"), seg, pnum, m.group("mz"), p))
+
+    if not files:
+        return 0, 0
+
+    # Group by base sample (so Peak1 restarts for each base)
+    by_base: Dict[str, list] = {}
+    for base, seg, pnum, mz, path in files:
+        by_base.setdefault(base, []).append((seg, pnum, mz, path))
+
+    renamed = 0
+    skipped = 0
+
+    for base, items in by_base.items():
+        items.sort(key=lambda t: (t[0], t[1]))  # (seg, p)
+
+        # Two-phase rename to avoid collisions
+        temp_moves = []
+        for i, (seg, pnum, mz, old_path) in enumerate(items, start=1):
+            new_name = f"{base}_mz{mz}_Peak{i}_{group_tag}.png"
+            new_path = patch_dir / new_name
+
+            if new_path.exists() and not overwrite:
+                skipped += 1
+                continue
+
+            tmp_path = patch_dir / f"{old_path.stem}__TMP__.png"
+            old_path.rename(tmp_path)
+            temp_moves.append((tmp_path, new_path))
+
+        for tmp_path, new_path in temp_moves:
+            if new_path.exists() and overwrite:
+                new_path.unlink()
+            tmp_path.rename(new_path)
+            renamed += 1
+
+    return renamed, skipped
 
 def process_file_coelution_sliced(dirs: Dict[str, str], group_name: str) -> str:
-    """
-    Pipeline-friendly function.
-    Expects dirs to contain:
-      - dirs["coelu_slices"]  : Peak Coelu Slices folder
-      - dirs["coelu_csv"]     : Peak Coelu CSV folder
-      - dirs["coelu_sliced"]  : output folder Coelu Slices Sliced
-    """
     tag = _group_tag(group_name)
 
     coelu_slices_dir = Path(dirs["coelu"])
@@ -342,6 +373,19 @@ def process_file_coelution_sliced(dirs: Dict[str, str], group_name: str) -> str:
             out_name = f"{slice_path.stem}_p{label}{slice_path.suffix}"
             cv2.imwrite(str(out_dir / out_name), piece)
             total_out += 1
+
+    patch_dir = Path(dirs["patch"])
+    c2, s2 = copy_coelu_sliced_to_patch(
+        coelu_sliced_dir=out_dir,
+        patch_dir=patch_dir,
+        overwrite=False,
+    )
+    if DEBUG_PRINT or c2 > 0:
+        print(f"[Patch sync] coelu sliced -> patch: copied={c2}, skipped={s2} -> {patch_dir}")
+
+    r, s = rename_patch_to_peak_numbers(dirs=dirs, group_name=group_name, overwrite=False)
+    if DEBUG_PRINT:
+        print(f"[Patch rename] renamed={r}, skipped={s}")
 
     return (f"[✔] CoelutionSliced {tag}: "
             f"{total_in} files processed, {total_out} slices written, "
