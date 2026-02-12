@@ -152,7 +152,10 @@ class Pipeline:
         print(f"Checkpoint 5 (Slicing based on Pixel Mapping) completed in {elapsed:.2f} seconds!")
 
     def run_group_checkpoint6(self, dirs, group_name):
+        start_time = time.time()
         run_group_coelution(dirs=dirs, group_name=group_name)
+        elapsed = time.time() - start_time
+        print(f"Checkpoint 6 (Coelution slices added to Directory) completed in {elapsed:.2f} seconds!")
 
     def run(self):
         total_start = time.time()
@@ -171,6 +174,7 @@ class Pipeline:
             self.run_group_checkpoint6(dirs, group_name)
 
         total_elapsed = time.time() - total_start
+        print("\n")
         print("🐊" * 33)
         print("=" * 70)
         print(f"ALL GROUPS COMPLETE in {total_elapsed:.2f} seconds")
