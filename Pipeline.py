@@ -144,8 +144,11 @@ class Pipeline:
         print(f"Checkpoint 4 (Pixel Mapping) completed in {elapsed:.2f} seconds!")
 
     def run_group_checkpoint5(self, dirs, group_name):
-        """Checkpoint 5: Slice PNG images based on pixel mapping"""
+        start_time = time.time()
         process_file_checkpoint5(self, dirs, group_name)
+
+        elapsed = time.time() - start_time
+        print(f"Checkpoint 5 (Slicing based on Pixel Mapping) completed in {elapsed:.2f} seconds!")
 
     def run(self):
         total_start = time.time()

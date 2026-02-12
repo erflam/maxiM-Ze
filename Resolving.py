@@ -201,8 +201,8 @@ def process_file_checkpoint3(file_path: str, dirs: dict, group_name: str) -> str
             row.update({
                 "RT_start": float(px_to_rt(ps)),
                 "RT_end": float(px_to_rt(pe)),
-                "pixel_start": int(ps),
-                "pixel_end": int(pe),
+                "Pixel_start": int(ps),
+                "Pixel_end": int(pe),
                 "peak_type": "resolved",
                 "cluster_id": f"{mz_key}_0",
                 "is_cluster_lead": True
@@ -265,8 +265,8 @@ def process_file_checkpoint3(file_path: str, dirs: dict, group_name: str) -> str
                 row.update({
                     "RT_start": float(px_to_rt(ps)),
                     "RT_end": float(px_to_rt(pe)),
-                    "pixel_start": ps,
-                    "pixel_end": pe,
+                    "Pixel_start": ps,
+                    "Pixel_end": pe,
                     "peak_type": "resolved",
                     "cluster_id": f"{mz_key}_{cidx}",
                     "is_cluster_lead": True
@@ -329,8 +329,8 @@ def process_file_checkpoint3(file_path: str, dirs: dict, group_name: str) -> str
                 row.update({
                     "RT_start": float(px_to_rt(ps)),
                     "RT_end": float(px_to_rt(pe)),
-                    "pixel_start": ps,
-                    "pixel_end": pe,
+                    "Pixel_start": ps,
+                    "Pixel_end": pe,
                     "peak_type": "coeluting",
                     "cluster_id": f"{mz_key}_{cidx}",
                     "is_cluster_lead": bool(k == 0)
@@ -375,7 +375,7 @@ def count_peaks_per_file_summary(dirs: dict, group_name: str) -> str:
         try:
             df = pd.read_csv(peaks_csv_path)
 
-            base_required = ["RT_apex", "pixel_start", "pixel_end"]
+            base_required = ["RT_apex", "Pixel_start", "Pixel_end"]
             missing = [c for c in base_required if c not in df.columns]
             if missing:
                 print(f"[!] Missing columns {missing} in {file_name}, skipping...")
@@ -404,8 +404,8 @@ def count_peaks_per_file_summary(dirs: dict, group_name: str) -> str:
 
                 sample_data[f"Peak {peak_idx} m/z"] = mz_str
                 sample_data[f"Peak {peak_idx} RT_apex"] = row["RT_apex"]
-                sample_data[f"Peak {peak_idx} pixel_start"] = row["pixel_start"]
-                sample_data[f"Peak {peak_idx} pixel_end"] = row["pixel_end"]
+                sample_data[f"Peak {peak_idx} pixel_start"] = row["Pixel_start"]
+                sample_data[f"Peak {peak_idx} pixel_end"] = row["Pixel_end"]
 
             peak_summaries.append(sample_data)
 

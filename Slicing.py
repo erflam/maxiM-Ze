@@ -48,7 +48,7 @@ def slice_single_png(args):
 
             # Create output filename
             # Format: {base}_mz{mz}_seg{seg_id}_{group_tag}.png
-            slice_filename = f"{base}_mz{mz_str}_seg{seg_id:03d}_{group_tag}.png"
+            slice_filename = f"{base}_mz{mz_str}_seg{seg_id}_{group_tag}.png"
             slice_path = os.path.join(slice_dir, slice_filename)
 
             # Save the slice
