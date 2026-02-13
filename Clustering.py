@@ -1,22 +1,7 @@
-# Clustering.py
-# Align / cluster Peak patches by SHAPE similarity + build summary tables + optional RT/mass recluster + final Excel export
-#
-# Expected patch filenames (stem, no .png):
-#   {file_base}_mz{mz}_Peak{peaknum}_{GroupTag}
-# Example:
-#   OE_EF_IsmailBaseline_POS_C007_0002_mz187.0964_Peak2_Group1.png
-#
-# Expected pixel CSV per file (in dirs["pixel"]):
-#   {file_base}_peaks_pix.csv
-# Must contain columns: peak_num, RT_start, RT_apex, RT_end, pixel_start, pixel_end, height, area
-
-from __future__ import annotations
-
 import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
-
 import cv2
 import numpy as np
 import pandas as pd
