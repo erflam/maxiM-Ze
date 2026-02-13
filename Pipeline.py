@@ -202,7 +202,7 @@ class Pipeline:
             self.run_group_checkpoint5(dirs, group_name)
             self.run_group_checkpoint6(dirs, group_name)
             self.run_group_checkpoint7(dirs, group_name)
-            #self.run_group_checkpoint8(dirs, group_name)
+            self.run_group_checkpoint8(dirs, group_name)
 
         total_elapsed = time.time() - total_start
         print("\n")

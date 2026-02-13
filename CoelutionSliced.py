@@ -337,8 +337,36 @@ def process_file_coelution_sliced(dirs: Dict[str, str], group_name: str) -> str:
                 print(f"[!] Missing slice image: {slice_path}")
             continue
 
-        peak_nums = sorted(pd.unique(g["Peak_num_cluster"]))
-        n_peaks = len(peak_nums)
+        # Coeluting case: Peak_num_cluster works.
+        # Resolved-sliced-together case: Peak_num_cluster often collapses to [1] because each peak is in a different cluster.
+        peak_types = g.get("peak_type", pd.Series([], dtype=str)).astype(str).str.strip().str.lower()
+        has_resolved = peak_types.eq("resolved").any()
+
+        if has_resolved:
+            # Build unique peaks within this slice using available per-peak columns
+            # Prefer pixel ordering if present; fallback to RT_apex.
+            cols_needed = [c for c in ["cluster_id", "peak_num", "peak_pixel_start", "peak_pixel_end", "RT_apex"] if
+                           c in g.columns]
+            peaks_u = g[cols_needed].drop_duplicates().copy()
+
+            if "peak_pixel_start" in peaks_u.columns:
+                peaks_u["_sort"] = pd.to_numeric(peaks_u["peak_pixel_start"], errors="coerce")
+            elif "RT_apex" in peaks_u.columns:
+                peaks_u["_sort"] = pd.to_numeric(peaks_u["RT_apex"], errors="coerce")
+            else:
+                # last resort: keep original row order
+                peaks_u["_sort"] = np.arange(len(peaks_u), dtype=float)
+
+            peaks_u = peaks_u.sort_values("_sort", kind="stable")
+            n_peaks = int(len(peaks_u))
+
+            # labels 1..n left->right (these become _p1, _p2, ...)
+            labels = list(range(1, n_peaks + 1))
+
+        else:
+            peak_nums = sorted(pd.unique(g["Peak_num_cluster"]))
+            n_peaks = len(peak_nums)
+            labels = [int(x) for x in peak_nums]
 
         img = cv2.imread(str(slice_path), cv2.IMREAD_UNCHANGED)
         if img is None:
@@ -369,7 +397,7 @@ def process_file_coelution_sliced(dirs: Dict[str, str], group_name: str) -> str:
 
         # Save left->right pieces using Peak_num_cluster for names
         for i, piece in enumerate(pieces):
-            label = int(peak_nums[i]) if i < len(peak_nums) else (i + 1)
+            label = labels[i] if i < len(labels) else (i + 1)
             out_name = f"{slice_path.stem}_p{label}{slice_path.suffix}"
             cv2.imwrite(str(out_dir / out_name), piece)
             total_out += 1
