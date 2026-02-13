@@ -2,6 +2,7 @@ import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Tuple
+
 import pandas as pd
 
 @dataclass(frozen=True)
@@ -22,6 +23,143 @@ def _mz_key(series: pd.Series, decimals: int) -> pd.Series:
 def _mz_to_fname_dot(mz: float, decimals: int) -> str:
     """Matches your slice filenames: mz187.0964 (dot, fixed decimals)."""
     return f"{float(mz):.{decimals}f}"
+
+def _seg_id_to_int(seg_id) -> int:
+    """
+    Robust Segment_ID -> int conversion for filenames.
+    Handles values like 3, "3", 3.0, "3.0", pandas Int64, etc.
+    """
+    try:
+        # pandas NA-safe
+        v = pd.to_numeric(pd.Series([seg_id]), errors="coerce").iloc[0]
+        if pd.isna(v):
+            raise ValueError(f"Segment_ID is NaN: {seg_id!r}")
+        return int(float(v))
+    except Exception as e:
+        raise ValueError(f"Cannot convert Segment_ID to int: {seg_id!r}") from e
+
+def find_secondary_coelution_segments(
+    *,
+    peaks_norm: pd.DataFrame,
+    mapping_norm: pd.DataFrame,
+    rt_diff_threshold: float = 0.13,
+    apex_tolerance_pixels: int = 2,
+) -> pd.DataFrame:
+    cols = ["_mz_key", "_seg_id", "_sstart", "_send", "_delta_to_seg_start", "cluster_id"]
+    if peaks_norm.empty or mapping_norm.empty:
+        return pd.DataFrame(columns=cols)
+
+    p = peaks_norm.copy()
+    m = mapping_norm.copy()
+
+    # Ensure numeric columns
+    p["_pstart"] = pd.to_numeric(p.get("Pixel_start"), errors="coerce")
+    p["_pend"] = pd.to_numeric(p.get("Pixel_end"), errors="coerce")
+    p["_rt"] = pd.to_numeric(p.get("RT_apex"), errors="coerce")
+    p["_is_resolved"] = p["peak_type"].astype(str).str.strip().str.lower().eq("resolved")
+
+    # define an apex pixel if not already present: midpoint of peak bounds
+    p["_papex"] = (p["_pstart"] + p["_pend"]) / 2.0
+
+    p = p.dropna(subset=["_mz_key", "_pstart", "_pend", "_papex", "_rt"])
+    p = p.loc[p["_is_resolved"]].copy()
+    if p.empty:
+        return pd.DataFrame(columns=cols)
+
+    # Ensure mapping numeric columns exist
+    m["_sstart"] = pd.to_numeric(m.get("_sstart", m.get("Pixel_start")), errors="coerce")
+    m["_send"] = pd.to_numeric(m.get("_send", m.get("Pixel_end")), errors="coerce")
+
+    # IMPORTANT: ensure segment IDs are integer-like to avoid seg3.0 filenames
+    m["_seg_id"] = pd.to_numeric(m.get("_seg_id", m.get("Segment_ID")), errors="coerce").astype("Int64")
+
+    m = m.dropna(subset=["_mz_key", "_seg_id", "_sstart", "_send"])
+    if m.empty:
+        return pd.DataFrame(columns=cols)
+
+    out_rows = []
+
+    # Work m/z by m/z
+    for mz_key, m_mz in m.groupby("_mz_key", dropna=True):
+        p_mz = p.loc[p["_mz_key"].eq(mz_key)].copy()
+        if len(p_mz) < 2:
+            continue
+
+        # Assign each peak to ONE segment
+        assignments = []
+        for _, pk in p_mz.iterrows():
+            apex = float(pk["_papex"])
+            tol = float(apex_tolerance_pixels)
+
+            # candidate segments where apex is inside (with small tolerance)
+            cand = m_mz.loc[
+                (m_mz["_sstart"] - tol <= apex) & (apex <= m_mz["_send"] + tol)
+            ].copy()
+
+            if cand.empty:
+                # fallback: choose the segment with minimal distance to segment interval
+                def dist_to_seg(row):
+                    s, e = float(row["_sstart"]), float(row["_send"])
+                    if s <= apex <= e:
+                        return 0.0
+                    return min(abs(apex - s), abs(apex - e))
+
+                cand = m_mz.copy()
+                cand["_apex_dist"] = cand.apply(dist_to_seg, axis=1)
+                best = cand.sort_values("_apex_dist", kind="stable").head(1)
+            else:
+                # choose best by distance to segment center
+                cand["_center"] = (cand["_sstart"] + cand["_send"]) / 2.0
+                cand["_apex_dist"] = (cand["_center"] - apex).abs()
+                best = cand.sort_values("_apex_dist", kind="stable").head(1)
+
+            seg_row = best.iloc[0]
+            assignments.append(
+                {
+                    "cluster_id": str(pk["cluster_id"]),
+                    "_rt": float(pk["_rt"]),
+                    "_seg_id": int(seg_row["_seg_id"]),  # ensure int
+                    "_sstart": float(seg_row["_sstart"]),
+                    "_send": float(seg_row["_send"]),
+                }
+            )
+
+        a = pd.DataFrame(assignments)
+        if a.empty:
+            continue
+
+        # Find segments that have >=2 assigned peaks (THIS is "sliced together")
+        for seg_id, grp in a.groupby("_seg_id", dropna=True):
+            if len(grp) < 2:
+                continue
+
+            # Optional RT proximity gate
+            if rt_diff_threshold is not None:
+                rts = grp["_rt"].sort_values().to_numpy()
+                close_pair = any(
+                    abs(float(rts[i + 1]) - float(rts[i])) <= float(rt_diff_threshold) + 1e-12
+                    for i in range(len(rts) - 1)
+                )
+                if not close_pair:
+                    continue
+
+            # Trigger: add one row per cluster_id in this segment
+            for cid in grp["cluster_id"].unique().tolist():
+                out_rows.append(
+                    {
+                        "_mz_key": float(mz_key),
+                        "_seg_id": int(seg_id),  # ensure int
+                        "_sstart": float(grp["_sstart"].iloc[0]),
+                        "_send": float(grp["_send"].iloc[0]),
+                        "_delta_to_seg_start": 0.0,
+                        "cluster_id": cid,
+                    }
+                )
+
+    if not out_rows:
+        return pd.DataFrame(columns=cols)
+
+    return pd.DataFrame(out_rows)
 
 def copy_non_coeluting_to_patch(
     *,
@@ -63,11 +201,6 @@ def collect_for_base(
     params: CoelutionParams,
     dry_run: bool,
 ) -> Tuple[int, int, pd.DataFrame]:
-    """
-    Returns:
-      copied_png_count, missing_png_count, rows_df
-    rows_df contains ALL peaks belonging to cluster_id(s) that triggered a segment copy.
-    """
     peaks_path = pixel_csv_dir / f"{base}_peaks_pix_{tag}.csv"
     mapping_path = pixel_csv_dir / f"{base}_pixelmapping_{tag}.csv"
 
@@ -82,7 +215,6 @@ def collect_for_base(
     required_peaks = {
         "m/z", "RT_apex", "Pixel_start", "Pixel_end",
         "peak_type", "cluster_id", "is_cluster_lead", "peak_num",
-        # (RT_start/RT_end/area/height may exist, but we won't output them)
     }
     required_map = {"m/z", "Segment_ID", "Pixel_start", "Pixel_end"}
 
@@ -102,6 +234,7 @@ def collect_for_base(
     p["_is_lead"] = _to_bool(p["is_cluster_lead"])
     p["_mz_key"] = _mz_key(p["m/z"], params.mz_round_decimals)
     p["_pstart"] = pd.to_numeric(p["Pixel_start"], errors="coerce")
+    p["_pend"] = pd.to_numeric(p["Pixel_end"], errors="coerce")
 
     p = p.dropna(subset=["_mz_key", "_pstart"])
     if p.empty:
@@ -110,41 +243,76 @@ def collect_for_base(
     # Normalize mapping
     m = mapping.copy()
     m["_mz_key"] = _mz_key(m["m/z"], params.mz_round_decimals)
-    m["_seg_id"] = m["Segment_ID"]
+
+    # IMPORTANT: force seg_id to integer-like to match filenames (seg3 not seg3.0)
+    m["_seg_id"] = pd.to_numeric(m["Segment_ID"], errors="coerce").astype("Int64")
+
     m["_sstart"] = pd.to_numeric(m["Pixel_start"], errors="coerce")
     m["_send"] = pd.to_numeric(m["Pixel_end"], errors="coerce")
-    m = m.dropna(subset=["_mz_key", "_sstart", "_send"])
+    m = m.dropna(subset=["_mz_key", "_seg_id", "_sstart", "_send"])
     if m.empty:
         return 0, 0, pd.DataFrame()
 
-    # Choose segments based on coeluting + lead peaks within tolerance to Pixel_start
+    # Choose segments based on (A) your original coeluting-lead rule and (B) the new secondary rule
     lead = p.loc[p["_is_coelu"] & p["_is_lead"]].copy()
-    if lead.empty:
+
+    secondary = find_secondary_coelution_segments(
+        peaks_norm=p,
+        mapping_norm=m,
+        rt_diff_threshold=0.13,
+        apex_tolerance_pixels=2,
+    )
+
+    if lead.empty and secondary.empty:
         if params.verbose:
-            print(f"[v] base={base}: no coeluting cluster-lead peaks")
+            print(f"[v] base={base}: no coeluting-lead peaks AND no secondary-coelution segments")
         return 0, 0, pd.DataFrame()
 
-    candidates = lead.merge(m[["_mz_key", "_seg_id", "_sstart", "_send"]], on="_mz_key", how="inner")
-    if candidates.empty:
-        if params.verbose:
-            print(f"[v] base={base}: no m/z overlap between lead peaks and mapping")
-        return 0, 0, pd.DataFrame()
+    chosen_parts = []
 
-    candidates["_delta_to_seg_start"] = (candidates["_pstart"] - candidates["_sstart"]).abs()
-    chosen = candidates.loc[candidates["_delta_to_seg_start"] <= params.pixel_tolerance].copy()
-    if chosen.empty:
-        if params.verbose:
-            best = candidates.sort_values("_delta_to_seg_start").groupby("_mz_key").head(1)
-            for _, r in best.iterrows():
-                print(
-                    f"[v] base={base} mz={r['_mz_key']} best seg={r['_seg_id']} "
-                    f"seg_start={r['_sstart']} lead_peak_start={r['_pstart']} "
-                    f"delta={r['_delta_to_seg_start']} tol={params.pixel_tolerance}"
+    # Coeluting + lead peaks within tolerance to Pixel_start
+    if not lead.empty:
+        candidates = lead.merge(m[["_mz_key", "_seg_id", "_sstart", "_send"]], on="_mz_key", how="inner")
+
+        if candidates.empty:
+            if params.verbose:
+                print(f"[v] base={base}: no m/z overlap between lead peaks and mapping (rule A skipped)")
+        else:
+            candidates["_delta_to_seg_start"] = (candidates["_pstart"] - candidates["_sstart"]).abs()
+            chosen_a = candidates.loc[candidates["_delta_to_seg_start"] <= params.pixel_tolerance].copy()
+
+            if not chosen_a.empty:
+                # keep one per mz+seg (smallest delta)
+                chosen_a = (
+                    chosen_a.sort_values("_delta_to_seg_start")
+                    .drop_duplicates(subset=["_mz_key", "_seg_id"])
+                    .copy()
                 )
+                chosen_parts.append(chosen_a)
+
+    # Secondary coelution segments
+    if not secondary.empty:
+        chosen_parts.append(secondary.copy())
+
+    if not chosen_parts:
+        if params.verbose:
+            print(f"[v] base={base}: no segments chosen by either rule")
         return 0, 0, pd.DataFrame()
 
-    # Deduplicate segments (one per mz+seg). Keep smallest delta.
-    chosen = chosen.sort_values("_delta_to_seg_start").drop_duplicates(subset=["_mz_key", "_seg_id"]).copy()
+    # Combine and dedupe copies by mz+seg+cluster_id (so one segment can trigger multiple clusters)
+    chosen = pd.concat(chosen_parts, ignore_index=True)
+
+    # Normalize chosen seg_id to int for filenames
+    chosen["_seg_id"] = pd.to_numeric(chosen["_seg_id"], errors="coerce")
+
+    if "cluster_id" in chosen.columns:
+        chosen = chosen.sort_values("_delta_to_seg_start", kind="stable").drop_duplicates(
+            subset=["_mz_key", "_seg_id", "cluster_id"], keep="first"
+        )
+    else:
+        chosen = chosen.sort_values("_delta_to_seg_start", kind="stable").drop_duplicates(
+            subset=["_mz_key", "_seg_id"], keep="first"
+        )
 
     out_slice_dir.mkdir(parents=True, exist_ok=True)
 
@@ -154,11 +322,17 @@ def collect_for_base(
     seg_rows: List[dict] = []
     for _, seg in chosen.iterrows():
         mz_val = float(seg["_mz_key"])
-        seg_id = seg["_seg_id"]
+
+        # IMPORTANT: force seg_id to int so filename uses seg3 not seg3.0
+        seg_id_int = _seg_id_to_int(seg["_seg_id"])
+
         mz_str = _mz_to_fname_dot(mz_val, params.mz_fname_decimals)
-        slice_filename = f"{base}_mz{mz_str}_seg{seg_id}_{group_tag}.png"
+        slice_filename = f"{base}_mz{mz_str}_seg{seg_id_int}_{group_tag}.png"
         slice_path = slice_dir / slice_filename
         slice_found = slice_path.exists()
+
+        if not slice_found and params.verbose:
+            print(f"[v] missing slice png: {slice_filename}")
 
         if slice_found:
             if dry_run:
@@ -176,7 +350,7 @@ def collect_for_base(
             {
                 "base": base,
                 "m/z": mz_val,
-                "Segment_ID": seg_id,
+                "Segment_ID": seg_id_int,  # write int
                 "Pixel_start": float(seg["_sstart"]),
                 "Pixel_end": float(seg["_send"]),
                 "delta_pixels": float(seg["_delta_to_seg_start"]),
@@ -189,17 +363,13 @@ def collect_for_base(
     seg_df = pd.DataFrame(seg_rows)
     if seg_df.empty:
         return copied, missing_png, pd.DataFrame()
+
     trigger_clusters = set(seg_df["trigger_cluster_id"].astype(str).tolist())
     peaks_in_clusters = peaks.loc[peaks["cluster_id"].astype(str).isin(trigger_clusters)].copy()
-    peaks_in_clusters["_cluster_sort_pixel"] = pd.to_numeric(
-        peaks_in_clusters["Pixel_start"], errors="coerce"
-    )
-    peaks_in_clusters = peaks_in_clusters.sort_values(
-        ["cluster_id", "_cluster_sort_pixel"], kind="stable"
-    )
-    peaks_in_clusters["Peak_num_cluster"] = (
-            peaks_in_clusters.groupby("cluster_id").cumcount() + 1
-    )
+    peaks_in_clusters["_cluster_sort_pixel"] = pd.to_numeric(peaks_in_clusters["Pixel_start"], errors="coerce")
+    peaks_in_clusters = peaks_in_clusters.sort_values(["cluster_id", "_cluster_sort_pixel"], kind="stable")
+    peaks_in_clusters["Peak_num_cluster"] = peaks_in_clusters.groupby("cluster_id").cumcount() + 1
+
     if peaks_in_clusters.empty:
         return copied, missing_png, pd.DataFrame()
 
@@ -222,7 +392,6 @@ def collect_for_base(
                     "slice_found": seg["slice_found"],
                     "Peak_num_cluster": r["Peak_num_cluster"],
 
-                    # all peaks belonging to this cluster_id:
                     "RT_apex": r["RT_apex"],
                     "peak_pixel_start": r["Pixel_start"],
                     "peak_pixel_end": r["Pixel_end"],
@@ -250,6 +419,7 @@ def run_group_coelution(
       - dirs['slice']      Peak Slices folder
       - dirs['coelu']      Peak Coelu Slices folder
       - dirs['coelu csv']  Peak Coelu CSV folder  (NOTE SPACE)
+      - dirs['patch']      Peak Patches folder
     """
     group_tag = str(group_name).replace(" ", "")
     tag = tag or group_tag
@@ -303,7 +473,6 @@ def run_group_coelution(
 
         combined.to_csv(combined_path, index=False)
     else:
-        # Create empty but with expected headers
         pd.DataFrame(columns=[
             "base", "m/z", "Segment_ID", "Pixel_start", "Pixel_end",
             "delta_pixels", "slice_filename", "slice_found", "Peak_num_cluster",
@@ -326,6 +495,6 @@ def run_group_coelution(
 
     print(
         f"Coelution complete for {group_name} (tag={tag}): "
-        f"copied={total_copied}, missing_png={total_missing} | "
-        f"coelu_csv={combined_path}"
-    )
+        f"copied={total_copied}, missing_png={total_missing}")
+
+    print(f"Coelution CSV saved to coelu_csv={combined_path}")
