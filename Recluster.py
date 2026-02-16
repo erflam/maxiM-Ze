@@ -3,17 +3,14 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
-
 import numpy as np
 import pandas as pd
-
 
 @dataclass
 class ReclusterConfig:
     FORCE_MIN_COVERAGE: float = 0.95
     FORCE_RT_TOL: float = 0.1
     FORCE_MASS_TOL: float = 0.0001
-
 
 class Reclusterer:
     PATCH_STEM_RE = re.compile(
@@ -84,7 +81,7 @@ class Reclusterer:
         df_sum["peak count"] = pd.to_numeric(df_sum["peak count"], errors="coerce").fillna(0).astype(int)
         df_sum = self._add_forced_columns(df_sum)
 
-        # NEW: Pre-parse all unclustered peaks and build a small table with needed values
+        # Pre-parse all unclustered peaks and build a small table with needed values
         peaks_df = self._build_unclustered_table(df_un["peak_id"].astype(str), group)
         if peaks_df.empty:
             df_sum.to_csv(out_csv, index=False)
@@ -150,10 +147,6 @@ class Reclusterer:
         df_sum.to_csv(out_csv, index=False)
         return df_sum
 
-    # ----------------------------
-    # NEW: Build unclustered peak table using cached pixel CSVs
-    # ----------------------------
-
     def _build_unclustered_table(self, peak_ids: pd.Series, group: str) -> pd.DataFrame:
         rows: List[Dict[str, Any]] = []
         for peak_id in peak_ids.tolist():
@@ -215,10 +208,6 @@ class Reclusterer:
         self._pixel_cache[key] = df
         return df
 
-    # ----------------------------
-    # Misc helpers
-    # ----------------------------
-
     def _add_forced_columns(self, df: pd.DataFrame) -> pd.DataFrame:
         df = df.copy()
         if "Forced_any" not in df.columns:
@@ -239,7 +228,6 @@ class Reclusterer:
             int(m.group("peak_num")),
             m.group("group"),
         )
-
 
 def process_file_recluster(dirs: Dict[str, str | Path], group_name: str, config: Optional[ReclusterConfig] = None) -> str:
     t0 = time.time()

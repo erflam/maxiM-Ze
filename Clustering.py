@@ -4,20 +4,14 @@ import time
 from dataclasses import dataclass, asdict, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
-
 import numpy as np
 import pandas as pd
 from PIL import Image
 from scipy.stats import pearsonr
-
 try:
     import cv2  # recommended for blur
 except Exception:
     cv2 = None
-
-
-# ----------------------------- Config -----------------------------
-
 
 @dataclass
 class ClusterConfig:
@@ -26,10 +20,6 @@ class ClusterConfig:
     resize_hw: Tuple[int, int] = (50, 50)  # (H,W)
     blur_kernel: int = 5                  # odd integer; ignored if cv2 missing
     width_ratio_threshold: float = 0.75   # accept if width ratio >= this (corr fallback)
-
-
-# ----------------------------- Data Types -----------------------------
-
 
 @dataclass
 class PeakComponent:
@@ -42,7 +32,6 @@ class PeakComponent:
     pixel_end: int
     height: float
     area: float
-
 
 @dataclass
 class PeakInfo:
@@ -69,10 +58,6 @@ class PeakInfo:
 
     def rt_width(self) -> float:
         return float(self.rt_end - self.rt_start)
-
-
-# ----------------------------- Core Worker -----------------------------
-
 
 class PeakClusterer:
     """
@@ -228,8 +213,6 @@ class PeakClusterer:
         self._write_outputs(group, df_align, df_summary, df_unclustered)
         return df_align, df_summary, df_unclustered
 
-    # ----------------------------- Load -----------------------------
-
     def _load_all_peaks_for_group(self, patch_dir: Path, group: str) -> List[PeakInfo]:
         pixel_dir = self.dirs["pixel"]
         peaks: List[PeakInfo] = []
@@ -283,8 +266,6 @@ class PeakClusterer:
             )
 
         return peaks
-
-    # ----------------------------- Merge unresolved -----------------------------
 
     def _merge_unresolved(self, peaks: List[PeakInfo]) -> List[PeakInfo]:
         if len(peaks) <= 1:
@@ -360,8 +341,6 @@ class PeakClusterer:
 
         return out
 
-    # ----------------------------- Validate shapes -----------------------------
-
     def _validate_isomer_set(self, peaks: List[PeakInfo]) -> List[PeakInfo]:
         if len(peaks) <= 1:
             return peaks
@@ -406,8 +385,6 @@ class PeakClusterer:
         if np.allclose(a, a[0]) or np.allclose(b, b[0]):
             return float("nan")
         return float(pearsonr(a, b)[0])
-
-    # ----------------------------- Alignment rows -----------------------------
 
     def _compute_aligned_values(self, peaks: List[PeakInfo]) -> Dict[str, float]:
         return {
@@ -489,9 +466,6 @@ class PeakClusterer:
         df_wide = pd.concat([h, a], axis=1).reset_index()
         df_wide = df_wide.loc[df_wide["group"] == group].copy()
 
-        # --- NEW: collapse component_number so you get ONE row per (group,mass,isomer_position,aligned_rt_apex)
-        # heights: take max across components for each file
-        # areas: sum across components for each file
         height_cols = [c for c in df_wide.columns if c.endswith("_height")]
         area_cols = [c for c in df_wide.columns if c.endswith("_area")]
 
@@ -505,7 +479,6 @@ class PeakClusterer:
         # peak_count = number of files contributing a height value
         df_wide["peak_count"] = df_wide[height_cols].notna().sum(axis=1).astype(int)
 
-        # Rename to match requested header style
         df_wide = df_wide.rename(columns={
             "group": "Group",
             "mass": "m/z",
@@ -523,8 +496,6 @@ class PeakClusterer:
         df_wide.sort_values(["m/z", "Isomer_position"], inplace=True)
 
         return df_wide
-
-    # ----------------------------- Image utils -----------------------------
 
     def _read_grayscale(self, png_path: Path) -> np.ndarray:
         with Image.open(png_path) as im:
@@ -545,17 +516,11 @@ class PeakClusterer:
             return np.zeros_like(prof, dtype=np.float32)
         return ((prof - mn) / (mx - mn)).astype(np.float32)
 
-    # ----------------------------- Output -----------------------------
-
     def _write_outputs(self, group: str, df_align: pd.DataFrame, df_summary: pd.DataFrame, df_unclustered: pd.DataFrame) -> None:
         outdir = self.dirs["clustering"]
         df_align.to_csv(outdir / "peak_alignment.csv", index=False)
         df_unclustered.to_csv(outdir / f"unclustered_peaks_group_{group}.csv", index=False)
         df_summary.to_csv(outdir / f"alignment_summary_group_{group}.csv", index=False)
-
-
-# ----------------------------- Pipeline-style Function -----------------------------
-
 
 def process_file_cluster_peaks(dirs: Dict[str, str | Path], group_name: str, config: Optional[ClusterConfig] = None) -> str:
     """

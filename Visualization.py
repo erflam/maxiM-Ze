@@ -1,27 +1,15 @@
 import colorsys
 from pathlib import Path
 from typing import Dict, Optional
-
 import numpy as np
 import pandas as pd
-
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 import plotly.graph_objects as go
 
-
-# --------------------------------------------------------
-# Patch path builder (matches current naming)
-# --------------------------------------------------------
-
 def _build_patch_path(patch_dir: Path, file_base: str, mass: float, peak_num: int, group: str) -> Path:
     mass_str = f"{mass:.6f}".rstrip("0").rstrip(".")
     return patch_dir / f"{file_base}_mass{mass_str}_Peak{int(peak_num)}_{group}.png"
-
-
-# --------------------------------------------------------
-# Static Composite Visualization
-# --------------------------------------------------------
 
 def checkpoint_visualization_static_composite(cls, group_name: str) -> Optional[Path]:
 
@@ -115,11 +103,6 @@ def checkpoint_visualization_static_composite(cls, group_name: str) -> Optional[
 
     print(f"[Visualization] Static composite saved → {out_path}")
     return out_path
-
-
-# --------------------------------------------------------
-# Interactive Patch Overlay Visualization
-# --------------------------------------------------------
 
 def checkpoint_visualization_interactive_patches(cls, group_name: str) -> Optional[Path]:
 
@@ -226,11 +209,6 @@ def checkpoint_visualization_interactive_patches(cls, group_name: str) -> Option
 
     print(f"[Visualization] Interactive composite saved → {out_html}")
     return out_html
-
-
-# --------------------------------------------------------
-# Pipeline Entry Point
-# --------------------------------------------------------
 
 def process_visualizations(cls, group_name: str) -> str:
     out1 = checkpoint_visualization_static_composite(cls, group_name)

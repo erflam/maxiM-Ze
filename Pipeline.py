@@ -185,12 +185,9 @@ class Pipeline:
 
     def run_group_checkpoint10(self, dirs, group_name):
         start_time = time.time()
-
         self.dirs = dirs  # required for Visualization.py
-
         msg = process_visualizations(self, group_name)  # <-- FIXED
         print(msg)
-
         elapsed = time.time() - start_time
         print(f"Checkpoint 10 (Visual QC composites) completed in {elapsed:.2f} seconds!")
 
