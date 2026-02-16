@@ -12,7 +12,7 @@ from PixelMapping import process_file_checkpoint4
 from Slicing import process_file_checkpoint5
 from Coelution import run_group_coelution
 from CoelutionSliced import process_file_coelution_sliced
-from Clustering import cluster_group, recluster_group, export_all_group_summaries_to_excel
+from Clustering import cluster_peaks
 
 def init_worker():
     import matplotlib
@@ -169,22 +169,15 @@ class Pipeline:
     def run_group_checkpoint8(self, dirs, group_name):
         start_time = time.time()
 
-        # clustering
-        msg1 = cluster_group(
-            dirs=dirs,
-            group_name=group_name,
-            similarity_threshold=0.75,  # same as your old default
-            target_size=(50, 50),
-            debug_print=True,
+        cluster_peaks(
+            patch_dir=dirs["patch"],
+            pixel_dir=dirs["pixel"],
+            out_dir=dirs["clustering"],
+            group_tag=str(group_name).replace(" ", ""),  # "Group 1" -> "Group1"
         )
-        print(msg1)
-
-        # recluster (force attach)
-        msg2 = recluster_group(dirs=dirs, group_name=group_name)
-        print(msg2)
 
         elapsed = time.time() - start_time
-        print(f"Checkpoint 8 (Clustering + Recluster) completed in {elapsed:.2f} seconds!")
+        print(f"Checkpoint 8 (Clustering) completed in {elapsed:.2f} seconds!")
 
     def run(self):
         total_start = time.time()
@@ -202,7 +195,7 @@ class Pipeline:
             self.run_group_checkpoint5(dirs, group_name)
             self.run_group_checkpoint6(dirs, group_name)
             self.run_group_checkpoint7(dirs, group_name)
-            self.run_group_checkpoint8(dirs, group_name)
+            #self.run_group_checkpoint8(dirs, group_name)
 
         total_elapsed = time.time() - total_start
         print("\n")

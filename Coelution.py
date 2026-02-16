@@ -20,9 +20,23 @@ def _to_bool(s: pd.Series) -> pd.Series:
 def _mz_key(series: pd.Series, decimals: int) -> pd.Series:
     return pd.to_numeric(series, errors="coerce").round(decimals)
 
-def _mz_to_fname_dot(mz: float, decimals: int) -> str:
-    """Matches your slice filenames: mz187.0964 (dot, fixed decimals)."""
-    return f"{float(mz):.{decimals}f}"
+def _mz_variants_for_filename(mz: float, decimals: int) -> list[str]:
+    """
+    Generate safe filename variants for m/z:
+    - Full precision (e.g. 250.1500)
+    - Trailing-zero stripped (250.15)
+    Never alters non-zero digits.
+    """
+    base = f"{float(mz):.{decimals}f}"
+
+    variants = [base]
+
+    if "." in base:
+        stripped = base.rstrip("0").rstrip(".")
+        if stripped != base:
+            variants.append(stripped)
+
+    return variants
 
 def _seg_id_to_int(seg_id) -> int:
     """
@@ -322,14 +336,29 @@ def collect_for_base(
     seg_rows: List[dict] = []
     for _, seg in chosen.iterrows():
         mz_val = float(seg["_mz_key"])
-
-        # IMPORTANT: force seg_id to int so filename uses seg3 not seg3.0
         seg_id_int = _seg_id_to_int(seg["_seg_id"])
 
-        mz_str = _mz_to_fname_dot(mz_val, params.mz_fname_decimals)
-        slice_filename = f"{base}_mz{mz_str}_seg{seg_id_int}_{group_tag}.png"
-        slice_path = slice_dir / slice_filename
-        slice_found = slice_path.exists()
+        mz_variants = _mz_variants_for_filename(
+            mz_val,
+            params.mz_fname_decimals
+        )
+
+        slice_found = False
+        slice_path = None
+        slice_filename = None
+
+        for mz_str in mz_variants:
+            candidate = f"{base}_mz{mz_str}_seg{seg_id_int}_{group_tag}.png"
+            path = slice_dir / candidate
+            if path.exists():
+                slice_found = True
+                slice_path = path
+                slice_filename = candidate
+                break
+
+        # If none found, still record the expected "full precision" name
+        if not slice_found:
+            slice_filename = f"{base}_mz{mz_variants[0]}_seg{seg_id_int}_{group_tag}.png"
 
         if not slice_found and params.verbose:
             print(f"[v] missing slice png: {slice_filename}")
