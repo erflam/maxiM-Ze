@@ -14,6 +14,8 @@ from Coelution import run_group_coelution
 from CoelutionSliced import process_file_coelution_sliced
 from Clustering import process_file_cluster_peaks
 from Recluster import process_file_recluster
+from Visualization import process_visualizations
+from ExportExcel import process_export_excel
 
 def init_worker():
     import matplotlib
@@ -181,6 +183,24 @@ class Pipeline:
         elapsed = time.time() - start_time
         print(f"Checkpoint 9 (Post-clustering RT+mass recluster) completed in {elapsed:.2f} seconds!")
 
+    def run_group_checkpoint10(self, dirs, group_name):
+        start_time = time.time()
+
+        self.dirs = dirs  # required for Visualization.py
+
+        msg = process_visualizations(self, group_name)  # <-- FIXED
+        print(msg)
+
+        elapsed = time.time() - start_time
+        print(f"Checkpoint 10 (Visual QC composites) completed in {elapsed:.2f} seconds!")
+
+    def run_final_checkpoint_excel(self):
+        start_time = time.time()
+        msg = process_export_excel(Config)  # uses Config.MASS_GROUPS and output paths
+        print(msg)
+        elapsed = time.time() - start_time
+        print(f"Final Checkpoint (Excel export) completed in {elapsed:.2f} seconds!")
+
     def run(self):
         total_start = time.time()
 
@@ -199,7 +219,9 @@ class Pipeline:
             self.run_group_checkpoint7(dirs, group_name)
             self.run_group_checkpoint8(dirs, group_name)
             self.run_group_checkpoint9(dirs, group_name)
+            self.run_group_checkpoint10(dirs, group_name)
 
+        self.run_final_checkpoint_excel()
 
         total_elapsed = time.time() - total_start
         print("\n")

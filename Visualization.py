@@ -23,7 +23,7 @@ def _build_patch_path(patch_dir: Path, file_base: str, mass: float, peak_num: in
 # Static Composite Visualization
 # --------------------------------------------------------
 
-def checkpoint_visualization_static_composite(cls) -> Optional[Path]:
+def checkpoint_visualization_static_composite(cls, group_name: str) -> Optional[Path]:
 
     cluster_dir = Path(cls.dirs["clustering"])
     composite_dir = Path(cls.dirs["composites"])
@@ -94,7 +94,7 @@ def checkpoint_visualization_static_composite(cls) -> Optional[Path]:
 
     ax.set_xlabel("Retention Time (min)")
     ax.set_ylabel("Normalized Intensity")
-    ax.set_title(f"Composite Peak Visualization - {cls.CURRENT_GROUP}")
+    ax.set_title(f"Composite Peak Visualization - {group_name}")
 
     legend_elements = [
         patches.Patch(facecolor=colors[f], label=f)
@@ -107,7 +107,7 @@ def checkpoint_visualization_static_composite(cls) -> Optional[Path]:
     ax.set_xlim(rt_min - 0.5, rt_max + 0.5)
     ax.set_ylim(0, 1.2)
 
-    out_path = composite_dir / f"composite_visualization_{cls.CURRENT_GROUP}.png"
+    out_path = composite_dir / f"composite_visualization_{group_name}.png"
 
     plt.tight_layout()
     plt.savefig(out_path, dpi=300, bbox_inches="tight")
@@ -121,7 +121,7 @@ def checkpoint_visualization_static_composite(cls) -> Optional[Path]:
 # Interactive Patch Overlay Visualization
 # --------------------------------------------------------
 
-def checkpoint_visualization_interactive_patches(cls) -> Optional[Path]:
+def checkpoint_visualization_interactive_patches(cls, group_name: str) -> Optional[Path]:
 
     cluster_dir = Path(cls.dirs["clustering"])
     composite_dir = Path(cls.dirs["composites"])
@@ -165,7 +165,7 @@ def checkpoint_visualization_interactive_patches(cls) -> Optional[Path]:
             file_base,
             mass,
             peak_num,
-            cls.CURRENT_GROUP,
+            group_name,  # FIXED
         )
 
         if not patch_path.exists():
@@ -210,7 +210,7 @@ def checkpoint_visualization_interactive_patches(cls) -> Optional[Path]:
     rt_max = df["rt_end"].max()
 
     fig.update_layout(
-        title=f"Interactive Peak Patches Composite - {cls.CURRENT_GROUP}",
+        title=f"Interactive Peak Patches Composite - {group_name}",
         xaxis_title="Retention Time (min)",
         yaxis_title="Normalized Intensity",
         height=900,
@@ -221,7 +221,7 @@ def checkpoint_visualization_interactive_patches(cls) -> Optional[Path]:
 
     fig.update_xaxes(range=[rt_min - 0.5, rt_max + 0.5])
 
-    out_html = composite_dir / f"composite_patches_aligned_{cls.CURRENT_GROUP}.html"
+    out_html = composite_dir / f"composite_patches_aligned_{group_name}.html"
     fig.write_html(str(out_html), include_plotlyjs=True, full_html=True)
 
     print(f"[Visualization] Interactive composite saved → {out_html}")
@@ -232,7 +232,9 @@ def checkpoint_visualization_interactive_patches(cls) -> Optional[Path]:
 # Pipeline Entry Point
 # --------------------------------------------------------
 
-def process_visualizations(cls) -> str:
-    out1 = checkpoint_visualization_static_composite(cls)
-    out2 = checkpoint_visualization_interactive_patches(cls)
+def process_visualizations(cls, group_name: str) -> str:
+    out1 = checkpoint_visualization_static_composite(cls, group_name)
+    out2 = checkpoint_visualization_interactive_patches(cls, group_name)
     return f"Visualization complete → {out1} ; {out2}"
+
+
