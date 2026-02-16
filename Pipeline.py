@@ -13,6 +13,7 @@ from Slicing import process_file_checkpoint5
 from Coelution import run_group_coelution
 from CoelutionSliced import process_file_coelution_sliced
 from Clustering import process_file_cluster_peaks
+from Recluster import process_file_recluster
 
 def init_worker():
     import matplotlib
@@ -173,6 +174,13 @@ class Pipeline:
          elapsed = time.time() - start_time
          print(f"Checkpoint 8 (Peak clustering/alignment) completed in {elapsed:.2f} seconds!")
 
+    def run_group_checkpoint9(self, dirs, group_name):
+        start_time = time.time()
+        msg = process_file_recluster(dirs, group_name)
+        print(msg)
+        elapsed = time.time() - start_time
+        print(f"Checkpoint 9 (Post-clustering RT+mass recluster) completed in {elapsed:.2f} seconds!")
+
     def run(self):
         total_start = time.time()
 
@@ -190,6 +198,8 @@ class Pipeline:
             self.run_group_checkpoint6(dirs, group_name)
             self.run_group_checkpoint7(dirs, group_name)
             self.run_group_checkpoint8(dirs, group_name)
+            self.run_group_checkpoint9(dirs, group_name)
+
 
         total_elapsed = time.time() - total_start
         print("\n")
