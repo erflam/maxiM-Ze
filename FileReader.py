@@ -49,11 +49,9 @@ class MSFileAnalyzer:
     def fast_eic_extraction_parallel(mzs, ints, mass_list, tolerance):
         """Numba-accelerated parallel EIC extraction."""
         results = np.zeros(len(mass_list))
-        mzs_r = np.round(mzs, 4)
-
         for i in prange(len(mass_list)):
             mz_target = mass_list[i]
-            mask = np.abs(mzs_r - mz_target) <= tolerance
+            mask = np.abs(mzs - mz_target) <= tolerance
             results[i] = ints[mask].sum() if mask.any() else 0.0
         return results
 
@@ -62,9 +60,8 @@ class MSFileAnalyzer:
     def fast_eic_extraction(mzs, ints, mass_list, tolerance):
         """Numba-accelerated EIC extraction."""
         results = np.zeros(len(mass_list))
-        mzs_r = np.round(mzs, 4)
         for i, mz_target in enumerate(mass_list):
-            mask = np.abs(mzs_r - mz_target) <= tolerance
+            mask = np.abs(mzs - mz_target) <= tolerance
             results[i] = ints[mask].sum() if mask.any() else 0.0
         return results
 
@@ -91,15 +88,7 @@ class MSFileAnalyzer:
 
                         mzs = self._convert_array_dtype(scan['m/z array'])
                         ints = self._convert_array_dtype(scan['intensity array'])
-
-                        if len(mzs) > 10000:
-                            intensities = self.fast_eic_extraction_parallel(
-                                mzs, ints, mass_list, Config.MASS_TOLERANCE
-                            )
-                        else:
-                            intensities = self.fast_eic_extraction(
-                                mzs, ints, mass_list, Config.MASS_TOLERANCE
-                            )
+                        intensities = self.fast_eic_extraction_parallel(mzs, ints, mass_list, Config.MASS_TOLERANCE)
 
                         for m, i in zip(mass_list, intensities):
                             if i > 0:
@@ -132,8 +121,7 @@ class MSFileAnalyzerOptimized(MSFileAnalyzer):
         if self._cached_eic is not None:
             return self._cached_eic
 
-        mass_list = list(Config.MASS_LIST)
-        mass_list_str = [f"{m:.4f}" for m in Config.MASS_LIST]
+        mass_list = np.array(Config.MASS_LIST)   
 
         scan_values = []
         rt_values = []
@@ -142,6 +130,7 @@ class MSFileAnalyzerOptimized(MSFileAnalyzer):
 
         try:
             with self.get_reader() as reader:
+                temp = np.array(mass_list, dtype=np.float32)
                 for scan in reader:
                     try:
                         rt = self.get_retention_time(scan)
@@ -149,16 +138,7 @@ class MSFileAnalyzerOptimized(MSFileAnalyzer):
 
                         mzs = self._convert_array_dtype(scan['m/z array'])
                         ints = self._convert_array_dtype(scan['intensity array'])
-
-                        if len(mzs) > 10000:
-                            intensities = self.fast_eic_extraction_parallel(
-                                mzs, ints, np.array(mass_list, dtype=np.float32), Config.MASS_TOLERANCE
-                            )
-                        else:
-                            intensities = self.fast_eic_extraction(
-                                mzs, ints, np.array(mass_list, dtype=np.float32), Config.MASS_TOLERANCE
-                            )
-
+                        intensities = self.fast_eic_extraction_parallel( mzs, ints, temp, Config.MASS_TOLERANCE)
                         for idx, i in enumerate(intensities):
                             if i > 0:
                                 scan_values.append(scan_num)
@@ -175,11 +155,10 @@ class MSFileAnalyzerOptimized(MSFileAnalyzer):
         except Exception as e:
             print(f"Fatal error processing {self.file_path}: {str(e)}")
             raise
-
         self._cached_eic = pd.DataFrame({
             'scan': scan_values,
             'rt': rt_values,
-            'mass': [mass_list_str[i] for i in mass_indices],
+            'mass': [mass_list[i] for i in mass_indices],
             'intensity': intensity_values
         })
         return self._cached_eic
@@ -189,12 +168,13 @@ def process_file_checkpoint1(fp, dirs, group_name):
     Config.set_mass_group(group_name)
     try:
         base = os.path.splitext(os.path.basename(fp))[0]
+        assert Config.CURRENT_GROUP is not None, "No group selected"
         group_tag = Config.CURRENT_GROUP.replace(" ", "")
         raw_csv = os.path.join(dirs['csv'], f"{base}_EIC_raw_{group_tag}.csv")
-
+        assert os.path.exists(dirs['csv']), f"CSV directory does not exist: {dirs['csv']}"
         if os.path.exists(raw_csv):
             return f"[↷] {base} (raw cached)"
-
+        
         analyzer = MSFileAnalyzerOptimized(fp)
         df_raw = analyzer.extract_eic()
         df_raw.to_csv(raw_csv, index=False, float_format='%.3f')
