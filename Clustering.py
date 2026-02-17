@@ -16,7 +16,7 @@ except Exception:
 @dataclass
 class ClusterConfig:
     rt_unresolved_threshold_min: float = 0.01
-    similarity_threshold: float = 0.75
+    similarity_threshold: float = 0.7
     resize_hw: Tuple[int, int] = (50, 50)  # (H,W)
     blur_kernel: int = 5                  # odd integer; ignored if cv2 missing
     width_ratio_threshold: float = 0.75   # accept if width ratio >= this (corr fallback)
