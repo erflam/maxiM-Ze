@@ -41,6 +41,7 @@ def process_file_checkpoint3(file_path: str, dirs: dict, group_name: str) -> str
     VALLEY_DROP_MIN = 0.40
     MARGIN_FRAC = 0.08
     VERY_CLOSE_RT = 0.02
+    SHOULDER_RT_MAX = 0.0355  # min
 
     KERNEL_3x3 = np.ones((3, 3), np.uint8)
 
@@ -149,6 +150,27 @@ def process_file_checkpoint3(file_path: str, dirs: dict, group_name: str) -> str
         yL = profile_smooth[xL]
         yR = profile_smooth[xR]
         return vx, float(vy), float(yL), float(yR)
+
+    def is_smaller_shoulder(grp, idx_a, idx_b, shoulder_rt_max):
+        """
+        True if peak idx_a is a shoulder of idx_b:
+          - very close in RT_apex (< shoulder_rt_max minutes)
+          - and smaller (height if available for both, else area)
+        """
+        rt_a = float(grp["RT_apex"].iloc[idx_a])
+        rt_b = float(grp["RT_apex"].iloc[idx_b])
+        if abs(rt_a - rt_b) >= shoulder_rt_max:
+            return False
+
+        ha = grp["height"].iloc[idx_a]
+        hb = grp["height"].iloc[idx_b]
+
+        # Use height when both are available
+        if pd.notna(ha) and pd.notna(hb):
+            return float(ha) < float(hb)
+
+        # Otherwise fall back to area
+        return float(grp["area"].iloc[idx_a]) < float(grp["area"].iloc[idx_b])
 
     # Main Loop
     if os.path.exists(pixel_csv):
@@ -325,13 +347,29 @@ def process_file_checkpoint3(file_path: str, dirs: dict, group_name: str) -> str
                 ps = int(np.clip(ps, 0, W - 2))
                 pe = int(np.clip(pe, ps + 1, W))
 
+                # Determine if THIS member is a shoulder (smaller peak within SHOULDER_RT_MAX of a larger neighbor)
+                is_shoulder = False
+
+                # Only compare to immediate neighbors in RT order within this cluster
+                if k > 0:
+                    # idx is shoulder of previous member?
+                    if is_smaller_shoulder(grp, idx, member_idxs[k - 1], SHOULDER_RT_MAX):
+                        is_shoulder = True
+
+                if (not is_shoulder) and (k < len(member_idxs) - 1):
+                    # idx is shoulder of next member?
+                    if is_smaller_shoulder(grp, idx, member_idxs[k + 1], SHOULDER_RT_MAX):
+                        is_shoulder = True
+
+                peak_type = "shoulder" if is_shoulder else "coeluting"
+
                 row = grp.iloc[idx].to_dict()
                 row.update({
                     "RT_start": float(px_to_rt(ps)),
                     "RT_end": float(px_to_rt(pe)),
                     "Pixel_start": ps,
                     "Pixel_end": pe,
-                    "peak_type": "coeluting",
+                    "peak_type": peak_type,
                     "cluster_id": f"{mz_key}_{cidx}",
                     "is_cluster_lead": bool(k == 0)
                 })
