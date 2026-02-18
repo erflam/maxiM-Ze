@@ -5,7 +5,7 @@ class Config:
     BASE_DIR = Path.home() / "Desktop/maxiMiZe Tests"
     INPUT_SUBDIR = Path("maxiMiZe Files")
     OUTPUT_ROOT = Path("maxiMiZe Checkpoints")
-    ANALYSIS_FOLDER = "maxiMZe Tests 0217 4 Group 1-6"
+    ANALYSIS_FOLDER = "maxiMZe Tests 0218 5 Group 1-10"
 
     # Analysis parameters
     MASS_GROUPS = {
@@ -15,10 +15,10 @@ class Config:
         'Group4': [206.1005, 393.2859, 233.1383],
         'Group5': [235.1652, 187.0964, 261.1697],
         'Group6': [169.0583, 232.1544, 274.2741],
-        #'Group7': [119.0896, 337.0641, 247.1441],
-        #'Group8': [70.0651, 283.1515, 175.1077],
-        #'Group9': [179.0484, 409.1871, 292.2119],
-        #'Group10': [158.9640, 314.2327, 280.1391],
+        'Group7': [119.0896, 337.0641, 247.1441],
+        'Group8': [70.0651, 283.1515, 175.1077],
+        'Group9': [179.0484, 409.1871, 292.2119],
+        'Group10': [158.9640, 314.2327, 280.1391],
     }
     MASS_LIST = MASS_GROUPS["Group1"]  # Default to first group for backwards compatibility
     MASS_TOLERANCE = 0.0005

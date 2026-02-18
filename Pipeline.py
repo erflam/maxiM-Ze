@@ -13,7 +13,7 @@ from Slicing import process_file_checkpoint5
 from Coelution import run_group_coelution
 from CoelutionSliced import process_file_coelution_sliced
 from Clustering import process_file_cluster_peaks
-from Recluster import process_file_recluster
+from Recluster import process_file_recluster_peaks
 from Visualization import process_visualizations
 from ExportExcel import process_export_excel
 
@@ -178,7 +178,7 @@ class Pipeline:
 
     def run_group_checkpoint9(self, dirs, group_name):
         start_time = time.time()
-        msg = process_file_recluster(dirs, group_name)
+        msg = process_file_recluster_peaks(dirs, group_name)
         print(msg)
         elapsed = time.time() - start_time
         print(f"Checkpoint 9 (Post-clustering RT+mass recluster) completed in {elapsed:.2f} seconds!")
@@ -216,7 +216,7 @@ class Pipeline:
             self.run_group_checkpoint7(dirs, group_name)
             self.run_group_checkpoint8(dirs, group_name)
             self.run_group_checkpoint9(dirs, group_name)
-            self.run_group_checkpoint10(dirs, group_name)
+            #self.run_group_checkpoint10(dirs, group_name)
 
         self.run_final_checkpoint_excel()
 

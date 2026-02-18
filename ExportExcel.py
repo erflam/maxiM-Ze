@@ -44,7 +44,7 @@ def export_all_group_summaries_to_excel(Config) -> Path:
 
             summary_csv = cluster_dir / f"alignment_summary_group_{group_name}.csv"
             unresolved_csv = cluster_dir / f"unresolved_peaks_group_{group_name}.csv"
-            unclustered_csv = cluster_dir / f"unclustered_peaks_group_{group_name}.csv"
+            unclustered_csv = cluster_dir / f"unclustered_peaks_reclustered_group_{group_name}.csv"
 
             if not summary_csv.exists():
                 print(f"[!] Skipping {group_name}: summary file not found.")
