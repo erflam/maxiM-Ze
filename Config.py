@@ -5,7 +5,7 @@ class Config:
     BASE_DIR = Path.home() / "Desktop/maxiMiZe Tests"
     INPUT_SUBDIR = Path("maxiMiZe Files")
     OUTPUT_ROOT = Path("maxiMiZe Checkpoints")
-    ANALYSIS_FOLDER = "maxiMZe Tests 0218 5 Group 1-10"
+    ANALYSIS_FOLDER = ("maxiMZe Tests 0219 3 Group 1-10")
 
     # Analysis parameters
     MASS_GROUPS = {

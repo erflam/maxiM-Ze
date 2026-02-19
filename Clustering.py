@@ -516,9 +516,63 @@ class PeakClusterer:
             return np.zeros_like(prof, dtype=np.float32)
         return ((prof - mn) / (mx - mn)).astype(np.float32)
 
+    def _enrich_unclustered(self, df_unclustered: pd.DataFrame, group: str) -> pd.DataFrame:
+        """Add m/z, RT_apex, RT_start, RT_end, height, and area columns to the unclustered DataFrame
+        by parsing the peak_id string and looking up the pixel CSV."""
+        if df_unclustered.empty:
+            return df_unclustered
+
+        pixel_dir = self.dirs["pixel"]
+        mass_re = re.compile(r"_mass(?P<mass>\d+(?:\.\d+)?)_Peak(?P<peak_num>\d+)_")
+
+        records = []
+        for peak_id in df_unclustered["peak_id"]:
+            m = mass_re.search(peak_id)
+            if not m:
+                records.append({"peak_id": peak_id, "m/z": None, "RT_apex": None,
+                                 "RT_start": None, "RT_end": None, "height": None, "area": None})
+                continue
+
+            mass = float(m.group("mass"))
+            peak_num = int(m.group("peak_num"))
+
+            # file_base is everything before _mass
+            file_base = peak_id[: peak_id.find("_mass")]
+
+            pixel_csv = pixel_dir / f"{file_base}_peaks_pix_{group}.csv"
+            rt_apex = rt_start = rt_end = height = area = None
+
+            if pixel_csv.exists():
+                try:
+                    df_pix = pd.read_csv(pixel_csv)
+                    df_pix = self._normalize_columns(df_pix)
+                    hit = df_pix.loc[df_pix["peak_num"].astype(int) == peak_num]
+                    if not hit.empty:
+                        r = hit.iloc[0]
+                        rt_apex  = float(r["RT_apex"])
+                        rt_start = float(r["RT_start"])
+                        rt_end   = float(r["RT_end"])
+                        height   = float(r["height"])
+                        area     = float(r["area"])
+                except Exception:
+                    pass
+
+            records.append({
+                "peak_id":  peak_id,
+                "m/z":      mass,
+                "RT_start": rt_start,
+                "RT_apex":  rt_apex,
+                "RT_end":   rt_end,
+                "height":   height,
+                "area":     area,
+            })
+
+        return pd.DataFrame(records)
+
     def _write_outputs(self, group: str, df_align: pd.DataFrame, df_summary: pd.DataFrame, df_unclustered: pd.DataFrame) -> None:
         outdir = self.dirs["clustering"]
         df_align.to_csv(outdir / "peak_alignment.csv", index=False)
+        df_unclustered = self._enrich_unclustered(df_unclustered, group)
         df_unclustered.to_csv(outdir / f"unclustered_peaks_group_{group}.csv", index=False)
         df_summary.to_csv(outdir / f"alignment_summary_group_{group}.csv", index=False)
 

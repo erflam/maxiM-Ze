@@ -1,521 +1,330 @@
-# Recluster.py
-"""
-Fallback reclustering for "unclustered" peaks.
-
-Implements two fallback passes (in this order):
-
-1) FORCE-RECLUSTER AGAINST EXISTING ALIGNMENTS
-   If an unclustered peak matches (same group, same mass) AND its RT_apex from peaks_pix
-   is within `rt_window_min` of an existing alignment's Aligned_rt_apex, we add it into that
-   existing alignment (same isomer_position).
-
-2) CREATE NEW ALIGNMENT ROW(S) FROM REMAINING UNCLUSTERED PEAKS
-   For remaining unclustered peaks, if (same group, same mass) and their RT_apex values
-   are within `rt_window_min` of each other, we create a *new* alignment group (new
-   isomer_position) and add rows for those peaks.
-
-Outputs (written into dirs['clustering']):
-
-- peak_alignment_reclustered.csv
-- alignment_summary_reclustered_group_<GroupX>.csv
-- unclustered_peaks_reclustered_group_<GroupX>.csv
-
-Notes / assumptions:
-- Uses the same patch naming convention as the checkpoint code:
-    <file_base>_mass<mass>_Peak<peak_num>_<GroupX>.png
-  and peak_id is usually the PNG stem.
-- If a peak_id includes "__MERGED", we strip that suffix when mapping back to peaks_pix.
-- We pull RT_start/RT_apex/RT_end/pixel_start/pixel_end/height/area from peaks_pix CSV.
-- When forcing into an existing alignment, we keep that alignment's aligned_* values as-is
-  (we do NOT recompute the whole cluster mean; this is a conservative append).
-"""
-
-from __future__ import annotations
-
-import re
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
-
-import numpy as np
+import time
 import pandas as pd
+import numpy as np
+from pathlib import Path
+from openpyxl import Workbook
+from openpyxl.styles import Font, Alignment, PatternFill
+from openpyxl.utils import get_column_letter
 
 
-PATCH_RE = re.compile(
-    r"""
-    ^(?P<file_base>.+?)              # everything before _mass
-    _mass(?P<mass>\d+(?:\.\d+)?)     # float mass
-    _Peak(?P<peak_num>\d+)           # int peak number
-    _(?P<group>Group\d+)$            # GroupX
-    """,
-    re.VERBOSE,
-)
+# ── Path configuration ────────────────────────────────────────────────────────
+# Mirror the class-level path constants used in the rest of the project.
+# Adjust BASE_DIR / OUTPUT_ROOT / ANALYSIS_FOLDER / CURRENT_GROUP as needed.
+
+class Config:
+    BASE_DIR        = Path(".")          # change to match your project root
+    OUTPUT_ROOT     = "Output"
+    ANALYSIS_FOLDER = "Analysis"
+    CURRENT_GROUP   = "Group1"           # or pass in dynamically
+
+    @classmethod
+    def clustering_dir(cls) -> Path:
+        return cls.BASE_DIR / cls.OUTPUT_ROOT / cls.ANALYSIS_FOLDER / cls.CURRENT_GROUP / "Clustering"
+
+    @classmethod
+    def pixel_dir(cls) -> Path:
+        return cls.BASE_DIR / cls.OUTPUT_ROOT / cls.ANALYSIS_FOLDER / cls.CURRENT_GROUP / "Pixel CSVs"
 
 
-REQUIRED_PIX_COLS = [
-    "peak_num",
-    "RT_start",
-    "RT_apex",
-    "RT_end",
-    "pixel_start",
-    "pixel_end",
-    "height",
-    "area",
-]
-
-COLUMN_ALIASES = {
-    "pixel_start": ["Pixel_start", "pixelStart", "PixelStart", "pixel_start", "pixel start", "Pixel start"],
-    "pixel_end": ["Pixel_end", "pixelEnd", "PixelEnd", "pixel_end", "pixel end", "Pixel end"],
-    "peak_num": ["peak_num", "Peak_num", "PeakNum", "peak number", "PeakNumber"],
-    "RT_start": ["RT_start", "rt_start", "Rt_start", "RT start"],
-    "RT_apex": ["RT_apex", "rt_apex", "Rt_apex", "RT apex"],
-    "RT_end": ["RT_end", "rt_end", "Rt_end", "RT end"],
-    "height": ["height", "Height", "peak_height", "Peak_height"],
-    "area": ["area", "Area", "peak_area", "Peak_area"],
-}
+RT_TOLERANCE = 0.08   # seconds / minutes – same unit as RT_apex column
 
 
-def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
-    cols = list(df.columns)
-    rename_map: Dict[str, str] = {}
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
-    alias_to_canon: Dict[str, str] = {}
-    for canon, aliases in COLUMN_ALIASES.items():
-        for a in aliases:
-            alias_to_canon[a] = canon
-
-    existing = set(cols)
-    for c in cols:
-        if c in alias_to_canon:
-            canon = alias_to_canon[c]
-            if canon not in existing:
-                rename_map[c] = canon
-
-    if rename_map:
-        df = df.rename(columns=rename_map)
-
-    return df
+def _sample_name_from_col(col: str) -> str:
+    """Strip trailing _height or _area suffix to get the bare sample name."""
+    for suffix in ("_height", "_area"):
+        if col.endswith(suffix):
+            return col[: -len(suffix)]
+    return col
 
 
-def _assert_required_columns(df: pd.DataFrame, path: Path) -> pd.DataFrame:
-    df = _normalize_columns(df)
-    missing = [c for c in REQUIRED_PIX_COLS if c not in df.columns]
-    if missing:
-        raise ValueError(f"Pixel CSV missing required columns {missing} in {path}. Found: {list(df.columns)}")
-    return df
-
-
-@dataclass(frozen=True)
-class UnclusteredPeakKey:
-    peak_id: str
-    group: str
-    mass: float
-    file_base: str
-    peak_num: int
-
-
-def _parse_peak_id(peak_id: str) -> Optional[UnclusteredPeakKey]:
+def _sample_name_from_peak_id(peak_id: str) -> str:
     """
-    peak_id is expected to be the PNG stem, e.g.:
-      SomeFile_mass123.45_Peak7_Group3
-    It may also include "__MERGED" suffix; we strip it for parsing.
+    peak_id looks like:  OE_EF_..._C012_0001_mass297.1672_Peak6_Group1
+    We want:             OE_EF_..._C012_0001
+    Strategy: drop everything from '_mass' onwards.
     """
-    core = peak_id.split("__MERGED", 1)[0]
-    m = PATCH_RE.match(core)
-    if not m:
-        return None
-    return UnclusteredPeakKey(
-        peak_id=peak_id,
-        group=m.group("group"),
-        mass=float(m.group("mass")),
-        file_base=m.group("file_base"),
-        peak_num=int(m.group("peak_num")),
+    idx = peak_id.find("_mass")
+    if idx != -1:
+        return peak_id[:idx]
+    # fallback – return as-is
+    return peak_id
+
+
+def _height_col(sample: str) -> str:
+    return f"{sample}_height"
+
+
+def _area_col(sample: str) -> str:
+    return f"{sample}_area"
+
+
+# ── Core reclustering logic ───────────────────────────────────────────────────
+
+def recluster_group(group: str, config: type = Config) -> None:
+    clustering_dir = config.clustering_dir()
+    pixel_dir      = config.pixel_dir()
+
+    alignment_path    = clustering_dir / f"alignment_summary_group_{group}.csv"
+    unclustered_path  = clustering_dir / f"unclustered_peaks_group_{group}.csv"
+    output_path       = clustering_dir / f"Group_Summary_{group}.xlsx"
+
+    # ── Load input files ──────────────────────────────────────────────────────
+    alignment  = pd.read_csv(alignment_path)
+    unclustered = pd.read_csv(unclustered_path)
+
+    # Identify all sample columns present in the alignment summary
+    height_cols = [c for c in alignment.columns if c.endswith("_height")]
+    area_cols   = [c for c in alignment.columns if c.endswith("_area")]
+    all_samples = [_sample_name_from_col(c) for c in height_cols]
+
+    # Add Recluster column (default FALSE)
+    alignment["Recluster"] = False
+
+    # Track which (row_idx, col_name) cells were newly filled so we can bold them
+    newly_filled: set[tuple[int, str]] = set()
+
+    # Track which unclustered peak_ids were successfully matched
+    matched_peak_ids: set = set()
+
+    # ── Iterate over every blank height cell in the alignment summary ─────────
+    for row_idx, row in alignment.iterrows():
+        aligned_rt  = row["Aligned_rt_apex"]
+        mz          = row["m/z"]
+
+        for sample in all_samples:
+            h_col = _height_col(sample)
+            a_col = _area_col(sample)
+
+            # Only attempt to fill if the height cell is blank / NaN / 0
+            height_val = row.get(h_col, np.nan)
+            if pd.notna(height_val) and height_val != 0:
+                continue
+
+            # Find candidate unclustered peaks for this sample + m/z
+            candidates = unclustered[
+                (unclustered["m/z"] == mz) &
+                (unclustered["peak_id"].apply(_sample_name_from_peak_id) == sample) &
+                (abs(unclustered["RT_apex"] - aligned_rt) <= RT_TOLERANCE)
+            ].copy()
+
+            if candidates.empty:
+                continue
+
+            # Pick the candidate with the closest RT_apex
+            candidates["_rt_diff"] = abs(candidates["RT_apex"] - aligned_rt)
+            best = candidates.loc[candidates["_rt_diff"].idxmin()]
+
+            # Fill height
+            alignment.at[row_idx, h_col] = best["height"]
+            newly_filled.add((row_idx, h_col))
+
+            # Fill area if column exists
+            if a_col in alignment.columns:
+                alignment.at[row_idx, a_col] = best["area"]
+                newly_filled.add((row_idx, a_col))
+
+            alignment.at[row_idx, "Recluster"] = True
+            matched_peak_ids.add(best["peak_id"])
+
+    # ── Recalculate peak count and Aligned_rt_apex ────────────────────────────
+    for row_idx, row in alignment.iterrows():
+        if not row["Recluster"]:
+            continue
+
+        # Count non-null, non-zero height values
+        heights = [row.get(_height_col(s), np.nan) for s in all_samples]
+        new_count = sum(1 for h in heights if pd.notna(h) and h != 0)
+        alignment.at[row_idx, "peak count"] = new_count
+
+        # Recalculate Aligned_rt_apex from the pixel CSVs for this group
+        # We collect RT_apex values for all filled samples by reading pixel files.
+        rt_values = []
+        mz_val = row["m/z"]
+        for sample in all_samples:
+            h_col = _height_col(sample)
+            if pd.notna(row.get(h_col, np.nan)) and row.get(h_col, 0) != 0:
+                pixel_file = pixel_dir / f"{sample}_peaks_pix_{group}.csv"
+                if pixel_file.exists():
+                    try:
+                        pix = pd.read_csv(pixel_file)
+                        match = pix[
+                            (pix["m/z"] == mz_val) &
+                            (abs(pix["RT_apex"] - row["Aligned_rt_apex"]) <= RT_TOLERANCE + 0.05)
+                        ]
+                        if not match.empty:
+                            # pick the row whose RT_apex is closest to current aligned RT
+                            best_rt = match.loc[
+                                (match["RT_apex"] - row["Aligned_rt_apex"]).abs().idxmin(), "RT_apex"
+                            ]
+                            rt_values.append(best_rt)
+                    except Exception:
+                        pass
+
+        if rt_values:
+            alignment.at[row_idx, "Aligned_rt_apex"] = float(np.mean(rt_values))
+
+    # ── Still-unclustered peaks ───────────────────────────────────────────────
+    still_unclustered = unclustered[~unclustered["peak_id"].isin(matched_peak_ids)].copy()
+
+    # ── Build the Excel workbook ──────────────────────────────────────────────
+    _write_excel(
+        output_path   = output_path,
+        alignment     = alignment,
+        unclustered   = still_unclustered,
+        newly_filled  = newly_filled,
+        height_cols   = height_cols,
+        area_cols     = area_cols,
     )
 
-
-def _load_peak_from_pix(dirs: Dict[str, Path], key: UnclusteredPeakKey) -> Optional[Dict[str, Any]]:
-    """
-    Pull peak metrics from peaks_pix CSV for (file_base, group) and peak_num.
-    Returns a dict with raw fields needed for an alignment row.
-    """
-    pixel_csv = dirs["pixel"] / f"{key.file_base}_peaks_pix_{key.group}.csv"
-    if not pixel_csv.exists():
-        return None
-
-    df = pd.read_csv(pixel_csv)
-    df = _assert_required_columns(df, pixel_csv)
-
-    hits = df.loc[df["peak_num"].astype(int) == int(key.peak_num)]
-    if hits.shape[0] != 1:
-        return None
-
-    r = hits.iloc[0]
-    return {
-        "group": key.group,
-        "mass": float(key.mass),
-        "file": key.file_base,
-        "peak_id": key.peak_id,
-        "peak_num": int(key.peak_num),
-        "rt_start": float(r["RT_start"]),
-        "rt_apex": float(r["RT_apex"]),
-        "rt_end": float(r["RT_end"]),
-        "pixel_start": int(r["pixel_start"]),
-        "pixel_end": int(r["pixel_end"]),
-        "height": float(r["height"]),
-        "area": float(r["area"]),
-    }
+    print(f"Done. Output written to: {output_path}")
+    print(f"  Rows reclustered : {alignment['Recluster'].sum()}")
+    print(f"  Peaks matched    : {len(matched_peak_ids)}")
+    print(f"  Still unclustered: {len(still_unclustered)}")
 
 
-def _build_summary_like_checkpoint(df_align: pd.DataFrame, group: str) -> pd.DataFrame:
-    """
-    Lightweight summary builder matching the checkpoint’s output *shape*:
-    Group, m/z, Isomer_position, Aligned_rt_apex, peak count, then <file>_height/<file>_area columns.
+# ── Excel writer ──────────────────────────────────────────────────────────────
 
-    (This fallback version does not expand component_peaks_json; it just uses height/area per row.)
-    """
-    if df_align.empty:
-        return pd.DataFrame()
+def _write_excel(
+    output_path:  Path,
+    alignment:    pd.DataFrame,
+    unclustered:  pd.DataFrame,
+    newly_filled: set[tuple[int, str]],
+    height_cols:  list[str],
+    area_cols:    list[str],
+) -> None:
 
-    df = df_align.copy()
-    df = df.loc[df["group"] == group].copy()
-    if df.empty:
-        return pd.DataFrame()
+    wb = Workbook()
 
-    idx_cols = ["group", "mass", "isomer_position", "aligned_rt_apex"]
+    # ── Sheet 1: reclustered summary ──────────────────────────────────────────
+    ws1 = wb.active
+    ws1.title = "Summary"
 
-    h = df.pivot_table(index=idx_cols, columns="file", values="height", aggfunc="first")
-    a = df.pivot_table(index=idx_cols, columns="file", values="area", aggfunc="first")
-    h.columns = [f"{c}_height" for c in h.columns]
-    a.columns = [f"{c}_area" for c in a.columns]
+    bold_font   = Font(name="Arial", bold=True)
+    normal_font = Font(name="Arial", bold=False)
+    header_font = Font(name="Arial", bold=True)
 
-    df_wide = pd.concat([h, a], axis=1).reset_index()
+    # Reorder columns so Recluster appears right after peak count
+    cols = list(alignment.columns)
+    if "Recluster" in cols:
+        cols.remove("Recluster")
+        pc_idx = cols.index("peak count") if "peak count" in cols else len(cols) - 1
+        cols.insert(pc_idx + 1, "Recluster")
+    alignment = alignment[cols]
 
-    height_cols = [c for c in df_wide.columns if c.endswith("_height")]
-    area_cols = [c for c in df_wide.columns if c.endswith("_area")]
+    # Write header row
+    for col_idx, col_name in enumerate(alignment.columns, start=1):
+        cell = ws1.cell(row=1, column=col_idx, value=col_name)
+        cell.font = header_font
+        cell.alignment = Alignment(horizontal="center", wrap_text=True)
 
-    df_wide["peak_count"] = df_wide[height_cols].notna().sum(axis=1).astype(int)
+    # Map DataFrame column name → Excel column index (1-based)
+    col_name_to_excel_col = {name: i + 1 for i, name in enumerate(alignment.columns)}
 
-    df_wide = df_wide.rename(
-        columns={
-            "group": "Group",
-            "mass": "m/z",
-            "isomer_position": "Isomer_position",
-            "aligned_rt_apex": "Aligned_rt_apex",
-            "peak_count": "peak count",
-        }
-    )
+    # Write data rows
+    for df_row_idx, (_, row) in enumerate(alignment.iterrows()):
+        excel_row = df_row_idx + 2          # +1 for header, +1 for 1-based
+        orig_df_idx = alignment.index[df_row_idx]   # original DataFrame index used in newly_filled
 
-    meta_cols = ["Group", "m/z", "Isomer_position", "Aligned_rt_apex", "peak count"]
-    height_cols2 = sorted([c for c in df_wide.columns if c.endswith("_height")])
-    area_cols2 = sorted([c for c in df_wide.columns if c.endswith("_area")])
-    df_wide = df_wide[meta_cols + height_cols2 + area_cols2]
-    df_wide.sort_values(["m/z", "Isomer_position"], inplace=True)
-    return df_wide
+        for col_name in alignment.columns:
+            value = row[col_name]
+            # Convert numpy booleans / scalars
+            if isinstance(value, (np.bool_,)):
+                value = bool(value)
+            elif isinstance(value, (np.integer,)):
+                value = int(value)
+            elif isinstance(value, (np.floating,)):
+                value = float(value) if not np.isnan(value) else None
 
+            excel_col = col_name_to_excel_col[col_name]
+            cell = ws1.cell(row=excel_row, column=excel_col, value=value)
+            cell.font = normal_font
 
-class Reclusterer:
-    def __init__(self, dirs: Dict[str, str | Path], rt_window_min: float = 0.095):
-        self.dirs = {k: Path(v) for k, v in dirs.items()}
-        for k in ("pixel", "clustering"):
-            if k not in self.dirs:
-                raise KeyError(f"dirs must include '{k}'")
-        self.rt_window_min = float(rt_window_min)
+            # Bold newly filled cells
+            if (orig_df_idx, col_name) in newly_filled:
+                cell.font = bold_font
 
-    def run(self, group: str) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-        """
-        Reads existing clustering outputs, applies fallback reclustering, and writes updated outputs.
-        Returns: (df_align_reclustered, df_summary_reclustered, df_unclustered_remaining)
-        """
-        cluster_dir = self.dirs["clustering"]
+    # Auto-size columns (capped at 40)
+    for col_cells in ws1.columns:
+        max_len = max(
+            (len(str(c.value)) if c.value is not None else 0) for c in col_cells
+        )
+        ws1.column_dimensions[get_column_letter(col_cells[0].column)].width = min(max_len + 2, 40)
 
-        # Load existing alignment (if missing, treat as empty)
-        align_path = cluster_dir / "peak_alignment.csv"
-        if align_path.exists():
-            df_align = pd.read_csv(align_path)
-        else:
-            df_align = pd.DataFrame()
+    # ── Sheet 2: still-unclustered peaks ─────────────────────────────────────
+    ws2 = wb.create_sheet(title="unclustered")
 
-        # Load existing unclustered list (required for this stage)
-        un_path = cluster_dir / f"unclustered_peaks_group_{group}.csv"
-        if not un_path.exists():
-            # Nothing to do
-            df_summary = _build_summary_like_checkpoint(df_align, group)
-            df_un = pd.DataFrame(columns=["peak_id"])
-            self._write(group, df_align, df_summary, df_un)
-            return df_align, df_summary, df_un
+    if not unclustered.empty:
+        for col_idx, col_name in enumerate(unclustered.columns, start=1):
+            cell = ws2.cell(row=1, column=col_idx, value=col_name)
+            cell.font = header_font
+            cell.alignment = Alignment(horizontal="center", wrap_text=True)
 
-        df_un = pd.read_csv(un_path)
-        if df_un.empty or "peak_id" not in df_un.columns:
-            df_summary = _build_summary_like_checkpoint(df_align, group)
-            df_un2 = pd.DataFrame(columns=["peak_id"])
-            self._write(group, df_align, df_summary, df_un2)
-            return df_align, df_summary, df_un2
+        for row_idx, (_, row) in enumerate(unclustered.iterrows(), start=2):
+            for col_idx, col_name in enumerate(unclustered.columns, start=1):
+                value = row[col_name]
+                if isinstance(value, (np.bool_,)):
+                    value = bool(value)
+                elif isinstance(value, (np.integer,)):
+                    value = int(value)
+                elif isinstance(value, (np.floating,)):
+                    value = float(value) if not np.isnan(value) else None
+                cell = ws2.cell(row=row_idx, column=col_idx, value=value)
+                cell.font = normal_font
 
-        # Parse + hydrate unclustered peaks from peaks_pix
-        keys: List[UnclusteredPeakKey] = []
-        for pid in df_un["peak_id"].astype(str).tolist():
-            k = _parse_peak_id(pid)
-            if k and k.group == group:
-                keys.append(k)
-
-        un_rows: List[Dict[str, Any]] = []
-        for k in keys:
-            r = _load_peak_from_pix(self.dirs, k)
-            if r is not None:
-                un_rows.append(r)
-
-        if not un_rows:
-            df_summary = _build_summary_like_checkpoint(df_align, group)
-            df_un2 = pd.DataFrame({"peak_id": df_un["peak_id"].astype(str).tolist()})
-            self._write(group, df_align, df_summary, df_un2)
-            return df_align, df_summary, df_un2
-
-        df_un_peaks = pd.DataFrame(un_rows)
-
-        # Ensure df_align has needed columns
-        # (If df_align is empty, we can only do pass #2 among unclustered peaks.)
-        if df_align.empty:
-            df_align = pd.DataFrame(
-                columns=[
-                    "group",
-                    "mass",
-                    "isomer_position",
-                    "file",
-                    "peak_id",
-                    "peak_num",
-                    "rt_start",
-                    "rt_apex",
-                    "rt_end",
-                    "aligned_rt_start",
-                    "aligned_rt_apex",
-                    "aligned_rt_end",
-                    "pixel_start",
-                    "pixel_end",
-                    "aligned_pixel_start",
-                    "aligned_pixel_end",
-                    "height",
-                    "area",
-                ]
+        for col_cells in ws2.columns:
+            max_len = max(
+                (len(str(c.value)) if c.value is not None else 0) for c in col_cells
             )
+            ws2.column_dimensions[get_column_letter(col_cells[0].column)].width = min(max_len + 2, 40)
+    else:
+        ws2.cell(row=1, column=1, value="No unclustered peaks remaining.")
 
-        # -----------------------------
-        # PASS 1: force recluster to existing alignments by (mass, |rt_apex - aligned_rt_apex| <= window)
-        # -----------------------------
-        df_align_g = df_align.loc[df_align.get("group", "") == group].copy()
-
-        forced_added: List[Dict[str, Any]] = []
-        forced_peak_ids: set[str] = set()
-
-        if not df_align_g.empty and "aligned_rt_apex" in df_align_g.columns:
-            # Build per (mass, isomer_position) representative aligned_* values
-            rep_cols = [
-                "group",
-                "mass",
-                "isomer_position",
-                "aligned_rt_start",
-                "aligned_rt_apex",
-                "aligned_rt_end",
-                "aligned_pixel_start",
-                "aligned_pixel_end",
-            ]
-            # Take the first row as representative per cluster
-            clusters = (
-                df_align_g.sort_values(["mass", "isomer_position", "aligned_rt_apex"])
-                .groupby(["mass", "isomer_position"], as_index=False)[rep_cols]
-                .first()
-            )
-
-            # For each unclustered peak, find best cluster within window
-            for _, u in df_un_peaks.iterrows():
-                mass = float(u["mass"])
-                rt = float(u["rt_apex"])
-                cand = clusters.loc[clusters["mass"].astype(float) == mass].copy()
-                if cand.empty:
-                    continue
-                cand["rt_diff"] = (cand["aligned_rt_apex"].astype(float) - rt).abs()
-                cand = cand.loc[cand["rt_diff"] <= self.rt_window_min].sort_values("rt_diff")
-                if cand.empty:
-                    continue
-
-                best = cand.iloc[0]
-                forced_peak_ids.add(str(u["peak_id"]))
-
-                forced_added.append(
-                    {
-                        "group": group,
-                        "mass": mass,
-                        "isomer_position": int(best["isomer_position"]),
-                        "file": str(u["file"]),
-                        "peak_id": str(u["peak_id"]),
-                        "peak_num": int(u["peak_num"]),
-                        "rt_start": float(u["rt_start"]),
-                        "rt_apex": rt,
-                        "rt_end": float(u["rt_end"]),
-                        "aligned_rt_start": float(best["aligned_rt_start"]),
-                        "aligned_rt_apex": float(best["aligned_rt_apex"]),
-                        "aligned_rt_end": float(best["aligned_rt_end"]),
-                        "pixel_start": int(u["pixel_start"]),
-                        "pixel_end": int(u["pixel_end"]),
-                        "aligned_pixel_start": float(best["aligned_pixel_start"]),
-                        "aligned_pixel_end": float(best["aligned_pixel_end"]),
-                        "height": float(u["height"]),
-                        "area": float(u["area"]),
-                    }
-                )
-
-        # Append forced rows (drop duplicates if already present)
-        if forced_added:
-            df_forced = pd.DataFrame(forced_added)
-            if not df_align.empty and "peak_id" in df_align.columns:
-                df_forced = df_forced.loc[~df_forced["peak_id"].isin(df_align["peak_id"].astype(str))].copy()
-            df_align = pd.concat([df_align, df_forced], ignore_index=True)
-
-        # Remaining unclustered peaks after forced pass
-        df_remaining = df_un_peaks.loc[~df_un_peaks["peak_id"].astype(str).isin(forced_peak_ids)].copy()
-
-        # -----------------------------
-        # PASS 2: create new alignments from remaining unclustered peaks
-        # Rule: same mass, and RT_apex within window of each other => new isomer_position
-        # -----------------------------
-        created_added: List[Dict[str, Any]] = []
-        created_peak_ids: set[str] = set()
-
-        if not df_remaining.empty:
-            # Determine current max isomer_position per mass (for this group)
-            df_align_g2 = df_align.loc[df_align.get("group", "") == group].copy()
-            if df_align_g2.empty:
-                max_iso_by_mass: Dict[float, int] = {}
-            else:
-                tmp = df_align_g2.groupby("mass")["isomer_position"].max()
-                max_iso_by_mass = {float(k): int(v) for k, v in tmp.items()}
-
-            for mass, df_m in df_remaining.groupby("mass", sort=True):
-                df_m = df_m.sort_values("rt_apex").copy()
-
-                # cluster by rt_apex window (simple single-linkage walk)
-                bucket: List[pd.Series] = []
-                last_rt: Optional[float] = None
-
-                def flush_bucket(bucket_rows: List[pd.Series]) -> None:
-                    nonlocal created_added, created_peak_ids, max_iso_by_mass
-                    if len(bucket_rows) < 2:
-                        return  # only form a new alignment if we have at least 2 peaks
-
-                    mass_f = float(mass)
-                    new_iso = max_iso_by_mass.get(mass_f, 0) + 1
-                    max_iso_by_mass[mass_f] = new_iso
-
-                    # aligned values = mean of bucket
-                    rt_start_mean = float(np.mean([float(r["rt_start"]) for r in bucket_rows]))
-                    rt_apex_mean = float(np.mean([float(r["rt_apex"]) for r in bucket_rows]))
-                    rt_end_mean = float(np.mean([float(r["rt_end"]) for r in bucket_rows]))
-                    px_s_mean = float(np.mean([float(r["pixel_start"]) for r in bucket_rows]))
-                    px_e_mean = float(np.mean([float(r["pixel_end"]) for r in bucket_rows]))
-
-                    for r in bucket_rows:
-                        created_peak_ids.add(str(r["peak_id"]))
-                        created_added.append(
-                            {
-                                "group": group,
-                                "mass": mass_f,
-                                "isomer_position": int(new_iso),
-                                "file": str(r["file"]),
-                                "peak_id": str(r["peak_id"]),
-                                "peak_num": int(r["peak_num"]),
-                                "rt_start": float(r["rt_start"]),
-                                "rt_apex": float(r["rt_apex"]),
-                                "rt_end": float(r["rt_end"]),
-                                "aligned_rt_start": rt_start_mean,
-                                "aligned_rt_apex": rt_apex_mean,
-                                "aligned_rt_end": rt_end_mean,
-                                "pixel_start": int(r["pixel_start"]),
-                                "pixel_end": int(r["pixel_end"]),
-                                "aligned_pixel_start": px_s_mean,
-                                "aligned_pixel_end": px_e_mean,
-                                "height": float(r["height"]),
-                                "area": float(r["area"]),
-                            }
-                        )
-
-                for _, row in df_m.iterrows():
-                    rt = float(row["rt_apex"])
-                    if last_rt is None:
-                        bucket = [row]
-                        last_rt = rt
-                        continue
-
-                    if abs(rt - last_rt) <= self.rt_window_min:
-                        bucket.append(row)
-                        last_rt = rt
-                    else:
-                        flush_bucket(bucket)
-                        bucket = [row]
-                        last_rt = rt
-
-                flush_bucket(bucket)
-
-        if created_added:
-            df_created = pd.DataFrame(created_added)
-            if not df_align.empty and "peak_id" in df_align.columns:
-                df_created = df_created.loc[~df_created["peak_id"].isin(df_align["peak_id"].astype(str))].copy()
-            df_align = pd.concat([df_align, df_created], ignore_index=True)
-
-        # -----------------------------
-        # Final: compute remaining unclustered peak_ids
-        # -----------------------------
-        newly_clustered = forced_peak_ids.union(created_peak_ids)
-
-        remaining_peak_ids = [
-            pid for pid in df_un["peak_id"].astype(str).tolist()
-            if pid not in newly_clustered
-        ]
-        df_un_out = pd.DataFrame({"peak_id": remaining_peak_ids})
-
-        # Sort df_align
-        if not df_align.empty:
-            sort_cols = [c for c in ["group", "mass", "isomer_position", "file", "rt_apex"] if c in df_align.columns]
-            if sort_cols:
-                df_align.sort_values(sort_cols, inplace=True)
-
-        # Build summary (group-specific)
-        df_summary = _build_summary_like_checkpoint(df_align, group)
-
-        # Write outputs
-        self._write(group, df_align, df_summary, df_un_out)
-        return df_align, df_summary, df_un_out
-
-    def _write(self, group: str, df_align: pd.DataFrame, df_summary: pd.DataFrame, df_un: pd.DataFrame) -> None:
-        outdir = self.dirs["clustering"]
-        outdir.mkdir(parents=True, exist_ok=True)
-
-        df_align.to_csv(outdir / "peak_alignment_reclustered.csv", index=False)
-        df_summary.to_csv(outdir / f"Feature_list_{group}.csv", index=False)
-        df_un.to_csv(outdir / f"unclustered_peaks_reclustered_group_{group}.csv", index=False)
+    wb.save(output_path)
 
 
-def process_file_recluster_peaks(
-    dirs: Dict[str, str | Path],
-    group_name: str,
-    rt_window_min: float = 0.095,
-) -> str:
+# ── Pipeline interface ────────────────────────────────────────────────────────
+
+def process_file_recluster(dirs: dict, group_name: str) -> str:
     """
-    Entrypoint similar in style to your other pipeline stage functions.
+    Thin wrapper around recluster_group() that accepts the standard pipeline
+    `dirs` dict (as returned by Config.setup_directories()) and returns a
+    status message string.
 
-    Reads:
-      - <clustering>/peak_alignment.csv
-      - <clustering>/unclustered_peaks_group_<GroupX>.csv
-
-    Writes:
-      - <clustering>/peak_alignment_reclustered.csv
-      - <clustering>/alignment_summary_reclustered_group_<GroupX>.csv
-      - <clustering>/unclustered_peaks_reclustered_group_<GroupX>.csv
+    Reads 'clustering' and 'pixel' paths directly from `dirs` so the correct
+    absolute paths from Config.py are always used.
     """
-    recl = Reclusterer(dirs=dirs, rt_window_min=rt_window_min)
-    df_align, df_summary, df_un = recl.run(group=group_name)
 
-    return (
-        f"Recluster fallback complete for {group_name}. "
-        f"Aligned rows now: {0 if df_align.empty else len(df_align)}. "
-        f"Summary rows: {0 if df_summary.empty else len(df_summary)}. "
-        f"Remaining unclustered patches: {len(df_un)}."
-    )
+    class _RuntimeConfig(Config):
+        @classmethod
+        def clustering_dir(cls) -> Path:
+            return Path(dirs["clustering"])
+
+        @classmethod
+        def pixel_dir(cls) -> Path:
+            return Path(dirs["pixel"])
+
+    recluster_group(group=group_name, config=_RuntimeConfig)
+    output_path = Path(dirs["clustering"]) / f"Group_Summary_{group_name}.xlsx"
+    return f"Reclustering complete for {group_name}. Output: {output_path}"
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Recluster unclustered peaks into alignment summary.")
+    parser.add_argument("group", help="Group identifier, e.g. Group1")
+    parser.add_argument("--base-dir",        default=".",        help="Project base directory")
+    parser.add_argument("--output-root",     default="Output",   help="Output root folder name")
+    parser.add_argument("--analysis-folder", default="Analysis", help="Analysis folder name")
+    args = parser.parse_args()
+
+    # Patch Config with CLI arguments
+    Config.BASE_DIR        = Path(args.base_dir)
+    Config.OUTPUT_ROOT     = args.output_root
+    Config.ANALYSIS_FOLDER = args.analysis_folder
+    Config.CURRENT_GROUP   = args.group
+
+    recluster_group(group=args.group, config=Config)

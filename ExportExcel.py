@@ -1,7 +1,7 @@
 import re
 from pathlib import Path
-from typing import Optional
-
+import openpyxl
+from openpyxl.styles import Font
 import pandas as pd
 
 
@@ -13,6 +13,36 @@ def _group_sort_key(name: str):
     """
     m = re.search(r"(\d+)", str(name))
     return int(m.group(1)) if m else str(name)
+
+
+def _copy_xlsx_sheet_to_worksheet(
+    src_xlsx: Path,
+    dest_ws,
+    start_row: int = 0,
+) -> int:
+    """
+    Copies all rows (with bold formatting) from the first sheet of src_xlsx
+    into dest_ws starting at start_row (0-indexed).
+
+    Returns the number of rows written (excluding the start offset).
+    """
+    src_wb = openpyxl.load_workbook(src_xlsx)
+    src_ws = src_wb.active
+
+    bold_font = Font(bold=True)
+    rows_written = 0
+
+    for src_row in src_ws.iter_rows():
+        dest_row_idx = start_row + rows_written + 1  # openpyxl is 1-indexed
+        for src_cell in src_row:
+            dest_cell = dest_ws.cell(row=dest_row_idx, column=src_cell.column, value=src_cell.value)
+            # Preserve bold from source cell
+            if src_cell.font and src_cell.font.bold:
+                dest_cell.font = Font(bold=True)
+        rows_written += 1
+
+    src_wb.close()
+    return rows_written
 
 
 def export_all_group_summaries_to_excel(Config) -> Path:
@@ -34,120 +64,96 @@ def export_all_group_summaries_to_excel(Config) -> Path:
 
     print(f"\n[Excel Export] Saving all group summaries to {excel_path}\n")
 
-    with pd.ExcelWriter(excel_path, engine="xlsxwriter") as writer:
-        workbook = writer.book
-        forced_fmt = workbook.add_format({"bold": True, "font_color": "red"})
+    wb = openpyxl.Workbook()
+    # Remove the default empty sheet
+    wb.remove(wb.active)
 
-        # ---- ORDERED SHEETS HERE ----
-        for group_name in sorted(Config.MASS_GROUPS.keys(), key=_group_sort_key):
-            cluster_dir = output_root / str(group_name) / "Clustering"
+    for group_name in sorted(Config.MASS_GROUPS.keys(), key=_group_sort_key):
+        cluster_dir = output_root / str(group_name) / "Clustering"
 
-            summary_csv = cluster_dir / f"alignment_summary_group_{group_name}.csv"
-            unresolved_csv = cluster_dir / f"unresolved_peaks_group_{group_name}.csv"
-            unclustered_csv = cluster_dir / f"unclustered_peaks_reclustered_group_{group_name}.csv"
+        feature_xlsx = cluster_dir / f"Feature_list_{group_name}.xlsx"
+        summary_csv  = cluster_dir / f"alignment_summary_group_{group_name}.csv"
+        unresolved_csv  = cluster_dir / f"unresolved_peaks_group_{group_name}.csv"
+        unclustered_csv = cluster_dir / f"unclustered_peaks_reclustered_group_{group_name}.csv"
 
-            if not summary_csv.exists():
-                print(f"[!] Skipping {group_name}: summary file not found.")
-                continue
+        # Need at least one of the two primary sources
+        if not feature_xlsx.exists() and not summary_csv.exists():
+            print(f"[!] Skipping {group_name}: neither Feature_list xlsx nor summary CSV found.")
+            continue
 
-            # Excel sheet name max length = 31 chars
-            sheet_name = str(group_name)[:31]
-            current_row = 0
+        # Excel sheet name max length = 31 chars
+        sheet_name = str(group_name)[:31]
+        ws = wb.create_sheet(title=sheet_name)
+        current_row = 0  # 0-indexed row offset for next block
 
-            # Prefer Feature_list for export (fallback to alignment summary)
-            feature_csv = cluster_dir / f"Feature_list_{group_name}.csv"
-            chosen_csv = feature_csv if feature_csv.exists() else summary_csv
+        # ------------------------------------------------------------------
+        # PRIMARY BLOCK: Feature_list xlsx (preferred) or fallback to CSV
+        # ------------------------------------------------------------------
+        if feature_xlsx.exists():
+            rows_written = _copy_xlsx_sheet_to_worksheet(feature_xlsx, ws, start_row=current_row)
+            print(f"[✔] Sheet '{sheet_name}' → Feature_list ({rows_written} rows) [{feature_xlsx.name}]")
+            current_row += rows_written + 2  # +2 for a blank gap row
+        else:
+            # Fallback: plain CSV written without special formatting
+            df_summary = pd.read_csv(summary_csv)
+            bold_font = Font(bold=True)
+            # Header
+            for col_idx, col_name in enumerate(df_summary.columns, start=1):
+                cell = ws.cell(row=current_row + 1, column=col_idx, value=col_name)
+                cell.font = bold_font
+            # Data rows
+            for row_offset, (_, row) in enumerate(df_summary.iterrows(), start=1):
+                for col_idx, value in enumerate(row, start=1):
+                    ws.cell(row=current_row + 1 + row_offset, column=col_idx, value=value)
+            rows_written = len(df_summary) + 1  # header + data
+            print(f"[✔] Sheet '{sheet_name}' → Summary CSV ({len(df_summary)} rows) [{summary_csv.name}]")
+            current_row += rows_written + 2
 
-            df_summary = pd.read_csv(chosen_csv)
-            df_summary.to_excel(writer, sheet_name=sheet_name, startrow=current_row, index=False)
-            print(f"[✔] Sheet '{sheet_name}' → Summary ({len(df_summary)} rows) [{chosen_csv.name}]")
-
-            worksheet = writer.sheets[sheet_name]
-
-            # --- Forced formatting ---
-            # Supports either naming scheme:
-            #   - New: Forced_files / Forced_any / Forced_n (from our Recluster.py)
-            #   - Old: forced_files (your snippet)
-            header = list(df_summary.columns)
-
-            forced_files_col = None
-            for candidate in ("Forced_files", "forced_files"):
-                if candidate in header:
-                    forced_files_col = candidate
-                    break
-
-            # Optional: highlight a peak_files column if present
-            peak_files_col = "peak_files" if "peak_files" in header else None
-
-            if forced_files_col is not None:
-                col_forced_files = header.index(forced_files_col)
-
-                # Map sample name -> column index for heights/areas
-                sample_height_cols = {c[:-7]: header.index(c) for c in header if c.endswith("_height")}
-                sample_area_cols = {c[:-5]: header.index(c) for c in header if c.endswith("_area")}
-
-                def normalize_forced_token(tok: str) -> str:
-                    # Tokens might look like:
-                    #   {file_base}_mass247.154_peak4  (older style)
-                    # Or just:
-                    #   {file_base}                    (newer style)
-                    m = re.match(r"(.+)_mass\d+(?:\.\d+)?_peak\d+$", tok, flags=re.IGNORECASE)
-                    return m.group(1) if m else tok
-
-                for i, row in df_summary.iterrows():
-                    forced_files = row.get(forced_files_col, "")
-                    if not isinstance(forced_files, str) or not forced_files.strip():
-                        continue
-
-                    # Accept separators "," or ";" (Recluster writes ";")
-                    raw_tokens = re.split(r"[;,]", forced_files)
-                    forced_samples = [normalize_forced_token(x.strip()) for x in raw_tokens if x.strip()]
-
-                    excel_row = current_row + 1 + i  # +1 for header row
-
-                    # Highlight the forced_files cell itself
-                    worksheet.write(excel_row, col_forced_files, row.get(forced_files_col, ""), forced_fmt)
-
-                    # Optionally highlight peak_files
-                    if peak_files_col is not None:
-                        cidx = header.index(peak_files_col)
-                        worksheet.write(excel_row, cidx, row.get(peak_files_col, ""), forced_fmt)
-
-                    # Highlight forced sample height/area cells
-                    for s in forced_samples:
-                        if s in sample_height_cols:
-                            cidx = sample_height_cols[s]
-                            worksheet.write(excel_row, cidx, row.get(header[cidx], ""), forced_fmt)
-                        if s in sample_area_cols:
-                            cidx = sample_area_cols[s]
-                            worksheet.write(excel_row, cidx, row.get(header[cidx], ""), forced_fmt)
-
-            current_row += len(df_summary) + 2
-
-            # Unresolved peaks
-            if unresolved_csv.exists():
-                df_unresolved = pd.read_csv(unresolved_csv)
-                if not df_unresolved.empty:
-                    df_unresolved.to_excel(writer, sheet_name=sheet_name, startrow=current_row, index=False)
-                    print(f"    ↳ Unresolved peaks added ({len(df_unresolved)} rows)")
-                    current_row += len(df_unresolved) + 2
-                else:
-                    print(f"    ↳ Skipped unresolved peaks: file is empty")
+        # ------------------------------------------------------------------
+        # UNRESOLVED PEAKS
+        # ------------------------------------------------------------------
+        if unresolved_csv.exists():
+            df_unresolved = pd.read_csv(unresolved_csv)
+            if not df_unresolved.empty:
+                # Header
+                for col_idx, col_name in enumerate(df_unresolved.columns, start=1):
+                    ws.cell(row=current_row + 1, column=col_idx, value=col_name)
+                # Data
+                for row_offset, (_, row) in enumerate(df_unresolved.iterrows(), start=1):
+                    for col_idx, value in enumerate(row, start=1):
+                        ws.cell(row=current_row + 1 + row_offset, column=col_idx, value=value)
+                rows_written = len(df_unresolved) + 1
+                print(f"    ↳ Unresolved peaks added ({len(df_unresolved)} rows)")
+                current_row += rows_written + 2
             else:
-                print(f"    ↳ No unresolved peaks file found")
+                print(f"    ↳ Skipped unresolved peaks: file is empty")
+        else:
+            print(f"    ↳ No unresolved peaks file found")
 
-            # Unclustered peaks
-            if unclustered_csv.exists():
-                df_unclustered = pd.read_csv(unclustered_csv)
-                if not df_unclustered.empty:
-                    df_unclustered.to_excel(writer, sheet_name=sheet_name, startrow=current_row, index=False)
-                    print(f"    ↳ Unclustered peaks added ({len(df_unclustered)} rows)")
-                    current_row += len(df_unclustered) + 2
-                else:
-                    print(f"    ↳ Skipped unclustered peaks: file is empty")
+        # ------------------------------------------------------------------
+        # UNCLUSTERED PEAKS
+        # Note: if Feature_list xlsx already contains the unclustered section
+        # at the bottom (as written by Recluster.py), we skip this block to
+        # avoid duplicating it. Only append from CSV if no Feature_list xlsx.
+        # ------------------------------------------------------------------
+        if not feature_xlsx.exists() and unclustered_csv.exists():
+            df_unclustered = pd.read_csv(unclustered_csv)
+            if not df_unclustered.empty:
+                for col_idx, col_name in enumerate(df_unclustered.columns, start=1):
+                    ws.cell(row=current_row + 1, column=col_idx, value=col_name)
+                for row_offset, (_, row) in enumerate(df_unclustered.iterrows(), start=1):
+                    for col_idx, value in enumerate(row, start=1):
+                        ws.cell(row=current_row + 1 + row_offset, column=col_idx, value=value)
+                print(f"    ↳ Unclustered peaks added ({len(df_unclustered)} rows)")
+                current_row += len(df_unclustered) + 3
             else:
-                print(f"    ↳ No unclustered peaks file found")
+                print(f"    ↳ Skipped unclustered peaks: file is empty")
+        elif feature_xlsx.exists():
+            print(f"    ↳ Unclustered peaks already included in Feature_list xlsx")
+        else:
+            print(f"    ↳ No unclustered peaks file found")
 
+    wb.save(excel_path)
     print(f"\n[✔] Excel export complete → {excel_path}")
     return excel_path
 
