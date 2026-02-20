@@ -267,6 +267,18 @@ def collect_for_base(
     if m.empty:
         return 0, 0, pd.DataFrame()
 
+    skip_mz_keys: set = set()
+    for mz_key_val, m_mz in m.groupby("_mz_key", dropna=True):
+        n_segments = len(m_mz)
+        p_mz = p.loc[p["_mz_key"].eq(mz_key_val)]
+        n_peaks = len(p_mz)
+        if n_segments == n_peaks:
+            skip_mz_keys.add(mz_key_val)
+
+    if skip_mz_keys:
+        p = p.loc[~p["_mz_key"].isin(skip_mz_keys)].copy()
+        m = m.loc[~m["_mz_key"].isin(skip_mz_keys)].copy()
+
     # Choose segments based on (A) your original coeluting-lead rule and (B) the new secondary rule
     lead = p.loc[p["_is_coelu"] & p["_is_lead"]].copy()
 

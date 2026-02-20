@@ -88,45 +88,53 @@ def recluster_group(group: str, config: type = Config) -> None:
     # Track which unclustered peak_ids were successfully matched
     matched_peak_ids: set = set()
 
+    # Skip matching entirely if unclustered is empty or missing required columns
+    has_unclustered = (
+        not unclustered.empty
+        and "m/z" in unclustered.columns
+        and "RT_apex" in unclustered.columns
+    )
+
     # ── Iterate over every blank height cell in the alignment summary ─────────
-    for row_idx, row in alignment.iterrows():
-        aligned_rt  = row["Aligned_rt_apex"]
-        mz          = row["m/z"]
+    if has_unclustered:
+        for row_idx, row in alignment.iterrows():
+            aligned_rt  = row["Aligned_rt_apex"]
+            mz          = row["m/z"]
 
-        for sample in all_samples:
-            h_col = _height_col(sample)
-            a_col = _area_col(sample)
+            for sample in all_samples:
+                h_col = _height_col(sample)
+                a_col = _area_col(sample)
 
-            # Only attempt to fill if the height cell is blank / NaN / 0
-            height_val = row.get(h_col, np.nan)
-            if pd.notna(height_val) and height_val != 0:
-                continue
+                # Only attempt to fill if the height cell is blank / NaN / 0
+                height_val = row.get(h_col, np.nan)
+                if pd.notna(height_val) and height_val != 0:
+                    continue
 
-            # Find candidate unclustered peaks for this sample + m/z
-            candidates = unclustered[
-                (unclustered["m/z"] == mz) &
-                (unclustered["peak_id"].apply(_sample_name_from_peak_id) == sample) &
-                (abs(unclustered["RT_apex"] - aligned_rt) <= RT_TOLERANCE)
-            ].copy()
+                # Find candidate unclustered peaks for this sample + m/z
+                candidates = unclustered[
+                    (unclustered["m/z"] == mz) &
+                    (unclustered["peak_id"].apply(_sample_name_from_peak_id) == sample) &
+                    (abs(unclustered["RT_apex"] - aligned_rt) <= RT_TOLERANCE)
+                ].copy()
 
-            if candidates.empty:
-                continue
+                if candidates.empty:
+                    continue
 
-            # Pick the candidate with the closest RT_apex
-            candidates["_rt_diff"] = abs(candidates["RT_apex"] - aligned_rt)
-            best = candidates.loc[candidates["_rt_diff"].idxmin()]
+                # Pick the candidate with the closest RT_apex
+                candidates["_rt_diff"] = abs(candidates["RT_apex"] - aligned_rt)
+                best = candidates.loc[candidates["_rt_diff"].idxmin()]
 
-            # Fill height
-            alignment.at[row_idx, h_col] = best["height"]
-            newly_filled.add((row_idx, h_col))
+                # Fill height
+                alignment.at[row_idx, h_col] = best["height"]
+                newly_filled.add((row_idx, h_col))
 
-            # Fill area if column exists
-            if a_col in alignment.columns:
-                alignment.at[row_idx, a_col] = best["area"]
-                newly_filled.add((row_idx, a_col))
+                # Fill area if column exists
+                if a_col in alignment.columns:
+                    alignment.at[row_idx, a_col] = best["area"]
+                    newly_filled.add((row_idx, a_col))
 
-            alignment.at[row_idx, "Recluster"] = True
-            matched_peak_ids.add(best["peak_id"])
+                alignment.at[row_idx, "Recluster"] = True
+                matched_peak_ids.add(best["peak_id"])
 
     # ── Recalculate peak count and Aligned_rt_apex ────────────────────────────
     for row_idx, row in alignment.iterrows():
@@ -308,6 +316,15 @@ def process_file_recluster(dirs: dict, group_name: str) -> str:
     recluster_group(group=group_name, config=_RuntimeConfig)
     output_path = Path(dirs["clustering"]) / f"Group_Summary_{group_name}.xlsx"
     return f"Reclustering complete for {group_name}. Output: {output_path}"
+
+
+def run_group_checkpoint9(self, dirs: dict, group_name: str) -> None:
+    start_time = time.time()
+    msg = process_file_recluster(dirs, group_name)
+    print(msg)
+    elapsed = time.time() - start_time
+    print(f"Checkpoint 9 (Post-clustering RT+mass recluster) completed in {elapsed:.2f} seconds!")
+
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 

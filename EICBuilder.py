@@ -473,6 +473,33 @@ def analyze_ms_file_plotly(file_path, output_image_path, file_colors):
                 if len(y_peak) >= 12:
                     apex_idx_local = np.argmax(y_peak)
                     peak_height = y_peak[apex_idx_local]
+
+                    # --- FRONTING DETECTION (mirrored tailing logic) ---
+                    pre_y = y_peak[:apex_idx_local + 1][::-1]  # reverse so we walk away from apex
+                    slope_front = np.abs(np.diff(pre_y))
+
+                    slope_thresh_front = 0.006 * peak_height
+                    height_thresh_front = 0.025 * peak_height
+                    stable_len = 2
+
+                    for j in range(len(slope_front) - stable_len):
+                        window = slope_front[j:j + stable_len]
+                        if np.all(window < slope_thresh_front):
+                            crop_candidate_idx = j + 1
+                            if pre_y[crop_candidate_idx] < height_thresh_front:
+                                buffer = int(0.01 * len(pre_y))
+                                safe_idx = max(1, crop_candidate_idx - buffer)
+                                # Convert back from reversed index to forward index
+                                crop_front_idx = apex_idx_local - safe_idx
+                                if crop_front_idx > 0:
+                                    x_peak = x_peak[crop_front_idx:]
+                                    y_peak = y_peak[crop_front_idx:]
+                                    left_idx = left_idx + crop_front_idx
+                                break
+
+                    # --- EXISTING TAILING CROP (unchanged) ---
+                    apex_idx_local = np.argmax(y_peak)  # recalculate after possible front crop
+                    peak_height = y_peak[apex_idx_local]
                     post_y = y_peak[apex_idx_local + 1:]
                     slope = np.abs(np.diff(post_y))
 
