@@ -84,9 +84,8 @@ class PeakClusterer:
         "pixel_start", "pixel_end",
         "height", "area",
     ]
-    # Add near REQUIRED_COLUMNS
+
     COLUMN_ALIASES = {
-        # canonical : aliases that may appear in your files
         "pixel_start": ["Pixel_start", "pixelStart", "PixelStart", "pixel_start", "pixel start", "Pixel start"],
         "pixel_end": ["Pixel_end", "pixelEnd", "PixelEnd", "pixel_end", "pixel end", "Pixel end"],
         "peak_num": ["peak_num", "Peak_num", "PeakNum", "peak number", "PeakNumber"],
@@ -98,37 +97,23 @@ class PeakClusterer:
     }
 
     def _normalize_columns(self, df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Rename known alias columns to canonical names, without touching unrelated columns.
-        If both canonical and alias exist, canonical wins.
-        """
         cols = list(df.columns)
         rename_map: Dict[str, str] = {}
-
-        # Build reverse lookup alias -> canonical
         alias_to_canon: Dict[str, str] = {}
         for canon, aliases in self.COLUMN_ALIASES.items():
             for a in aliases:
                 alias_to_canon[a] = canon
-
-        # Choose renames
         existing = set(cols)
         for c in cols:
             if c in alias_to_canon:
                 canon = alias_to_canon[c]
                 if canon not in existing:
                     rename_map[c] = canon
-
         if rename_map:
             df = df.rename(columns=rename_map)
-
         return df
 
     def _assert_required_columns(self, df: pd.DataFrame, path: Path) -> pd.DataFrame:
-        """
-        Normalizes columns then asserts required set exists.
-        Returns the normalized df for convenience.
-        """
         df = self._normalize_columns(df)
         missing = [c for c in self.REQUIRED_COLUMNS if c not in df.columns]
         if missing:
@@ -147,18 +132,9 @@ class PeakClusterer:
         self.dirs["clustering"].mkdir(parents=True, exist_ok=True)
 
     def run(self, group: str) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-        """
-        Returns:
-          df_align (long), df_summary (wide), df_unclustered
-        Also writes 3 CSVs into dirs['clustering'].
-        """
         patch_dir = self.dirs["patch"]
-        cluster_dir = self.dirs["clustering"]
 
-        # 1) Load peaks for group
         all_peaks = self._load_all_peaks_for_group(patch_dir, group)
-
-        # Collect all patch stems for group (even if pixel CSV missing)
         all_patch_stems = {p.stem for p in patch_dir.glob(f"*_{group}.png")}
 
         if not all_peaks:
@@ -168,17 +144,14 @@ class PeakClusterer:
             self._write_outputs(group, df_align, df_summary, df_unclustered)
             return df_align, df_summary, df_unclustered
 
-        # mass -> file -> peaks
         mass_peaks: Dict[float, Dict[str, List[PeakInfo]]] = {}
         for p in all_peaks:
             mass_peaks.setdefault(p.mass, {}).setdefault(p.file_base, []).append(p)
 
-        # 2) merge unresolved within each (mass,file)
         for mass, file_map in mass_peaks.items():
             for fb, peaks in list(file_map.items()):
                 file_map[fb] = self._merge_unresolved(peaks)
 
-        # 3) isomer positions + validate shapes
         accepted_rows: List[Dict[str, Any]] = []
         accepted_peak_ids: Set[str] = set()
 
@@ -187,14 +160,28 @@ class PeakClusterer:
                 file_map[fb] = sorted(file_map[fb], key=lambda x: x.rt_apex)
 
             max_isomers = max((len(v) for v in file_map.values()), default=0)
-            for iso_idx in range(max_isomers):
-                candidates = [peaks[iso_idx] for peaks in file_map.values() if iso_idx < len(peaks)]
+
+            full_files = {fb: peaks for fb, peaks in file_map.items() if len(peaks) == max_isomers}
+            partial_files = {fb: peaks for fb, peaks in file_map.items() if len(peaks) < max_isomers}
+
+            iso_groups: List[List[PeakInfo]] = [[] for _ in range(max_isomers)]
+            for fb, peaks in full_files.items():
+                for iso_idx, pk in enumerate(peaks):
+                    iso_groups[iso_idx].append(pk)
+
+            for fb, peaks in partial_files.items():
+                for pk in peaks:
+                    best_idx = self._find_best_isomer_group(pk, iso_groups)
+                    if best_idx is not None:
+                        iso_groups[best_idx].append(pk)
+
+            for iso_idx, candidates in enumerate(iso_groups):
+                if not candidates:
+                    continue
                 validated = self._validate_isomer_set(candidates)
                 if not validated:
                     continue
-
                 aligned = self._compute_aligned_values(validated)
-
                 for pk in validated:
                     accepted_rows.append(self._make_alignment_row(pk, mass, iso_idx + 1, aligned))
                     accepted_peak_ids.add(pk.peak_id)
@@ -203,13 +190,8 @@ class PeakClusterer:
         if not df_align.empty:
             df_align.sort_values(["group", "mass", "isomer_position", "file", "rt_apex"], inplace=True)
 
-        # 4) unclustered
         df_unclustered = pd.DataFrame({"peak_id": sorted(all_patch_stems - accepted_peak_ids)})
-
-        # 5) summary
         df_summary = self._build_summary(df_align, group)
-
-        # 6) write
         self._write_outputs(group, df_align, df_summary, df_unclustered)
         return df_align, df_summary, df_unclustered
 
@@ -341,6 +323,41 @@ class PeakClusterer:
 
         return out
 
+    def _find_best_isomer_group(self, pk: PeakInfo, iso_groups: List[List[PeakInfo]]) -> Optional[int]:
+        """
+        Assign a peak from a partial file to the best isomer group purely by shape similarity.
+        Returns None if no group scores above similarity_threshold, or if shape profile is missing.
+        """
+        if pk.shape_profile is None:
+            return None
+
+        best_idx = None
+        best_score = -np.inf
+
+        for idx, group in enumerate(iso_groups):
+            if not group:
+                continue
+
+            shape_scores = []
+            for g in group:
+                if g.shape_profile is not None:
+                    c = self._safe_corr(pk.shape_profile, g.shape_profile)
+                    if not np.isnan(c):
+                        shape_scores.append(c)
+
+            if not shape_scores:
+                continue
+
+            score = float(np.mean(shape_scores))
+            if score > best_score:
+                best_score = score
+                best_idx = idx
+
+        if best_score < self.cfg.similarity_threshold:
+            return None
+
+        return best_idx
+
     def _validate_isomer_set(self, peaks: List[PeakInfo]) -> List[PeakInfo]:
         if len(peaks) <= 1:
             return peaks
@@ -434,30 +451,17 @@ class PeakClusterer:
                 "aligned_rt_apex": float(r["aligned_rt_apex"]),
             }
 
-            if bool(r.get("merged", False)) and isinstance(r.get("component_peaks_json", ""), str) and r[
-                "component_peaks_json"]:
+            if bool(r.get("merged", False)) and isinstance(r.get("component_peaks_json", ""), str) and r["component_peaks_json"]:
                 comps = json.loads(r["component_peaks_json"])
                 comps = sorted(comps, key=lambda c: float(c["rt_apex"]))
                 for i, c in enumerate(comps, start=1):
-                    expanded.append({
-                        **base,
-                        "component_number": i,
-                        "height": float(c["height"]),
-                        "area": float(c["area"]),
-                    })
+                    expanded.append({**base, "component_number": i, "height": float(c["height"]), "area": float(c["area"])})
             else:
-                expanded.append({
-                    **base,
-                    "component_number": 1,
-                    "height": float(r["height"]),
-                    "area": float(r["area"]),
-                })
+                expanded.append({**base, "component_number": 1, "height": float(r["height"]), "area": float(r["area"])})
 
         df_exp = pd.DataFrame(expanded)
 
-        # Pivot with component_number included (temporary)
         idx = ["group", "mass", "isomer_position", "aligned_rt_apex", "component_number"]
-
         h = df_exp.pivot_table(index=idx, columns="file", values="height", aggfunc="first")
         a = df_exp.pivot_table(index=idx, columns="file", values="area", aggfunc="first")
         h.columns = [f"{c}_height" for c in h.columns]
@@ -468,34 +472,77 @@ class PeakClusterer:
 
         height_cols = [c for c in df_wide.columns if c.endswith("_height")]
         area_cols = [c for c in df_wide.columns if c.endswith("_area")]
-
         group_cols = ["group", "mass", "isomer_position", "aligned_rt_apex"]
 
         agg_spec = {c: "max" for c in height_cols}
         agg_spec.update({c: "sum" for c in area_cols})
-
         df_wide = df_wide.groupby(group_cols, as_index=False).agg(agg_spec)
 
-        # peak_count = number of files contributing a height value
         df_wide["peak_count"] = df_wide[height_cols].notna().sum(axis=1).astype(int)
-
         df_wide = df_wide.rename(columns={
-            "group": "Group",
-            "mass": "m/z",
-            "isomer_position": "Isomer_position",
-            "aligned_rt_apex": "Aligned_rt_apex",
-            "peak_count": "peak count",
+            "group": "Group", "mass": "m/z", "isomer_position": "Isomer_position",
+            "aligned_rt_apex": "Aligned_rt_apex", "peak_count": "peak count",
         })
 
-        # Desired column order
         meta_cols = ["Group", "m/z", "Isomer_position", "Aligned_rt_apex", "peak count"]
         height_cols2 = sorted([c for c in df_wide.columns if c.endswith("_height")])
         area_cols2 = sorted([c for c in df_wide.columns if c.endswith("_area")])
-
         df_wide = df_wide[meta_cols + height_cols2 + area_cols2]
         df_wide.sort_values(["m/z", "Isomer_position"], inplace=True)
-
         return df_wide
+
+    def _build_cluster_patch(self, df_align: pd.DataFrame) -> pd.DataFrame:
+        """
+        Builds a transposed manifest where each cluster is a column (Cluster 1, Cluster 2, ...),
+        and rows are: m/z, Isomer_position, Aligned_rt_apex, peak count, then one row per PNG.
+
+        Layout:
+                                Cluster 1                               Cluster 2
+        m/z                     86.0964                                 86.0964
+        Isomer_position         1                                       2
+        Aligned_rt_apex         2.192767442                             2.503651163
+        peak count              43                                      43
+                                C007_0002_mass86.0964_Peak3_Group3.png  C007_0002_mass86.0964_Peak4_Group3.png
+                                C009_0002_mass86.0964_Peak3_Group3.png  C009_0002_mass86.0964_Peak4_Group3.png
+        """
+        if df_align.empty:
+            return pd.DataFrame()
+
+        group_cols = ["group", "mass", "isomer_position", "aligned_rt_apex"]
+
+        clusters: List[Dict] = []
+        for key, grp in df_align.groupby(group_cols, sort=True):
+            group_val, mass_val, iso_pos, aligned_rt = key
+            patch_names = sorted([Path(p).name for p in grp["patch_path"].tolist()])
+            clusters.append({
+                "m/z": mass_val,
+                "Isomer_position": int(iso_pos),
+                "Aligned_rt_apex": aligned_rt,
+                "peak count": len(patch_names),
+                "patches": patch_names,
+            })
+
+        col_names = [f"Cluster {i + 1}" for i in range(len(clusters))]
+        max_patches = max((len(c["patches"]) for c in clusters), default=0)
+
+        # Row labels: 4 metadata rows + one blank-label row per PNG
+        meta_labels = ["m/z", "Isomer_position", "Aligned_rt_apex", "peak count"]
+        index_col = meta_labels + [""] * max_patches
+
+        data: Dict[str, List] = {"": index_col}
+        for col, cluster in zip(col_names, clusters):
+            col_values: List[Any] = [
+                cluster["m/z"],
+                cluster["Isomer_position"],
+                cluster["Aligned_rt_apex"],
+                cluster["peak count"],
+            ]
+            # Pad patch list to max_patches so all columns are the same length
+            patches = cluster["patches"] + [""] * (max_patches - len(cluster["patches"]))
+            col_values.extend(patches)
+            data[col] = col_values
+
+        return pd.DataFrame(data)
 
     def _read_grayscale(self, png_path: Path) -> np.ndarray:
         with Image.open(png_path) as im:
@@ -535,8 +582,6 @@ class PeakClusterer:
 
             mass = float(m.group("mass"))
             peak_num = int(m.group("peak_num"))
-
-            # file_base is everything before _mass
             file_base = peak_id[: peak_id.find("_mass")]
 
             pixel_csv = pixel_dir / f"{file_base}_peaks_pix_{group}.csv"
@@ -575,17 +620,19 @@ class PeakClusterer:
         df_unclustered = self._enrich_unclustered(df_unclustered, group)
         df_unclustered.to_csv(outdir / f"unclustered_peaks_group_{group}.csv", index=False)
         df_summary.to_csv(outdir / f"alignment_summary_group_{group}.csv", index=False)
+        df_patch = self._build_cluster_patch(df_align)
+        df_patch.to_csv(outdir / f"cluster_patch_{group}.csv", index=False)
+
 
 def process_file_cluster_peaks(dirs: Dict[str, str | Path], group_name: str, config: Optional[ClusterConfig] = None) -> str:
     """
     Pipeline stage entrypoint.
-    Matches your existing style:
-        msg = process_file_coelution_sliced(dirs, group_name)
 
     Writes:
       - <clustering>/peak_alignment.csv
       - <clustering>/alignment_summary_group_<GroupX>.csv
       - <clustering>/unclustered_peaks_group_<GroupX>.csv
+      - <clustering>/cluster_patch_<GroupX>.csv
     """
     t0 = time.time()
     clusterer = PeakClusterer(dirs=dirs, config=config)
