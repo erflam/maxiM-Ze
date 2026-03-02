@@ -2,165 +2,165 @@ import re
 from pathlib import Path
 import openpyxl
 from openpyxl.styles import Font
-import pandas as pd
+from openpyxl.utils import get_column_letter
 
 
 def _group_sort_key(name: str):
-    """
-    Sort Group names numerically when possible:
-      Group1, Group2, ..., Group10
-    Falls back to the full string if no number is found.
-    """
     m = re.search(r"(\d+)", str(name))
     return int(m.group(1)) if m else str(name)
 
 
-def _copy_xlsx_sheet_to_worksheet(
+def _append_sheet_rows(
     src_xlsx: Path,
+    src_sheet_name: str,
     dest_ws,
-    start_row: int = 0,
+    start_row: int,
+    include_header: bool = True,
 ) -> int:
     """
-    Copies all rows (with bold formatting) from the first sheet of src_xlsx
-    into dest_ws starting at start_row (0-indexed).
-
-    Returns the number of rows written (excluding the start offset).
+    Appends rows from src_sheet_name into dest_ws starting at start_row (0-based).
+    If include_header is False, skips the first row of the source sheet.
+    Returns number of rows written.
     """
-    src_wb = openpyxl.load_workbook(src_xlsx)
-    src_ws = src_wb.active
+    src_wb = openpyxl.load_workbook(src_xlsx, data_only=True)
+    try:
+        if src_sheet_name not in src_wb.sheetnames:
+            return 0
 
-    bold_font = Font(bold=True)
-    rows_written = 0
+        src_ws = src_wb[src_sheet_name]
+        rows_written = 0
 
-    for src_row in src_ws.iter_rows():
-        dest_row_idx = start_row + rows_written + 1  # openpyxl is 1-indexed
-        for src_cell in src_row:
-            dest_cell = dest_ws.cell(row=dest_row_idx, column=src_cell.column, value=src_cell.value)
-            # Preserve bold from source cell
-            if src_cell.font and src_cell.font.bold:
-                dest_cell.font = Font(bold=True)
-        rows_written += 1
+        for row_idx, src_row in enumerate(src_ws.iter_rows()):
+            is_header = (row_idx == 0)
+            if is_header and not include_header:
+                continue
 
-    src_wb.close()
-    return rows_written
+            dest_row_idx = start_row + rows_written + 1  # openpyxl is 1-based
+            for src_cell in src_row:
+                dest_cell = dest_ws.cell(
+                    row=dest_row_idx,
+                    column=src_cell.column,
+                    value=src_cell.value,
+                )
+                if src_cell.font and src_cell.font.bold:
+                    dest_cell.font = Font(bold=True)
+
+            rows_written += 1
+
+        return rows_written
+    finally:
+        src_wb.close()
+
+
+def _count_data_rows(src_xlsx: Path, sheet_name: str) -> int:
+    """
+    Counts "data rows" in a sheet, assuming first row is header.
+    Returns max(0, max_row - 1).
+    """
+    src_wb = openpyxl.load_workbook(src_xlsx, data_only=True, read_only=True)
+    try:
+        if sheet_name not in src_wb.sheetnames:
+            return 0
+        ws = src_wb[sheet_name]
+        max_row = ws.max_row or 0
+        return max(0, max_row - 1)
+    finally:
+        src_wb.close()
+
+
+def _autosize_columns(ws):
+    """
+    Simple autosize based on string length of cell values.
+    """
+    for col in ws.columns:
+        max_len = 0
+        col_letter = get_column_letter(col[0].column)
+        for cell in col:
+            v = cell.value
+            if v is None:
+                continue
+            max_len = max(max_len, len(str(v)))
+        ws.column_dimensions[col_letter].width = min(60, max(10, max_len + 2))
 
 
 def export_all_group_summaries_to_excel(Config) -> Path:
-    """
-    Config must provide:
-      - BASE_DIR (Path)
-      - OUTPUT_ROOT (str or Path)
-      - ANALYSIS_FOLDER (str)
-      - MASS_GROUPS (dict-like; keys are group names, e.g. "Group1", "Group2", ...)
-
-    Writes:
-      MassSelectionSummary_<ANALYSIS_FOLDER>.xlsx
-    Returns:
-      Path to the created Excel file
-    """
     output_root = Path(Config.BASE_DIR) / Path(Config.OUTPUT_ROOT) / Config.ANALYSIS_FOLDER
     excel_path = output_root / f"MassSelectionSummary_{Config.ANALYSIS_FOLDER}.xlsx"
     output_root.mkdir(parents=True, exist_ok=True)
 
-    print(f"\n[Excel Export] Saving all group summaries to {excel_path}\n")
+    print(f"\n[Excel Export] Saving summary workbook to {excel_path}\n")
 
     wb = openpyxl.Workbook()
-    # Remove the default empty sheet
     wb.remove(wb.active)
 
-    for group_name in sorted(Config.MASS_GROUPS.keys(), key=_group_sort_key):
+    sorted_groups = sorted(Config.MASS_GROUPS.keys(), key=_group_sort_key)
+
+    # ------------------------------------------------------------------
+    # SHEET 1: All_Groups_Summary (concatenated "Summary" sheets)
+    # ------------------------------------------------------------------
+    master_ws = wb.create_sheet(title="All_Groups_Summary")
+    master_row = 0
+    wrote_header = False
+
+    # ------------------------------------------------------------------
+    # SHEET 2: Groups_With_Unclustered_Peaks
+    # ------------------------------------------------------------------
+    unclustered_ws = wb.create_sheet(title="Groups_With_Unclustered_Peaks")
+    unclustered_ws.append(["Group", "Unclustered_Peak_Count", "Group_Summary_File"])
+    for cell in unclustered_ws[1]:
+        cell.font = Font(bold=True)
+
+    groups_with_unclustered = 0
+
+    for group_name in sorted_groups:
         cluster_dir = output_root / str(group_name) / "Clustering"
+        group_summary_xlsx = cluster_dir / f"Group_Summary_{group_name}.xlsx"
 
-        feature_xlsx = cluster_dir / f"Feature_list_{group_name}.xlsx"
-        summary_csv  = cluster_dir / f"alignment_summary_group_{group_name}.csv"
-        unresolved_csv  = cluster_dir / f"unresolved_peaks_group_{group_name}.csv"
-        unclustered_csv = cluster_dir / f"unclustered_peaks_reclustered_group_{group_name}.csv"
-
-        # Need at least one of the two primary sources
-        if not feature_xlsx.exists() and not summary_csv.exists():
-            print(f"[!] Skipping {group_name}: neither Feature_list xlsx nor summary CSV found.")
+        if not group_summary_xlsx.exists():
             continue
 
-        # Excel sheet name max length = 31 chars
-        sheet_name = str(group_name)[:31]
-        ws = wb.create_sheet(title=sheet_name)
-        current_row = 0  # 0-indexed row offset for next block
+        # Load once to check sheet existence
+        src_wb = openpyxl.load_workbook(group_summary_xlsx, read_only=True, data_only=True)
+        try:
+            sheet_names = set(src_wb.sheetnames)
+        finally:
+            src_wb.close()
 
-        # ------------------------------------------------------------------
-        # PRIMARY BLOCK: Feature_list xlsx (preferred) or fallback to CSV
-        # ------------------------------------------------------------------
-        if feature_xlsx.exists():
-            rows_written = _copy_xlsx_sheet_to_worksheet(feature_xlsx, ws, start_row=current_row)
-            print(f"[✔] Sheet '{sheet_name}' → Feature_list ({rows_written} rows) [{feature_xlsx.name}]")
-            current_row += rows_written + 2  # +2 for a blank gap row
+        # Append Summary into master
+        if "Summary" in sheet_names:
+            rows_written = _append_sheet_rows(
+                group_summary_xlsx,
+                "Summary",
+                master_ws,
+                start_row=master_row,
+                include_header=(not wrote_header),
+            )
+            if rows_written > 0:
+                master_row += rows_written
+                wrote_header = True
+                print(f"[✔] Master sheet ← {group_name} Summary ({rows_written} rows)")
         else:
-            # Fallback: plain CSV written without special formatting
-            df_summary = pd.read_csv(summary_csv)
-            bold_font = Font(bold=True)
-            # Header
-            for col_idx, col_name in enumerate(df_summary.columns, start=1):
-                cell = ws.cell(row=current_row + 1, column=col_idx, value=col_name)
-                cell.font = bold_font
-            # Data rows
-            for row_offset, (_, row) in enumerate(df_summary.iterrows(), start=1):
-                for col_idx, value in enumerate(row, start=1):
-                    ws.cell(row=current_row + 1 + row_offset, column=col_idx, value=value)
-            rows_written = len(df_summary) + 1  # header + data
-            print(f"[✔] Sheet '{sheet_name}' → Summary CSV ({len(df_summary)} rows) [{summary_csv.name}]")
-            current_row += rows_written + 2
+            # no Summary sheet; skip
+            continue
 
-        # ------------------------------------------------------------------
-        # UNRESOLVED PEAKS
-        # ------------------------------------------------------------------
-        if unresolved_csv.exists():
-            df_unresolved = pd.read_csv(unresolved_csv)
-            if not df_unresolved.empty:
-                # Header
-                for col_idx, col_name in enumerate(df_unresolved.columns, start=1):
-                    ws.cell(row=current_row + 1, column=col_idx, value=col_name)
-                # Data
-                for row_offset, (_, row) in enumerate(df_unresolved.iterrows(), start=1):
-                    for col_idx, value in enumerate(row, start=1):
-                        ws.cell(row=current_row + 1 + row_offset, column=col_idx, value=value)
-                rows_written = len(df_unresolved) + 1
-                print(f"    ↳ Unresolved peaks added ({len(df_unresolved)} rows)")
-                current_row += rows_written + 2
-            else:
-                print(f"    ↳ Skipped unresolved peaks: file is empty")
-        else:
-            print(f"    ↳ No unresolved peaks file found")
+        # Track which groups have Unclustered peaks
+        if "Unclustered" in sheet_names:
+            peak_count = _count_data_rows(group_summary_xlsx, "Unclustered")
+            unclustered_ws.append([str(group_name), int(peak_count), str(group_summary_xlsx)])
+            groups_with_unclustered += 1
+            print(f"    ↳ Unclustered found for {group_name} ({peak_count} rows)")
 
-        # ------------------------------------------------------------------
-        # UNCLUSTERED PEAKS
-        # Note: if Feature_list xlsx already contains the unclustered section
-        # at the bottom (as written by Recluster.py), we skip this block to
-        # avoid duplicating it. Only append from CSV if no Feature_list xlsx.
-        # ------------------------------------------------------------------
-        if not feature_xlsx.exists() and unclustered_csv.exists():
-            df_unclustered = pd.read_csv(unclustered_csv)
-            if not df_unclustered.empty:
-                for col_idx, col_name in enumerate(df_unclustered.columns, start=1):
-                    ws.cell(row=current_row + 1, column=col_idx, value=col_name)
-                for row_offset, (_, row) in enumerate(df_unclustered.iterrows(), start=1):
-                    for col_idx, value in enumerate(row, start=1):
-                        ws.cell(row=current_row + 1 + row_offset, column=col_idx, value=value)
-                print(f"    ↳ Unclustered peaks added ({len(df_unclustered)} rows)")
-                current_row += len(df_unclustered) + 3
-            else:
-                print(f"    ↳ Skipped unclustered peaks: file is empty")
-        elif feature_xlsx.exists():
-            print(f"    ↳ Unclustered peaks already included in Feature_list xlsx")
-        else:
-            print(f"    ↳ No unclustered peaks file found")
+    _autosize_columns(master_ws)
+    _autosize_columns(unclustered_ws)
 
     wb.save(excel_path)
-    print(f"\n[✔] Excel export complete → {excel_path}")
+    print(
+        f"\n[✔] Excel export complete → {excel_path}\n"
+        f"[ℹ] Groups with unclustered peaks: {groups_with_unclustered}\n"
+    )
     return excel_path
 
 
 def process_export_excel(Config) -> str:
-    """
-    Pipeline-style entrypoint. Call once after all groups finish.
-    """
     excel_path = export_all_group_summaries_to_excel(Config)
     return f"Excel export complete → {excel_path}"

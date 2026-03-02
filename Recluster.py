@@ -23,6 +23,11 @@ class Config:
     def pixel_dir(cls) -> Path:
         return cls.BASE_DIR / cls.OUTPUT_ROOT / cls.ANALYSIS_FOLDER / cls.CURRENT_GROUP / "Pixel CSVs"
 
+    @classmethod
+    def peak_patches_dir(cls) -> Path:
+        # Used only for filename normalization/verification (optional)
+        return cls.BASE_DIR / cls.OUTPUT_ROOT / cls.ANALYSIS_FOLDER / cls.CURRENT_GROUP / "Peak Patches"
+
 
 RT_TOLERANCE = 0.08
 
@@ -51,9 +56,65 @@ def _area_col(sample: str) -> str:
     return f"{sample}_area"
 
 
+def _to_float(x):
+    if x is None:
+        return None
+    if isinstance(x, (float, int, np.floating, np.integer)):
+        if pd.isna(x):
+            return None
+        return float(x)
+    s = str(x).strip()
+    if s == "" or s.lower() in {"nan", "none"}:
+        return None
+    try:
+        return float(s)
+    except Exception:
+        return None
+
+
+def _to_int(x):
+    if x is None:
+        return None
+    if isinstance(x, (int, np.integer)):
+        return int(x)
+    if isinstance(x, (float, np.floating)):
+        if pd.isna(x):
+            return None
+        try:
+            return int(round(float(x)))
+        except Exception:
+            return None
+    s = str(x).strip()
+    if s == "" or s.lower() in {"nan", "none"}:
+        return None
+    try:
+        return int(round(float(s)))
+    except Exception:
+        return None
+
+
+def _png_name_from_peak_id(peak_id: str) -> str:
+    peak_id = str(peak_id).strip()
+    if not peak_id:
+        return peak_id
+    return peak_id if peak_id.lower().endswith(".png") else f"{peak_id}.png"
+
+
+def _build_patch_index(patch_dir: Path) -> dict[str, str]:
+    """
+    Map lowercase filename -> actual filename for all PNGs in the patch directory.
+    This lets us correct case/format differences safely.
+    """
+    index: dict[str, str] = {}
+    if patch_dir and patch_dir.exists():
+        for p in patch_dir.glob("*.png"):
+            index[p.name.lower()] = p.name
+    return index
+
+
 # ── cluster_patch helpers ─────────────────────────────────────────────────────
 
-def _load_cluster_patch(path: Path) -> list[dict]:
+def _load_cluster_patch(path: Path, drop_empty_clusters: bool = True) -> list[dict]:
     """
     Read cluster_patch_<group>.csv back into a list of cluster dicts:
       [{"m/z": ..., "Isomer_position": ..., "Aligned_rt_apex": ...,
@@ -63,31 +124,50 @@ def _load_cluster_patch(path: Path) -> list[dict]:
         return []
 
     df = pd.read_csv(path, header=0)
-    # First column is the row-label column (empty header)
+    if df.empty or len(df.columns) < 2:
+        return []
+
+    # First column is the row-label column (empty header or similar)
     label_col = df.columns[0]
-    cluster_cols = [c for c in df.columns if c.startswith("Cluster ")]
+    cluster_cols = [c for c in df.columns if str(c).startswith("Cluster ")]
 
-    # Build a dict: label -> value for each cluster column
-    label_series = df[label_col].fillna("").tolist()
+    label_series = df[label_col].fillna("").astype(str).tolist()
 
-    clusters = []
+    clusters: list[dict] = []
     for col in cluster_cols:
         values = df[col].tolist()
         row_map = dict(zip(label_series, values))
 
-        patches = []
+        patches: list[str] = []
         for label, val in zip(label_series, values):
+            # PNG rows are stored where label == "" (per your writer)
             if label == "" and pd.notna(val) and str(val).strip():
                 patches.append(str(val).strip())
 
-        clusters.append({
-            "col_name": col,
-            "m/z": row_map.get("m/z"),
-            "Isomer_position": row_map.get("Isomer_position"),
-            "Aligned_rt_apex": row_map.get("Aligned_rt_apex"),
-            "peak count": row_map.get("peak count"),
+        mz = _to_float(row_map.get("m/z"))
+        iso = _to_int(row_map.get("Isomer_position"))
+        art = _to_float(row_map.get("Aligned_rt_apex"))
+        pc  = _to_int(row_map.get("peak count"))
+
+        # If peak count is missing/incorrect, recompute from patches
+        if pc is None:
+            pc = len(patches)
+
+        cluster = {
+            "col_name": str(col),
+            "m/z": mz,
+            "Isomer_position": iso,
+            "Aligned_rt_apex": art,
+            "peak count": pc,
             "patches": patches,
-        })
+        }
+
+        if drop_empty_clusters and len(patches) == 0:
+            # Drop clusters that contain no patch filenames.
+            # This prevents "9 clusters" when you only have 8 patch rows total.
+            continue
+
+        clusters.append(cluster)
 
     return clusters
 
@@ -100,21 +180,22 @@ def _clusters_to_df(clusters: list[dict]) -> pd.DataFrame:
     if not clusters:
         return pd.DataFrame()
 
-    max_patches = max(len(c["patches"]) for c in clusters)
+    max_patches = max(len(c["patches"]) for c in clusters) if clusters else 0
     meta_labels = ["m/z", "Isomer_position", "Aligned_rt_apex", "peak count"]
     index_col = meta_labels + [""] * max_patches
 
     data: dict[str, list] = {"": index_col}
     for cluster in clusters:
         col_values = [
-            cluster["m/z"],
-            cluster["Isomer_position"],
-            cluster["Aligned_rt_apex"],
-            cluster["peak count"],
+            cluster.get("m/z"),
+            cluster.get("Isomer_position"),
+            cluster.get("Aligned_rt_apex"),
+            cluster.get("peak count"),
         ]
-        patches = cluster["patches"] + [""] * (max_patches - len(cluster["patches"]))
+        patches = list(cluster.get("patches") or [])
+        patches = patches + [""] * (max_patches - len(patches))
         col_values.extend(patches)
-        data[cluster["col_name"]] = col_values
+        data[str(cluster.get("col_name"))] = col_values
 
     return pd.DataFrame(data)
 
@@ -130,109 +211,189 @@ def recluster_group(group: str, config: type = Config) -> None:
     patch_path       = clustering_dir / f"cluster_patch_{group}.csv"
     output_path      = clustering_dir / f"Group_Summary_{group}.xlsx"
 
+    # Optional: patch directory index so we can normalize PNG filenames
+    patch_index = _build_patch_index(getattr(config, "peak_patches_dir", lambda: None)())
+
     # ── Load input files ──────────────────────────────────────────────────────
     alignment   = pd.read_csv(alignment_path)
     unclustered = pd.read_csv(unclustered_path)
-    clusters    = _load_cluster_patch(patch_path)
+    clusters    = _load_cluster_patch(patch_path, drop_empty_clusters=True)
 
-    height_cols = [c for c in alignment.columns if c.endswith("_height")]
-    area_cols   = [c for c in alignment.columns if c.endswith("_area")]
+    # Normalize core fields (this is critical for matching)
+    if "m/z" in alignment.columns:
+        alignment["m/z"] = alignment["m/z"].apply(_to_float)
+    if "Isomer_position" in alignment.columns:
+        alignment["Isomer_position"] = alignment["Isomer_position"].apply(_to_int)
+
+    if "m/z" in unclustered.columns:
+        unclustered["m/z"] = unclustered["m/z"].apply(_to_float)
+    if "RT_apex" in unclustered.columns:
+        unclustered["RT_apex"] = pd.to_numeric(unclustered["RT_apex"], errors="coerce")
+    if "height" in unclustered.columns:
+        unclustered["height"] = pd.to_numeric(unclustered["height"], errors="coerce")
+    if "area" in unclustered.columns:
+        unclustered["area"] = pd.to_numeric(unclustered["area"], errors="coerce")
+    if "peak_id" in unclustered.columns:
+        unclustered["peak_id"] = unclustered["peak_id"].astype(str)
+
+    # Precompute sample name for each unclustered peak_id (avoid apply inside loop)
+    if "peak_id" in unclustered.columns:
+        unclustered["_sample"] = unclustered["peak_id"].apply(_sample_name_from_peak_id)
+    else:
+        unclustered["_sample"] = ""
+
+    height_cols = [c for c in alignment.columns if str(c).endswith("_height")]
+    area_cols   = [c for c in alignment.columns if str(c).endswith("_area")]
     all_samples = [_sample_name_from_col(c) for c in height_cols]
 
     alignment["Recluster"] = False
 
     newly_filled: set[tuple[int, str]] = set()
-    matched_peak_ids: set = set()
+    matched_peak_ids: set[str] = set()
+    peaks_used_count = 0
+    cluster_append_failures = 0
 
     has_unclustered = (
         not unclustered.empty
         and "m/z" in unclustered.columns
         and "RT_apex" in unclustered.columns
+        and "peak_id" in unclustered.columns
     )
 
     # ── Iterate over every blank height cell in the alignment summary ─────────
     if has_unclustered:
+        # Speed: group unclustered by (mz, sample) once
+        unclustered_grouped = {}
+        for (mz_val, sample), grp in unclustered.groupby(["m/z", "_sample"], dropna=False):
+            unclustered_grouped[(mz_val, sample)] = grp
+
         for row_idx, row in alignment.iterrows():
-            aligned_rt = row["Aligned_rt_apex"]
-            mz         = row["m/z"]
-            iso_pos    = row.get("Isomer_position", None)
+            aligned_rt = _to_float(row.get("Aligned_rt_apex"))
+            mz         = _to_float(row.get("m/z"))
+            iso_pos    = _to_int(row.get("Isomer_position", None))
+
+            if mz is None or aligned_rt is None:
+                continue
 
             for sample in all_samples:
                 h_col = _height_col(sample)
                 a_col = _area_col(sample)
 
                 height_val = row.get(h_col, np.nan)
-                if pd.notna(height_val) and height_val != 0:
+                if pd.notna(height_val) and float(height_val) != 0.0:
                     continue
 
-                candidates = unclustered[
-                    (unclustered["m/z"] == mz) &
-                    (unclustered["peak_id"].apply(_sample_name_from_peak_id) == sample) &
-                    (abs(unclustered["RT_apex"] - aligned_rt) <= RT_TOLERANCE)
+                grp = unclustered_grouped.get((mz, sample))
+                if grp is None or grp.empty:
+                    continue
+
+                # Candidate filter: RT tolerance + NOT already matched
+                candidates = grp[
+                    (grp["RT_apex"].notna()) &
+                    ((grp["RT_apex"] - aligned_rt).abs() <= RT_TOLERANCE) &
+                    (~grp["peak_id"].isin(matched_peak_ids))
                 ].copy()
 
                 if candidates.empty:
                     continue
 
-                candidates["_rt_diff"] = abs(candidates["RT_apex"] - aligned_rt)
+                candidates["_rt_diff"] = (candidates["RT_apex"] - aligned_rt).abs()
                 best = candidates.loc[candidates["_rt_diff"].idxmin()]
 
-                alignment.at[row_idx, h_col] = best["height"]
+                # Fill alignment cells
+                alignment.at[row_idx, h_col] = best.get("height", np.nan)
                 newly_filled.add((row_idx, h_col))
 
                 if a_col in alignment.columns:
-                    alignment.at[row_idx, a_col] = best["area"]
+                    alignment.at[row_idx, a_col] = best.get("area", np.nan)
                     newly_filled.add((row_idx, a_col))
 
                 alignment.at[row_idx, "Recluster"] = True
-                matched_peak_ids.add(best["peak_id"])
+
+                peak_id = str(best["peak_id"])
+                matched_peak_ids.add(peak_id)
+                peaks_used_count += 1
 
                 # ── Add PNG to the matching cluster in cluster_patch ───────────
-                peak_id  = str(best["peak_id"])
-                png_name = f"{peak_id}.png" if not peak_id.endswith(".png") else peak_id
+                png_name = _png_name_from_peak_id(peak_id)
+                # Normalize to actual filename in directory when possible
+                png_name = patch_index.get(png_name.lower(), png_name)
 
+                found_cluster = False
                 for cluster in clusters:
-                    if cluster["m/z"] == mz and cluster["Isomer_position"] == iso_pos:
+                    if cluster.get("m/z") == mz and cluster.get("Isomer_position") == iso_pos:
+                        found_cluster = True
                         if png_name not in cluster["patches"]:
                             cluster["patches"].append(png_name)
-                            cluster["peak count"] = len(cluster["patches"])
+                        cluster["peak count"] = len(cluster["patches"])
                         break
 
-    # ── Recalculate peak count and Aligned_rt_apex ────────────────────────────
+                if not found_cluster:
+                    cluster_append_failures += 1
+                    # Keep going; we still reclustered into alignment.
+
+    # ── Recalculate peak count and (optionally) refine Aligned_rt_apex ─────────
     for row_idx, row in alignment.iterrows():
-        if not row["Recluster"]:
+        if not bool(row.get("Recluster", False)):
             continue
 
         heights = [row.get(_height_col(s), np.nan) for s in all_samples]
-        new_count = sum(1 for h in heights if pd.notna(h) and h != 0)
-        alignment.at[row_idx, "peak count"] = new_count
+        new_count = sum(1 for h in heights if pd.notna(h) and float(h) != 0.0)
+        if "peak count" in alignment.columns:
+            alignment.at[row_idx, "peak count"] = int(new_count)
 
-        rt_values = []
-        mz_val = row["m/z"]
+        # Recompute aligned RT apex using pixel files (guarded, no silent failure)
+        mz_val = _to_float(row.get("m/z"))
+        aligned_rt = _to_float(row.get("Aligned_rt_apex"))
+        if mz_val is None or aligned_rt is None:
+            continue
+
+        rt_values: list[float] = []
         for sample in all_samples:
             h_col = _height_col(sample)
-            if pd.notna(row.get(h_col, np.nan)) and row.get(h_col, 0) != 0:
+            hv = row.get(h_col, np.nan)
+            if pd.notna(hv) and float(hv) != 0.0:
                 pixel_file = pixel_dir / f"{sample}_peaks_pix_{group}.csv"
-                if pixel_file.exists():
-                    try:
-                        pix = pd.read_csv(pixel_file)
-                        match = pix[
-                            (pix["m/z"] == mz_val) &
-                            (abs(pix["RT_apex"] - row["Aligned_rt_apex"]) <= RT_TOLERANCE + 0.05)
-                        ]
-                        if not match.empty:
-                            best_rt = match.loc[
-                                (match["RT_apex"] - row["Aligned_rt_apex"]).abs().idxmin(), "RT_apex"
-                            ]
-                            rt_values.append(best_rt)
-                    except Exception:
-                        pass
+                if not pixel_file.exists():
+                    continue
+                try:
+                    pix = pd.read_csv(pixel_file)
+                except Exception:
+                    continue
+
+                if "m/z" not in pix.columns or "RT_apex" not in pix.columns:
+                    continue
+
+                pix["m/z"] = pix["m/z"].apply(_to_float)
+                pix["RT_apex"] = pd.to_numeric(pix["RT_apex"], errors="coerce")
+
+                match = pix[
+                    (pix["m/z"] == mz_val) &
+                    (pix["RT_apex"].notna()) &
+                    ((pix["RT_apex"] - aligned_rt).abs() <= (RT_TOLERANCE + 0.05))
+                ]
+
+                if not match.empty:
+                    best_idx = (match["RT_apex"] - aligned_rt).abs().idxmin()
+                    best_rt = match.loc[best_idx, "RT_apex"]
+                    if pd.notna(best_rt):
+                        rt_values.append(float(best_rt))
 
         if rt_values:
             alignment.at[row_idx, "Aligned_rt_apex"] = float(np.mean(rt_values))
 
     # ── Still-unclustered peaks ───────────────────────────────────────────────
-    still_unclustered = unclustered[~unclustered["peak_id"].isin(matched_peak_ids)].copy()
+    if "peak_id" in unclustered.columns:
+        still_unclustered = unclustered[~unclustered["peak_id"].isin(matched_peak_ids)].copy()
+        # Remove helper column
+        if "_sample" in still_unclustered.columns:
+            still_unclustered.drop(columns=["_sample"], inplace=True)
+    else:
+        still_unclustered = unclustered.copy()
+
+    # Ensure cluster peak counts are consistent
+    for c in clusters:
+        c["peak count"] = len(c.get("patches") or [])
 
     # ── Build the Excel workbook ──────────────────────────────────────────────
     _write_excel(
@@ -246,9 +407,13 @@ def recluster_group(group: str, config: type = Config) -> None:
     )
 
     print(f"Done. Output written to: {output_path}")
-    print(f"  Rows reclustered : {alignment['Recluster'].sum()}")
-    print(f"  Peaks matched    : {len(matched_peak_ids)}")
-    print(f"  Still unclustered: {len(still_unclustered)}")
+    print(f"  Rows reclustered         : {int(alignment['Recluster'].sum())}")
+    print(f"  Peaks matched (unique)   : {len(matched_peak_ids)}")
+    print(f"  Peak assignments used    : {peaks_used_count}")
+    print(f"  Still unclustered        : {len(still_unclustered)}")
+    print(f"  Clusters loaded          : {len(clusters)} (empty clusters dropped)")
+    if cluster_append_failures:
+        print(f"  WARN: matched peaks not appended to any cluster: {cluster_append_failures}")
 
 
 # ── Excel writer ──────────────────────────────────────────────────────────────
@@ -262,7 +427,6 @@ def _write_excel(
     height_cols:  list[str],
     area_cols:    list[str],
 ) -> None:
-
     wb = Workbook()
 
     bold_font   = Font(name="Arial", bold=True)
@@ -362,7 +526,6 @@ def _write_excel(
                     value = float(value) if not np.isnan(value) else None
 
                 cell = ws3.cell(row=row_idx, column=col_idx, value=value)
-                # Bold the metadata label rows; normal for PNG rows
                 cell.font = bold_font if is_meta else normal_font
 
         for col_cells in ws3.columns:
@@ -385,6 +548,11 @@ def process_file_recluster(dirs: dict, group_name: str) -> str:
         @classmethod
         def pixel_dir(cls) -> Path:
             return Path(dirs["pixel"])
+
+        @classmethod
+        def peak_patches_dir(cls) -> Path:
+            # Optional, only used for PNG filename normalization
+            return Path(dirs.get("peak_patches", "")) if dirs.get("peak_patches") else super().peak_patches_dir()
 
     recluster_group(group=group_name, config=_RuntimeConfig)
     output_path = Path(dirs["clustering"]) / f"Group_Summary_{group_name}.xlsx"
