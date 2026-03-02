@@ -28,6 +28,7 @@ class Pipeline:
     def __init__(self):
         self.config = Config()
         self.file_paths = FileUtils.get_file_paths()
+        Config.initialize_mass_groups(self.file_paths)
         self.file_colors = {
             os.path.splitext(os.path.basename(fp))[0]: FileUtils.random_dark_hex_color()
             for fp in self.file_paths
@@ -48,7 +49,7 @@ class Pipeline:
 
         print("\nCLEAN RUN: deleting all previous outputs...\n")
 
-        for group_name in Config.MASS_GROUPS.keys():
+        for group_name in Config.get_group_names_to_run():
             Config.set_mass_group(group_name)
             dirs = Config.setup_directories()
 
@@ -201,7 +202,7 @@ class Pipeline:
     def run(self):
         total_start = time.time()
 
-        for group_name in Config.MASS_GROUPS.keys():
+        for group_name in Config.get_group_names_to_run():
             print(f"Running group: {group_name}")
 
             Config.set_mass_group(group_name)

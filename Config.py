@@ -1,41 +1,233 @@
+from __future__ import annotations
+
 from pathlib import Path
+import csv
+import json
+
 
 class Config:
+    # ---------------------------------------------------------------------
     # Base directories
+    # ---------------------------------------------------------------------
     BASE_DIR = Path.home() / "Desktop/maxiMiZe Tests"
     INPUT_SUBDIR = Path("maxiMiZe Files")
     OUTPUT_ROOT = Path("maxiMiZe Checkpoints")
-    ANALYSIS_FOLDER = ("maxiMZe Group 1-2 0302 Test 5 Export Excel")
+    ANALYSIS_FOLDER = "maxiMZe Group 1-3 0302 Test 6 New Mass"
 
-    # Analysis parameters
-    MASS_GROUPS = {
-        'Group1': [169.0356, 182.0811, 297.1672, 132.1019],
-        'Group2': [247.1540, 104.1069, 167.0896],
-        'Group3': [104.0706, 86.0964, 269.1358],
-        'Group4': [206.1005, 393.2859, 233.1383],
-        'Group5': [235.1652, 187.0964, 261.1697],
-        'Group6': [169.0583, 232.1544, 274.2741],
-        'Group7': [119.0896, 337.0641, 247.1441],
-        'Group8': [70.0651, 283.1515, 175.1077],
-        'Group9': [179.0484, 409.1871, 292.2119],
-        'Group10': [158.9640, 314.2327, 280.1391],
-    }
-    MASS_LIST = MASS_GROUPS["Group1"]  # Default to first group for backwards compatibility
+    # ---------------------------------------------------------------------
+    # Mass grouping control knobs
+    # ---------------------------------------------------------------------
+    USE_DYNAMIC_MASS_GROUPS = True          # MUST be True (fallback groups removed)
+    MAX_GROUPS_TO_RUN = 3                  # None = all, N = first N groups
+    REBUILD_MASS_GROUPS = False            # True = ignore cache and recompute
+    GROUPING_VERBOSE = False               # True = print per-file processing during grouping
+
+    # ---------------------------------------------------------------------
+    # Parameters for MassGrouping.py
+    # (These are used ONLY when building groups; the pipeline uses MASS_TOLERANCE
+    # for EIC extraction later.)
+    # ---------------------------------------------------------------------
+    GROUP_NOISE_LEVEL = 5000.0
+    GROUP_MZ_TOLERANCE = 0.0005
+    GROUP_MIN_CONSEC_SCANS = 7
+    GROUP_MIN_SAMPLE_PRESENCE = 1
+    GROUP_MIN_GROUP_SIZE = 3
+    GROUP_MAX_GROUP_SIZE = 5
+
+    # ---------------------------------------------------------------------
+    # Export / cache filenames (saved under: BASE_DIR/OUTPUT_ROOT/ANALYSIS_FOLDER)
+    # ---------------------------------------------------------------------
+    MASS_GROUPS_CACHE_NAME = "MassGroups_Cache.json"
+    MASS_GROUPS_EXPORT_NAME = "MassGroups_Formatted.csv"
+
+    # ---------------------------------------------------------------------
+    # Runtime state
+    # ---------------------------------------------------------------------
+    MASS_GROUPS: dict[str, list[float]] = {}   # populated by initialize_mass_groups() or cache
+    MASS_LIST: list[float] = []               # active group's masses
+    CURRENT_GROUP: str | None = None
+
+    # Pipeline analysis parameters (unchanged)
     MASS_TOLERANCE = 0.0005
     MAX_PEAK_DURATION = 1.5
-    CURRENT_GROUP = "Group1"  # Track current group being processed
+
+    # ---------------------------------------------------------------------
+    # Paths / helpers
+    # ---------------------------------------------------------------------
+    @classmethod
+    def _analysis_output_root(cls) -> Path:
+        # User requested:
+        # output_root = Path(Config.BASE_DIR) / Path(Config.OUTPUT_ROOT) / Config.ANALYSIS_FOLDER
+        return Path(cls.BASE_DIR) / Path(cls.OUTPUT_ROOT) / cls.ANALYSIS_FOLDER
 
     @classmethod
-    def set_mass_group(cls, group_name):
-        """Set the current mass group to process."""
+    def _mass_groups_cache_path(cls) -> Path:
+        out_dir = cls._analysis_output_root()
+        out_dir.mkdir(parents=True, exist_ok=True)
+        return out_dir / cls.MASS_GROUPS_CACHE_NAME
+
+    @staticmethod
+    def _group_sort_key(name: str) -> int:
+        digits = "".join(ch for ch in name if ch.isdigit())
+        return int(digits) if digits else 10**9
+
+    @staticmethod
+    def _display_group_label(name: str) -> str:
+        digits = "".join(ch for ch in name if ch.isdigit())
+        return f"'Group {digits}':" if digits else f"'{name}':"
+
+    # ---------------------------------------------------------------------
+    # Cache load/save (multiprocessing-safe)
+    # ---------------------------------------------------------------------
+    @classmethod
+    def save_mass_groups_cache(cls) -> None:
+        p = cls._mass_groups_cache_path()
+        p.write_text(json.dumps(cls.MASS_GROUPS, indent=2), encoding="utf-8")
+
+    @classmethod
+    def load_mass_groups_cache(cls) -> bool:
+        p = cls._mass_groups_cache_path()
+        if not p.exists():
+            return False
+        data = json.loads(p.read_text(encoding="utf-8"))
+        cls.MASS_GROUPS = {k: [float(x) for x in v] for k, v in data.items()}
+        return True
+
+    @classmethod
+    def ensure_mass_groups_loaded(cls) -> None:
+        """
+        Used by multiprocessing workers.
+        Workers won't inherit runtime-modified class variables from the parent
+        (spawn), so they must load MASS_GROUPS from disk.
+        """
+        if cls.MASS_GROUPS:
+            return
+        if not cls.load_mass_groups_cache():
+            raise RuntimeError(
+                "MASS_GROUPS not initialized in this process and cache not found.\n"
+                f"Expected cache at: {cls._mass_groups_cache_path()}\n"
+                "Fix: make sure the main process calls Config.initialize_mass_groups(...) "
+                "before starting multiprocessing."
+            )
+
+    # ---------------------------------------------------------------------
+    # Dynamic grouping initialization (uses MassGrouping.py's 6-file selection)
+    # ---------------------------------------------------------------------
+    @classmethod
+    def initialize_mass_groups(cls, _pipeline_file_paths_ignored: list[str] | None = None) -> None:
+        """
+        Builds MASS_GROUPS using what is defined in MassGrouping.py:
+        - select_files() (study design + manifest) -> typically 6 files
+        - build_mass_groups_from_files() -> groups
+
+        Also writes:
+        - MassGroups_Cache.json  (for multiprocessing workers)
+        - MassGroups_Formatted.csv
+        """
+        if not cls.USE_DYNAMIC_MASS_GROUPS:
+            raise ValueError("USE_DYNAMIC_MASS_GROUPS=False but fallback MASS_GROUPS were removed.")
+
+        # If we already have groups in memory and we're not rebuilding, keep them.
+        if cls.MASS_GROUPS and not cls.REBUILD_MASS_GROUPS:
+            cls.save_mass_groups_formatted_csv()
+            return
+
+        # Try cache first (fast)
+        if not cls.REBUILD_MASS_GROUPS and cls.load_mass_groups_cache():
+            # set default current group
+            first_group = sorted(cls.MASS_GROUPS.keys(), key=cls._group_sort_key)[0]
+            cls.set_mass_group(first_group)
+            cls.save_mass_groups_formatted_csv()
+            return
+
+        # Build fresh (slow)
+        from MassGrouping import select_files, build_mass_groups_from_files
+
+        grouping_files = select_files()  # <-- uses N_FILES_TO_PROCESS=6 and study design + manifest
+
+        cls.MASS_GROUPS = build_mass_groups_from_files(
+            grouping_files,
+            noise_level=cls.GROUP_NOISE_LEVEL,
+            mz_tolerance=cls.GROUP_MZ_TOLERANCE,
+            min_consec_scans=cls.GROUP_MIN_CONSEC_SCANS,
+            min_sample_presence=cls.GROUP_MIN_SAMPLE_PRESENCE,
+            min_group_size=cls.GROUP_MIN_GROUP_SIZE,
+            max_group_size=cls.GROUP_MAX_GROUP_SIZE,
+            # If you add verbose support to MassGrouping.build_mass_groups_from_files, it will use this:
+            verbose=getattr(cls, "GROUPING_VERBOSE", False),
+        )
+
+        if not cls.MASS_GROUPS:
+            raise ValueError("Dynamic mass grouping produced 0 groups.")
+
+        # Set default current group
+        first_group = sorted(cls.MASS_GROUPS.keys(), key=cls._group_sort_key)[0]
+        cls.set_mass_group(first_group)
+
+        # Persist for multiprocessing workers + export CSV
+        cls.save_mass_groups_cache()
+        cls.save_mass_groups_formatted_csv()
+
+    @classmethod
+    def get_group_names_to_run(cls) -> list[str]:
+        cls.ensure_mass_groups_loaded()
+        names = sorted(cls.MASS_GROUPS.keys(), key=cls._group_sort_key)
+        if cls.MAX_GROUPS_TO_RUN is None:
+            return names
+        return names[: int(cls.MAX_GROUPS_TO_RUN)]
+
+    # ---------------------------------------------------------------------
+    # Group selection + export
+    # ---------------------------------------------------------------------
+    @classmethod
+    def set_mass_group(cls, group_name: str) -> None:
+        # Multiprocessing-safe: if a worker calls this first, it will load cache.
+        cls.ensure_mass_groups_loaded()
+
         if group_name not in cls.MASS_GROUPS:
-            raise ValueError(f"Invalid group name: {group_name}")
+            available = sorted(cls.MASS_GROUPS.keys(), key=cls._group_sort_key)
+            raise ValueError(
+                f"Invalid group name: {group_name}. "
+                f"First available groups: {available[:10]}"
+            )
         cls.CURRENT_GROUP = group_name
         cls.MASS_LIST = cls.MASS_GROUPS[group_name]
 
     @classmethod
+    def save_mass_groups_formatted_csv(cls) -> Path:
+        """
+        Saves ALL groups (not limited by MAX_GROUPS_TO_RUN) to:
+          BASE_DIR / OUTPUT_ROOT / ANALYSIS_FOLDER / MassGroups_Formatted.csv
+        """
+        cls.ensure_mass_groups_loaded()
+
+        out_dir = cls._analysis_output_root()
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = out_dir / cls.MASS_GROUPS_EXPORT_NAME
+
+        group_names = sorted(cls.MASS_GROUPS.keys(), key=cls._group_sort_key)
+
+        with out_path.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(["Group", "Size", "Masses"])
+            for name in group_names:
+                masses = cls.MASS_GROUPS.get(name, [])
+                masses_str = "[" + ", ".join(f"{float(m):.4f}" for m in masses) + "]"
+                writer.writerow([cls._display_group_label(name), len(masses), masses_str])
+
+        return out_path
+
+    # ---------------------------------------------------------------------
+    # Existing directory setup
+    # ---------------------------------------------------------------------
+    @classmethod
     def setup_directories(cls):
-        """Setup and return all required output directories."""
+        if cls.CURRENT_GROUP is None:
+            raise RuntimeError(
+                "CURRENT_GROUP is None. "
+                "Call Config.initialize_mass_groups(...) and Config.set_mass_group(...) first."
+            )
+
         dirs = {
             'png': cls.BASE_DIR / cls.OUTPUT_ROOT / cls.ANALYSIS_FOLDER / cls.CURRENT_GROUP / "EIC PNGs",
             'csv': cls.BASE_DIR / cls.OUTPUT_ROOT / cls.ANALYSIS_FOLDER / cls.CURRENT_GROUP / "EIC CSVs",

@@ -321,10 +321,18 @@ def process_file_centroids(file_path: str, noise_level: float) -> Tuple[List[Tup
     return centroids, retention_times
 
 
-def process_single_file(file_path: str) -> Tuple[str, Set[float], List[Dict]]:
-    print(f"Processing {Path(file_path).name}...")
-    centroids, retention_times = process_file_centroids(file_path, NOISE_LEVEL)
-    features = find_mass_traces(centroids, MZ_TOLERANCE, MIN_CONSEC_SCANS, retention_times)
+def process_single_file(
+    file_path: str,
+    noise_level: float = NOISE_LEVEL,
+    mz_tolerance: float = MZ_TOLERANCE,
+    min_consec_scans: int = MIN_CONSEC_SCANS,
+    verbose: bool = False,   # 👈 ADD THIS LINE
+) -> Tuple[str, Set[float], List[Dict]]:
+
+    if verbose:  # 👈 ADD THIS
+        print(f"Processing {Path(file_path).name}...")
+    centroids, retention_times = process_file_centroids(file_path, noise_level)
+    features = find_mass_traces(centroids, mz_tolerance, min_consec_scans, retention_times)
     unique_masses = {feature['mz'] for feature in features}
     return file_path, unique_masses, features
 
@@ -448,6 +456,66 @@ def find_groups(masses_df: pd.DataFrame, min_group_size: int = 3, max_group_size
 
     return groups
 
+def build_mass_groups_from_files(
+    file_paths: List[str],
+    *,
+    noise_level: float = NOISE_LEVEL,
+    mz_tolerance: float = MZ_TOLERANCE,
+    min_consec_scans: int = MIN_CONSEC_SCANS,
+    min_sample_presence: int = MIN_SAMPLE_PRESENCE,
+    min_group_size: int = 3,
+    max_group_size: int = 5,
+    verbose: bool = False,
+) -> Dict[str, List[float]]:
+    """
+    Pipeline-friendly entry point.
+    Returns {"Group1": [mz...], "Group2": [mz...], ...}
+    """
+
+    masses_by_file: Dict[str, Set[float]] = {}
+    all_features: List[Dict] = []
+
+    with ProcessPoolExecutor(max_workers=min(len(file_paths), multiprocessing.cpu_count())) as executor:
+        futures = [
+            executor.submit(process_single_file, f, noise_level, mz_tolerance, min_consec_scans, verbose)
+            for f in file_paths
+        ]
+        for fut in futures:
+            file_path, masses, features = fut.result()
+            masses_by_file[file_path] = masses
+            all_features.extend(features)
+
+    mass_counts = defaultdict(int)
+    for masses in masses_by_file.values():
+        unique_masses = np.array(list(masses), dtype=float)
+        rounded_masses = np.round(unique_masses, decimals=6)
+        for mz in rounded_masses:
+            mass_counts[float(mz)] += 1
+
+    valid_masses = {mz for mz, count in mass_counts.items() if count >= min_sample_presence}
+
+    valid_features = []
+    for feature in all_features:
+        mz_round = round(feature['mz'], 6)
+        if mz_round in valid_masses:
+            valid_features.append(feature)
+
+    unique_features: Dict[float, Dict] = {}
+    for feature in sorted(valid_features, key=lambda x: x['intensity'], reverse=True):
+        mz_round = round(feature['mz'], 6)
+        if mz_round not in unique_features:
+            unique_features[mz_round] = feature
+
+    features_sorted = sorted(unique_features.values(), key=lambda x: x['mz'])
+    df = pd.DataFrame(features_sorted)
+
+    mass_groups = find_groups(df, min_group_size=min_group_size, max_group_size=max_group_size)
+
+    out: Dict[str, List[float]] = {}
+    for i, group in enumerate(mass_groups, 1):
+        out[f"Group{i}"] = [float(m["mz"]) for m in group]
+
+    return out
 
 # ---------------------------------------------------------------------------
 # Main

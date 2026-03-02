@@ -146,9 +146,14 @@ def export_all_group_summaries_to_excel(Config) -> Path:
         # Track which groups have Unclustered peaks
         if "Unclustered" in sheet_names:
             peak_count = _count_data_rows(group_summary_xlsx, "Unclustered")
-            unclustered_ws.append([str(group_name), int(peak_count), str(group_summary_xlsx)])
-            groups_with_unclustered += 1
-            print(f"    ↳ Unclustered found for {group_name} ({peak_count} rows)")
+            if peak_count > 0:  # <-- Only add if actual data rows exist
+                unclustered_ws.append([
+                    str(group_name),
+                    int(peak_count),
+                    str(group_summary_xlsx)
+                ])
+                groups_with_unclustered += 1
+                print(f"    ↳ Unclustered found for {group_name} ({peak_count} rows)")
 
     _autosize_columns(master_ws)
     _autosize_columns(unclustered_ws)
@@ -156,7 +161,7 @@ def export_all_group_summaries_to_excel(Config) -> Path:
     wb.save(excel_path)
     print(
         f"\n[✔] Excel export complete → {excel_path}\n"
-        f"[ℹ] Groups with unclustered peaks: {groups_with_unclustered}\n"
+        f"[!] Groups with unclustered peaks: {groups_with_unclustered}\n"
     )
     return excel_path
 
