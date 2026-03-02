@@ -6,9 +6,6 @@ from openpyxl import Workbook
 from openpyxl.styles import Font, Alignment
 from openpyxl.utils import get_column_letter
 
-
-# ── Path configuration ────────────────────────────────────────────────────────
-
 class Config:
     BASE_DIR        = Path(".")
     OUTPUT_ROOT     = "Output"
@@ -28,11 +25,7 @@ class Config:
         # Used only for filename normalization/verification (optional)
         return cls.BASE_DIR / cls.OUTPUT_ROOT / cls.ANALYSIS_FOLDER / cls.CURRENT_GROUP / "Peak Patches"
 
-
 RT_TOLERANCE = 0.08
-
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _sample_name_from_col(col: str) -> str:
     for suffix in ("_height", "_area"):
@@ -40,21 +33,17 @@ def _sample_name_from_col(col: str) -> str:
             return col[: -len(suffix)]
     return col
 
-
 def _sample_name_from_peak_id(peak_id: str) -> str:
     idx = peak_id.find("_mass")
     if idx != -1:
         return peak_id[:idx]
     return peak_id
 
-
 def _height_col(sample: str) -> str:
     return f"{sample}_height"
 
-
 def _area_col(sample: str) -> str:
     return f"{sample}_area"
-
 
 def _to_float(x):
     if x is None:
@@ -70,7 +59,6 @@ def _to_float(x):
         return float(s)
     except Exception:
         return None
-
 
 def _to_int(x):
     if x is None:
@@ -92,34 +80,20 @@ def _to_int(x):
     except Exception:
         return None
 
-
 def _png_name_from_peak_id(peak_id: str) -> str:
     peak_id = str(peak_id).strip()
     if not peak_id:
         return peak_id
     return peak_id if peak_id.lower().endswith(".png") else f"{peak_id}.png"
 
-
 def _build_patch_index(patch_dir: Path) -> dict[str, str]:
-    """
-    Map lowercase filename -> actual filename for all PNGs in the patch directory.
-    This lets us correct case/format differences safely.
-    """
     index: dict[str, str] = {}
     if patch_dir and patch_dir.exists():
         for p in patch_dir.glob("*.png"):
             index[p.name.lower()] = p.name
     return index
 
-
-# ── cluster_patch helpers ─────────────────────────────────────────────────────
-
 def _load_cluster_patch(path: Path, drop_empty_clusters: bool = True) -> list[dict]:
-    """
-    Read cluster_patch_<group>.csv back into a list of cluster dicts:
-      [{"m/z": ..., "Isomer_position": ..., "Aligned_rt_apex": ...,
-        "peak count": ..., "patches": [filename, ...]}, ...]
-    """
     if not path.exists():
         return []
 
@@ -164,19 +138,13 @@ def _load_cluster_patch(path: Path, drop_empty_clusters: bool = True) -> list[di
 
         if drop_empty_clusters and len(patches) == 0:
             # Drop clusters that contain no patch filenames.
-            # This prevents "9 clusters" when you only have 8 patch rows total.
             continue
 
         clusters.append(cluster)
 
     return clusters
 
-
 def _clusters_to_df(clusters: list[dict]) -> pd.DataFrame:
-    """
-    Convert a list of cluster dicts back to the transposed DataFrame format
-    for writing to the Excel sheet.
-    """
     if not clusters:
         return pd.DataFrame()
 
@@ -199,9 +167,6 @@ def _clusters_to_df(clusters: list[dict]) -> pd.DataFrame:
 
     return pd.DataFrame(data)
 
-
-# ── Core reclustering logic ───────────────────────────────────────────────────
-
 def recluster_group(group: str, config: type = Config) -> None:
     clustering_dir = config.clustering_dir()
     pixel_dir      = config.pixel_dir()
@@ -211,20 +176,17 @@ def recluster_group(group: str, config: type = Config) -> None:
     patch_path       = clustering_dir / f"cluster_patch_{group}.csv"
     output_path      = clustering_dir / f"Group_Summary_{group}.xlsx"
 
-    # Optional: patch directory index so we can normalize PNG filenames
     patch_index = _build_patch_index(getattr(config, "peak_patches_dir", lambda: None)())
 
-    # ── Load input files ──────────────────────────────────────────────────────
     alignment   = pd.read_csv(alignment_path)
     unclustered = pd.read_csv(unclustered_path)
     clusters    = _load_cluster_patch(patch_path, drop_empty_clusters=True)
 
-    # Normalize core fields (this is critical for matching)
+    # Normalize core fields
     if "m/z" in alignment.columns:
         alignment["m/z"] = alignment["m/z"].apply(_to_float)
     if "Isomer_position" in alignment.columns:
         alignment["Isomer_position"] = alignment["Isomer_position"].apply(_to_int)
-
     if "m/z" in unclustered.columns:
         unclustered["m/z"] = unclustered["m/z"].apply(_to_float)
     if "RT_apex" in unclustered.columns:
@@ -235,8 +197,6 @@ def recluster_group(group: str, config: type = Config) -> None:
         unclustered["area"] = pd.to_numeric(unclustered["area"], errors="coerce")
     if "peak_id" in unclustered.columns:
         unclustered["peak_id"] = unclustered["peak_id"].astype(str)
-
-    # Precompute sample name for each unclustered peak_id (avoid apply inside loop)
     if "peak_id" in unclustered.columns:
         unclustered["_sample"] = unclustered["peak_id"].apply(_sample_name_from_peak_id)
     else:
@@ -260,9 +220,7 @@ def recluster_group(group: str, config: type = Config) -> None:
         and "peak_id" in unclustered.columns
     )
 
-    # ── Iterate over every blank height cell in the alignment summary ─────────
     if has_unclustered:
-        # Speed: group unclustered by (mz, sample) once
         unclustered_grouped = {}
         for (mz_val, sample), grp in unclustered.groupby(["m/z", "_sample"], dropna=False):
             unclustered_grouped[(mz_val, sample)] = grp
@@ -314,7 +272,6 @@ def recluster_group(group: str, config: type = Config) -> None:
                 matched_peak_ids.add(peak_id)
                 peaks_used_count += 1
 
-                # ── Add PNG to the matching cluster in cluster_patch ───────────
                 png_name = _png_name_from_peak_id(peak_id)
                 # Normalize to actual filename in directory when possible
                 png_name = patch_index.get(png_name.lower(), png_name)
@@ -330,9 +287,7 @@ def recluster_group(group: str, config: type = Config) -> None:
 
                 if not found_cluster:
                     cluster_append_failures += 1
-                    # Keep going; we still reclustered into alignment.
 
-    # ── Recalculate peak count and (optionally) refine Aligned_rt_apex ─────────
     for row_idx, row in alignment.iterrows():
         if not bool(row.get("Recluster", False)):
             continue
@@ -342,7 +297,6 @@ def recluster_group(group: str, config: type = Config) -> None:
         if "peak count" in alignment.columns:
             alignment.at[row_idx, "peak count"] = int(new_count)
 
-        # Recompute aligned RT apex using pixel files (guarded, no silent failure)
         mz_val = _to_float(row.get("m/z"))
         aligned_rt = _to_float(row.get("Aligned_rt_apex"))
         if mz_val is None or aligned_rt is None:
@@ -382,20 +336,16 @@ def recluster_group(group: str, config: type = Config) -> None:
         if rt_values:
             alignment.at[row_idx, "Aligned_rt_apex"] = float(np.mean(rt_values))
 
-    # ── Still-unclustered peaks ───────────────────────────────────────────────
     if "peak_id" in unclustered.columns:
         still_unclustered = unclustered[~unclustered["peak_id"].isin(matched_peak_ids)].copy()
-        # Remove helper column
         if "_sample" in still_unclustered.columns:
             still_unclustered.drop(columns=["_sample"], inplace=True)
     else:
         still_unclustered = unclustered.copy()
 
-    # Ensure cluster peak counts are consistent
     for c in clusters:
         c["peak count"] = len(c.get("patches") or [])
 
-    # ── Build the Excel workbook ──────────────────────────────────────────────
     _write_excel(
         output_path   = output_path,
         alignment     = alignment,
@@ -415,9 +365,6 @@ def recluster_group(group: str, config: type = Config) -> None:
     if cluster_append_failures:
         print(f"  WARN: matched peaks not appended to any cluster: {cluster_append_failures}")
 
-
-# ── Excel writer ──────────────────────────────────────────────────────────────
-
 def _write_excel(
     output_path:  Path,
     alignment:    pd.DataFrame,
@@ -433,7 +380,6 @@ def _write_excel(
     normal_font = Font(name="Arial", bold=False)
     header_font = Font(name="Arial", bold=True)
 
-    # ── Sheet 1: reclustered summary ──────────────────────────────────────────
     ws1 = wb.active
     ws1.title = "Summary"
 
@@ -472,7 +418,6 @@ def _write_excel(
         max_len = max((len(str(c.value)) if c.value is not None else 0) for c in col_cells)
         ws1.column_dimensions[get_column_letter(col_cells[0].column)].width = min(max_len + 2, 40)
 
-    # ── Sheet 2: still-unclustered peaks ─────────────────────────────────────
     ws2 = wb.create_sheet(title="Unclustered")
 
     if not unclustered.empty:
@@ -499,7 +444,6 @@ def _write_excel(
     else:
         ws2.cell(row=1, column=1, value="No unclustered peaks remaining.")
 
-    # ── Sheet 3: cluster PNGs (transposed, Cluster N columns) ─────────────────
     ws3 = wb.create_sheet(title="Cluster PNGs")
 
     df_patch = _clusters_to_df(clusters)
@@ -536,9 +480,6 @@ def _write_excel(
 
     wb.save(output_path)
 
-
-# ── Pipeline interface ────────────────────────────────────────────────────────
-
 def process_file_recluster(dirs: dict, group_name: str) -> str:
     class _RuntimeConfig(Config):
         @classmethod
@@ -558,16 +499,12 @@ def process_file_recluster(dirs: dict, group_name: str) -> str:
     output_path = Path(dirs["clustering"]) / f"Group_Summary_{group_name}.xlsx"
     return f"Reclustering complete for {group_name}. Output: {output_path}"
 
-
 def run_group_checkpoint9(self, dirs: dict, group_name: str) -> None:
     start_time = time.time()
     msg = process_file_recluster(dirs, group_name)
     print(msg)
     elapsed = time.time() - start_time
     print(f"Checkpoint 9 (Post-clustering RT+mass recluster) completed in {elapsed:.2f} seconds!")
-
-
-# ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     import argparse
