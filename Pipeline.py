@@ -216,9 +216,9 @@ class Pipeline:
             self.run_group_checkpoint7(dirs, group_name)
             self.run_group_checkpoint8(dirs, group_name)
             self.run_group_checkpoint9(dirs, group_name)
-            #self.run_group_checkpoint10(dirs, group_name)
+            self.run_group_checkpoint10(dirs, group_name)
 
-        #self.run_final_checkpoint_excel()
+        self.run_final_checkpoint_excel()
 
         total_elapsed = time.time() - total_start
         print("\n")
