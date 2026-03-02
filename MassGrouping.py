@@ -8,16 +8,10 @@ from collections import defaultdict
 import multiprocessing
 from concurrent.futures import ProcessPoolExecutor
 
-# ---------------------------------------------------------------------------
-# Reproducibility (FULLY FIXED)
-# ---------------------------------------------------------------------------
 SEED = 12345
-RNG = random.Random(SEED)   # dedicated RNG: stable, isolated
-np.random.seed(SEED)        # only matters if NumPy RNG is used later
+RNG = random.Random(SEED)
+np.random.seed(SEED)
 
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
 BASE_DIR = Path.home() / "Desktop/maxiMiZe Tests"
 INPUT_SUBDIR = Path("maxiMiZe Files")
 OUTPUT_ROOT = Path("maxiMiZe Checkpoints")
@@ -27,10 +21,8 @@ NOISE_LEVEL = 5000.0
 MZ_TOLERANCE = 0.0005
 MIN_CONSEC_SCANS = 7
 MIN_SAMPLE_PRESENCE = 1
-# ---------------------------------------------------------------------------
-# Study Design
-# ---------------------------------------------------------------------------
-USE_STUDY_DESIGN = True
+
+USE_STUDY_DESIGN = False
 N_FILES_TO_PROCESS = 6
 TARGET_GROUP = "target"   # set to None if no target group
 
@@ -70,12 +62,8 @@ SAMPLE_GROUPS: Dict[str, List[str]] = {
     ],
 }
 
-# ---------------------------------------------------------------------------
-# Selection manifest (so "same files" always => same results)
-# ---------------------------------------------------------------------------
 REUSE_EXISTING_SELECTION = True  # if manifest exists, re-use it exactly
 SELECTION_MANIFEST_NAME = f"selected_files_seed_{SEED}.txt"
-
 
 def _manifest_path() -> Path:
     out_dir = BASE_DIR / OUTPUT_ROOT
@@ -90,22 +78,12 @@ def load_selection_manifest() -> List[str] | None:
         return lines if lines else None
     return None
 
-
 def save_selection_manifest(selected: List[str]) -> None:
     p = _manifest_path()
     p.write_text("\n".join(selected) + "\n")
 
 
-# ---------------------------------------------------------------------------
-# File selection (deterministic but still "random")
-# ---------------------------------------------------------------------------
-
 def select_files_with_study_design(n_files: int = N_FILES_TO_PROCESS) -> List[str]:
-    """
-    Deterministic given SEED.
-    IMPORTANT: We do NOT sort pools, to preserve your original list order semantics.
-    We DO sort group names to avoid dict-order accidents.
-    """
     selected: List[str] = []
     remaining_slots = n_files
 
@@ -147,14 +125,12 @@ def select_files_with_study_design(n_files: int = N_FILES_TO_PROCESS) -> List[st
 
     return selected
 
-
 def select_random_files(n_files: int = N_FILES_TO_PROCESS) -> List[str]:
     """Deterministic random selection from directory, given SEED."""
     all_files = sorted((BASE_DIR / INPUT_SUBDIR).glob("*.mzXML"))  # stable filesystem order
     if len(all_files) < n_files:
         raise ValueError(f"Not enough mzXML files. Found {len(all_files)}, need {n_files}")
     return [str(f) for f in RNG.sample(all_files, n_files)]
-
 
 def select_files() -> List[str]:
     """Top-level selector with manifest reuse."""
@@ -177,11 +153,6 @@ def select_files() -> List[str]:
 
     save_selection_manifest(selected)
     return selected
-
-
-# ---------------------------------------------------------------------------
-# Signal processing
-# ---------------------------------------------------------------------------
 
 def centroid_scan(scan_idx: int, mzs: np.ndarray, intensities: np.ndarray, noise_level: float) -> List[Tuple[int, float, float]]:
     if len(intensities) < 3:
@@ -209,7 +180,6 @@ def centroid_scan(scan_idx: int, mzs: np.ndarray, intensities: np.ndarray, noise
     peak_indices = np.where(peak_mask)[0]
     return [(scan_idx, float(mzs[i]), float(intensities[i])) for i in peak_indices]
 
-
 def longest_consecutive_run(scan_indices: Set[int]) -> int:
     if not scan_indices:
         return 0
@@ -219,7 +189,6 @@ def longest_consecutive_run(scan_indices: Set[int]) -> int:
     splits = np.concatenate(([0], run_starts, [len(scans)]))
     run_lengths = np.diff(splits)
     return int(run_lengths.max())
-
 
 class MassCluster:
     def __init__(self, scan_idx: int, mz: float, intensity: float):
@@ -245,7 +214,6 @@ class MassCluster:
         if intensity > self.max_intensity:
             self.max_intensity = intensity
             self.apex_scan_idx = scan_idx
-
 
 def find_mass_traces(
     centroids: List[Tuple[int, float, float]],
@@ -296,11 +264,6 @@ def find_mass_traces(
 
     return valid_clusters
 
-
-# ---------------------------------------------------------------------------
-# File processing
-# ---------------------------------------------------------------------------
-
 def process_file_centroids(file_path: str, noise_level: float) -> Tuple[List[Tuple[int, float, float]], Dict[int, float]]:
     centroids: List[Tuple[int, float, float]] = []
     retention_times: Dict[int, float] = {}
@@ -320,7 +283,6 @@ def process_file_centroids(file_path: str, noise_level: float) -> Tuple[List[Tup
 
     return centroids, retention_times
 
-
 def process_single_file(
     file_path: str,
     noise_level: float = NOISE_LEVEL,
@@ -336,7 +298,6 @@ def process_single_file(
     unique_masses = {feature['mz'] for feature in features}
     return file_path, unique_masses, features
 
-
 def process_files() -> List[Dict]:
     selected_files = select_files()
 
@@ -344,7 +305,6 @@ def process_files() -> List[Dict]:
     all_features: List[Dict] = []
 
     with ProcessPoolExecutor(max_workers=min(N_FILES_TO_PROCESS, multiprocessing.cpu_count())) as executor:
-        # Keep deterministic aggregation order: iterate in the same order we submitted
         futures = [executor.submit(process_single_file, f) for f in selected_files]
         for fut in futures:
             file_path, masses, features = fut.result()
@@ -359,8 +319,6 @@ def process_files() -> List[Dict]:
             mass_counts[float(mz)] += 1
 
     valid_masses = {mz for mz, count in mass_counts.items() if count >= MIN_SAMPLE_PRESENCE}
-
-    # Debug numbers (helps confirm you're back in the 4k–6k range)
     print(f"\nUnique masses across selected files (pre MIN_SAMPLE_PRESENCE): {len(mass_counts)}")
     print(f"Masses kept with MIN_SAMPLE_PRESENCE={MIN_SAMPLE_PRESENCE}: {len(valid_masses)}")
 
@@ -378,14 +336,8 @@ def process_files() -> List[Dict]:
 
     return sorted(unique_features.values(), key=lambda x: x['mz'])
 
-
-# ---------------------------------------------------------------------------
-# Grouping helpers
-# ---------------------------------------------------------------------------
-
 def is_same_mass(mz1: float, mz2: float, tolerance: float = 0.0005) -> bool:
     return abs(mz1 - mz2) <= tolerance
-
 
 def check_mass_compatibility(
     group: List[Dict],
@@ -415,7 +367,6 @@ def check_mass_compatibility(
             return False
 
     return True
-
 
 def find_groups(masses_df: pd.DataFrame, min_group_size: int = 3, max_group_size: int = 5) -> List[List[Dict]]:
     sorted_masses = masses_df.sort_values('intensity', ascending=False)
@@ -467,11 +418,6 @@ def build_mass_groups_from_files(
     max_group_size: int = 5,
     verbose: bool = False,
 ) -> Dict[str, List[float]]:
-    """
-    Pipeline-friendly entry point.
-    Returns {"Group1": [mz...], "Group2": [mz...], ...}
-    """
-
     masses_by_file: Dict[str, Set[float]] = {}
     all_features: List[Dict] = []
 
@@ -517,10 +463,6 @@ def build_mass_groups_from_files(
 
     return out
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-
 def main():
     features = process_files()
 
@@ -546,9 +488,6 @@ def main():
         print(f"RT end:    {df['rt_end'].min():.2f} - {df['rt_end'].max():.2f} min")
         print(f"Intensity: {df['intensity'].min():.0f} - {df['intensity'].max():.0f}")
 
-    # ------------------------------------------------------------------
-    # Mass grouping
-    # ------------------------------------------------------------------
     min_group_size = 3
     max_group_size = 5
 
@@ -610,7 +549,6 @@ def main():
 
     print(f"\nGrouping results appended to {output_file}")
     print(f"Selection manifest saved at: {_manifest_path()}")
-
 
 if __name__ == "__main__":
     main()

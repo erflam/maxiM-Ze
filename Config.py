@@ -4,27 +4,16 @@ import json
 
 
 class Config:
-    # ---------------------------------------------------------------------
-    # Base directories
-    # ---------------------------------------------------------------------
     BASE_DIR = Path.home() / "Desktop/maxiMiZe Tests"
     INPUT_SUBDIR = Path("maxiMiZe Files")
     OUTPUT_ROOT = Path("maxiMiZe Checkpoints")
     ANALYSIS_FOLDER = "maxiMZe Group 1-3 0302 Test 6 New Mass"
 
-    # ---------------------------------------------------------------------
-    # Mass grouping control knobs
-    # ---------------------------------------------------------------------
     USE_DYNAMIC_MASS_GROUPS = True          # MUST be True (fallback groups removed)
     MAX_GROUPS_TO_RUN = 3                  # None = all, N = first N groups
     REBUILD_MASS_GROUPS = False            # True = ignore cache and recompute
     GROUPING_VERBOSE = False               # True = print per-file processing during grouping
 
-    # ---------------------------------------------------------------------
-    # Parameters for MassGrouping.py
-    # (These are used ONLY when building groups; the pipeline uses MASS_TOLERANCE
-    # for EIC extraction later.)
-    # ---------------------------------------------------------------------
     GROUP_NOISE_LEVEL = 5000.0
     GROUP_MZ_TOLERANCE = 0.0005
     GROUP_MIN_CONSEC_SCANS = 7
@@ -32,26 +21,14 @@ class Config:
     GROUP_MIN_GROUP_SIZE = 3
     GROUP_MAX_GROUP_SIZE = 5
 
-    # ---------------------------------------------------------------------
-    # Export / cache filenames (saved under: BASE_DIR/OUTPUT_ROOT/ANALYSIS_FOLDER)
-    # ---------------------------------------------------------------------
     MASS_GROUPS_CACHE_NAME = "MassGroups_Cache.json"
     MASS_GROUPS_EXPORT_NAME = "MassGroups_Formatted.csv"
-
-    # ---------------------------------------------------------------------
-    # Runtime state
-    # ---------------------------------------------------------------------
     MASS_GROUPS: dict[str, list[float]] = {}   # populated by initialize_mass_groups() or cache
     MASS_LIST: list[float] = []               # active group's masses
     CURRENT_GROUP: str | None = None
-
-    # Pipeline analysis parameters (unchanged)
     MASS_TOLERANCE = 0.0005
     MAX_PEAK_DURATION = 1.5
 
-    # ---------------------------------------------------------------------
-    # Paths / helpers
-    # ---------------------------------------------------------------------
     @classmethod
     def _analysis_output_root(cls) -> Path:
         # User requested:
@@ -74,9 +51,6 @@ class Config:
         digits = "".join(ch for ch in name if ch.isdigit())
         return f"'Group {digits}':" if digits else f"'{name}':"
 
-    # ---------------------------------------------------------------------
-    # Cache load/save (multiprocessing-safe)
-    # ---------------------------------------------------------------------
     @classmethod
     def save_mass_groups_cache(cls) -> None:
         p = cls._mass_groups_cache_path()
@@ -108,9 +82,6 @@ class Config:
                 "before starting multiprocessing."
             )
 
-    # ---------------------------------------------------------------------
-    # Dynamic grouping initialization (uses MassGrouping.py's 6-file selection)
-    # ---------------------------------------------------------------------
     @classmethod
     def initialize_mass_groups(cls, _pipeline_file_paths_ignored: list[str] | None = None) -> None:
         """
@@ -141,7 +112,7 @@ class Config:
         # Build fresh (slow)
         from MassGrouping import select_files, build_mass_groups_from_files
 
-        grouping_files = select_files()  # <-- uses N_FILES_TO_PROCESS=6 and study design + manifest
+        grouping_files = select_files()
 
         cls.MASS_GROUPS = build_mass_groups_from_files(
             grouping_files,
@@ -174,9 +145,6 @@ class Config:
             return names
         return names[: int(cls.MAX_GROUPS_TO_RUN)]
 
-    # ---------------------------------------------------------------------
-    # Group selection + export
-    # ---------------------------------------------------------------------
     @classmethod
     def set_mass_group(cls, group_name: str) -> None:
         # Multiprocessing-safe: if a worker calls this first, it will load cache.
@@ -215,9 +183,6 @@ class Config:
 
         return out_path
 
-    # ---------------------------------------------------------------------
-    # Existing directory setup
-    # ---------------------------------------------------------------------
     @classmethod
     def setup_directories(cls):
         if cls.CURRENT_GROUP is None:
