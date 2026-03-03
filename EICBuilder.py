@@ -13,6 +13,8 @@ import colorsys
 
 REL_HEIGHT_BY_MASS = {104.1069: 0.985, 187.0964: 0.985, 119.0896: 0.98}
 DEFAULT_REL_HEIGHT = 0.99
+MIN_WINDOW_MINUTES = 6.0          # always show at least 6 minutes on x-axis
+X_PADDING_MINUTES = 0.10          # little padding on each side
 
 SHOULDER_MIN_HEIGHT_FRAC = 0.02
 SHOULDER_MIN_NOISE_MULT = 3.0
@@ -548,8 +550,43 @@ def analyze_ms_file_plotly(file_path, output_image_path, file_colors):
         print(f"[!] No peaks in {base}; skipping.")
         return []
 
+    # --- FORCE SAME X-AXIS SIZE (>= 6 minutes) FOR EVERY IMAGE ---
+    min_rt = float(np.min(rt_vals))  # earliest RT in the whole run
+    max_rt = float(np.max(rt_vals))  # latest RT in the whole run
+
+    # If you only plotted peaks, all_peak_rts can be a narrow zoom.
+    # We instead compute a fixed display window:
+    if all_peak_rts:
+        peaks_min = float(np.min(all_peak_rts))
+        peaks_max = float(np.max(all_peak_rts))
+    else:
+        peaks_min = min_rt
+        peaks_max = max_rt
+
+    # Center window around peaks, but enforce minimum width of 6 minutes
+    center = 0.5 * (peaks_min + peaks_max)
+    half_width = 0.5 * max(MIN_WINDOW_MINUTES, (peaks_max - peaks_min))
+
+    x0 = center - half_width - X_PADDING_MINUTES
+    x1 = center + half_width + X_PADDING_MINUTES
+
+    # Clamp to actual data range so we don't show nonsense beyond run boundaries
+    x0 = max(x0, min_rt)
+    x1 = min(x1, max_rt)
+
+    # If clamping made it smaller than 6 min, extend to the right or left when possible
+    if (x1 - x0) < MIN_WINDOW_MINUTES:
+        needed = MIN_WINDOW_MINUTES - (x1 - x0)
+        # try extend right
+        add_right = min(needed, max_rt - x1)
+        x1 += add_right
+        needed -= add_right
+        # then extend left
+        add_left = min(needed, x0 - min_rt)
+        x0 -= add_left
+
     fig.update_xaxes(
-        range=[min(all_peak_rts) - 0.1, max(all_peak_rts) + 0.1],
+        range=[x0, x1],
         showgrid=False, zeroline=False, showticklabels=False
     )
     fig.update_yaxes(
