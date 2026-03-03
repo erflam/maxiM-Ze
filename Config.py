@@ -2,16 +2,15 @@ from pathlib import Path
 import csv
 import json
 
-
 class Config:
     BASE_DIR = Path.home() / "Desktop/maxiMiZe Tests"
     INPUT_SUBDIR = Path("maxiMiZe Files")
     OUTPUT_ROOT = Path("maxiMiZe Checkpoints")
-    ANALYSIS_FOLDER = "maxiMZe Group 1-3 0302 Test 6 New Mass"
+    ANALYSIS_FOLDER = "maxiMZe Group 1-30 0303 Test 2"
 
-    USE_DYNAMIC_MASS_GROUPS = True          # MUST be True (fallback groups removed)
-    MAX_GROUPS_TO_RUN = 3                  # None = all, N = first N groups
-    REBUILD_MASS_GROUPS = False            # True = ignore cache and recompute
+    USE_DYNAMIC_MASS_GROUPS = True         # MUST be True (fallback groups removed)
+    MAX_GROUPS_TO_RUN = 30                 # None = all, N = first N groups
+    REBUILD_MASS_GROUPS = True            # True = ignore cache and recompute
     GROUPING_VERBOSE = False               # True = print per-file processing during grouping
 
     GROUP_NOISE_LEVEL = 5000.0
