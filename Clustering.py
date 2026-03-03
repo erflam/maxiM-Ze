@@ -133,6 +133,7 @@ class PeakClusterer:
 
     def run(self, group: str) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         patch_dir = self.dirs["patch"]
+        all_files_for_group = sorted({p.stem.split("_mass")[0] for p in patch_dir.glob(f"*_{group}.png")})
 
         all_peaks = self._load_all_peaks_for_group(patch_dir, group)
         all_patch_stems = {p.stem for p in patch_dir.glob(f"*_{group}.png")}
@@ -191,7 +192,7 @@ class PeakClusterer:
             df_align.sort_values(["group", "mass", "isomer_position", "file", "rt_apex"], inplace=True)
 
         df_unclustered = pd.DataFrame({"peak_id": sorted(all_patch_stems - accepted_peak_ids)})
-        df_summary = self._build_summary(df_align, group)
+        df_summary = self._build_summary(df_align, group, all_files=all_files_for_group)
         self._write_outputs(group, df_align, df_summary, df_unclustered)
         return df_align, df_summary, df_unclustered
 
@@ -437,7 +438,7 @@ class PeakClusterer:
             "patch_path": str(pk.patch_path),
         }
 
-    def _build_summary(self, df_align: pd.DataFrame, group: str) -> pd.DataFrame:
+    def _build_summary(self, df_align: pd.DataFrame, group: str, all_files: Optional[List[str]] = None) -> pd.DataFrame:
         if df_align.empty:
             return pd.DataFrame()
 
@@ -464,6 +465,9 @@ class PeakClusterer:
         idx = ["group", "mass", "isomer_position", "aligned_rt_apex", "component_number"]
         h = df_exp.pivot_table(index=idx, columns="file", values="height", aggfunc="first")
         a = df_exp.pivot_table(index=idx, columns="file", values="area", aggfunc="first")
+        if all_files:
+            h = h.reindex(columns=all_files)
+            a = a.reindex(columns=all_files)
         h.columns = [f"{c}_height" for c in h.columns]
         a.columns = [f"{c}_area" for c in a.columns]
 

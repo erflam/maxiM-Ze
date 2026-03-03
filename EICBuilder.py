@@ -181,7 +181,7 @@ def improved_peak_cutting(intensity_vals_smooth, rt_vals, peaks, width_results, 
 
     return peaks, width_results
 
-def analyze_ms_file_plotly(file_path, output_image_path, file_colors):
+def analyze_ms_file_plotly(file_path, output_image_path, file_colors, axis_meta_csv=None):
     """Analyze MS file and generate plotly visualization (no debugging)."""
 
     group_tag = Config.CURRENT_GROUP.replace(" ", "")
@@ -585,6 +585,16 @@ def analyze_ms_file_plotly(file_path, output_image_path, file_colors):
         add_left = min(needed, x0 - min_rt)
         x0 -= add_left
 
+    # --- SAVE AXIS METADATA (so resolving.py can map RT -> pixel correctly) ---
+    if axis_meta_csv is not None:
+        os.makedirs(os.path.dirname(axis_meta_csv), exist_ok=True)
+        pd.DataFrame([{
+            "x0": float(x0),
+            "x1": float(x1),
+            "png_width": 1600,
+            "png_height": 900,
+        }]).to_csv(axis_meta_csv, index=False)
+
     fig.update_xaxes(
         range=[x0, x1],
         showgrid=False, zeroline=False, showticklabels=False
@@ -639,7 +649,8 @@ def process_file_checkpoint2(fp, dirs, file_colors, group_name):
         if os.path.exists(png_path) and os.path.exists(peaks_csv):
             return f"[↷] {base} (png+peaks cached)"
 
-        peaks = analyze_ms_file_plotly(fp, png_path, file_colors)
+        axis_meta_csv = os.path.join(dirs['csv'], f"{base}_axis_{group_tag}.csv")
+        peaks = analyze_ms_file_plotly(fp, png_path, file_colors, axis_meta_csv=axis_meta_csv)
 
         if peaks:
             pd.DataFrame(peaks).to_csv(peaks_csv, index=False, float_format='%.3f')

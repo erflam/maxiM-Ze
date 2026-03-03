@@ -13,13 +13,14 @@ def _group_tag(group_name: str) -> str:
 def _paths_for_file(base: str, dirs: dict, group_name: str):
     tag = _group_tag(group_name)
 
-    # INPUTS (current naming)
     peaks_csv = os.path.join(dirs["csv"], f"{base}_peaks_{tag}.csv")
     png_path = os.path.join(dirs["png"], f"EIC_{base}_{tag}.png")
 
-    # OUTPUTS
+    # NEW: axis metadata produced by EIC builder
+    axis_meta_csv = os.path.join(dirs["csv"], f"{base}_axis_{tag}.csv")
+
     pixel_csv = os.path.join(dirs["pixel"], f"{base}_peaks_pix_{tag}.csv")
-    return peaks_csv, png_path, pixel_csv
+    return peaks_csv, png_path, axis_meta_csv, pixel_csv
 
 def process_file_checkpoint3(file_path: str, dirs: dict, group_name: str) -> str:
     """
@@ -33,7 +34,7 @@ def process_file_checkpoint3(file_path: str, dirs: dict, group_name: str) -> str
     Config.set_mass_group(group_name)
 
     base = os.path.splitext(os.path.basename(file_path))[0]
-    peaks_csv, png_path, pixel_csv = _paths_for_file(base, dirs, group_name)
+    peaks_csv, png_path, axis_meta_csv, pixel_csv = _paths_for_file(base, dirs, group_name)
 
     # Parameters
     MIN_RT_DIFF = 0.095
@@ -194,9 +195,20 @@ def process_file_checkpoint3(file_path: str, dirs: dict, group_name: str) -> str
     W, H = im.size
     A = np.array(im)[..., 3].astype(np.uint8)
 
-    rt_min = df["RT_start"].min() - 0.1
-    rt_max = df["RT_end"].max() + 0.1
+    axis_meta_csv = os.path.join(dirs["csv"], f"{base}_axis_{_group_tag(group_name)}.csv")
+
+    if os.path.exists(axis_meta_csv):
+        meta = pd.read_csv(axis_meta_csv).iloc[0]
+        rt_min = float(meta["x0"])
+        rt_max = float(meta["x1"])
+    else:
+        rt_min = df["RT_start"].min() - 0.1
+        rt_max = df["RT_end"].max() + 0.1
+
     rt_range = rt_max - rt_min
+    if rt_range <= 0:
+        return f"[!] {base} ({group_name}): invalid RT range for pixel mapping"
+
     width_factor = (W - 1) / rt_range
 
     def rt_to_px(x):

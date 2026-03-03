@@ -6,7 +6,7 @@ class Config:
     BASE_DIR = Path.home() / "Desktop/maxiMiZe Tests"
     INPUT_SUBDIR = Path("maxiMiZe Files")
     OUTPUT_ROOT = Path("maxiMiZe Checkpoints")
-    ANALYSIS_FOLDER = "maxiMZe Group 1-30 0303 Test 2"
+    ANALYSIS_FOLDER = "maxiMZe Group 1-30 0303 Test 4"
 
     USE_DYNAMIC_MASS_GROUPS = True         # MUST be True (fallback groups removed)
     MAX_GROUPS_TO_RUN = 30                 # None = all, N = first N groups
