@@ -222,10 +222,16 @@ class Pipeline:
         self.run_final_checkpoint_excel()
 
         total_elapsed = time.time() - total_start
+
+        # Convert to hours, minutes, seconds
+        hours = int(total_elapsed // 3600)
+        minutes = int((total_elapsed % 3600) // 60)
+        seconds = total_elapsed % 60
+
         print("\n")
         print("🐊" * 33)
         print("=" * 70)
-        print(f"ALL GROUPS COMPLETE in {total_elapsed:.2f} seconds")
+        print(f"ALL GROUPS COMPLETE in {hours:02d}:{minutes:02d}:{seconds:05.2f} (hh:mm:ss)")
         print("=" * 70)
         print("🐊" * 33)
         print("Go Gators! Go Garrett Lab!")
