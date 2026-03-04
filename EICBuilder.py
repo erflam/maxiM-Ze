@@ -22,6 +22,12 @@ SHOULDER_MIN_SEP_MIN = 0.06
 SHOULDER_VALLEY_DROP_FRAC = 0.85
 SHOULDER_LOCALMAX_ORDER = 2
 
+DEBUG_PEAK_FILTER = False
+
+EXPORT_DEBUG_CSV = False
+
+BYPASS_CACHE_WHEN_DEBUG = False
+
 def _dark_hex_palette(n: int):
     """Generate n distinct dark-ish hex colors."""
     if n <= 0:
@@ -34,6 +40,7 @@ def _dark_hex_palette(n: int):
         r, g, b = colorsys.hsv_to_rgb(h, s, v)
         colors.append(f"#{int(r*255):02x}{int(g*255):02x}{int(b*255):02x}")
     return colors
+
 
 def improved_peak_cutting(intensity_vals_smooth, rt_vals, peaks, width_results, specific_mass):
     MIN_APEX_SEP_MIN = 0.015
@@ -97,8 +104,12 @@ def improved_peak_cutting(intensity_vals_smooth, rt_vals, peaks, width_results, 
         valid_split = width_results_split[0] > 0
     except:
         valid_split = np.zeros(len(peaks), dtype=bool)
-        width_results_split = (np.zeros(len(peaks)), np.zeros(len(peaks)),
-                               np.zeros(len(peaks)), np.zeros(len(peaks)))
+        width_results_split = (
+            np.zeros(len(peaks)),
+            np.zeros(len(peaks)),
+            np.zeros(len(peaks)),
+            np.zeros(len(peaks)),
+        )
 
     new_peaks = []
 
@@ -181,14 +192,100 @@ def improved_peak_cutting(intensity_vals_smooth, rt_vals, peaks, width_results, 
 
     return peaks, width_results
 
+
+def looks_like_real_peak(y_raw_window: np.ndarray):
+    """
+    Returns:
+      (is_peak, frac_up, frac_down, apex, left_end, right_end)
+
+    This ALWAYS returns 6 values (so your CSV logging never breaks).
+    """
+    # Defaults for "can't judge"
+    nan = float("nan")
+
+    if y_raw_window is None:
+        return True, nan, nan, nan, nan, nan
+
+    if len(y_raw_window) < 7:
+        # too short to judge; don't filter
+        y = np.asarray(y_raw_window, dtype=float)
+        apex = float(np.max(y)) if len(y) else 0.0
+        left_end = float(y[0]) if len(y) else 0.0
+        right_end = float(y[-1]) if len(y) else 0.0
+        return True, nan, nan, apex, left_end, right_end
+
+    y = np.asarray(y_raw_window, dtype=float)
+    apex_i = int(np.argmax(y))
+    apex = float(y[apex_i])
+
+    left_end = float(y[0])
+    right_end = float(y[-1])
+
+    if apex <= 0:
+        return False, nan, nan, apex, left_end, right_end
+
+    left = y[:apex_i + 1]
+    right = y[apex_i:]
+
+    # Need points on both sides of apex
+    if len(left) < 3 or len(right) < 3:
+        return True, nan, nan, apex, left_end, right_end
+
+    # 1) Apex should be clearly higher than both ends (no baseline cutting needed)
+    MIN_RISE_FRAC = 0.25   # apex must be at least 25% above left end
+    MIN_FALL_FRAC = 0.25   # apex must be at least 25% above right end
+
+    if (apex - left_end) / apex < MIN_RISE_FRAC:
+        # Still return full tuple
+        return False, nan, nan, apex, left_end, right_end
+    if (apex - right_end) / apex < MIN_FALL_FRAC:
+        return False, nan, nan, apex, left_end, right_end
+
+    # 2) Mostly increasing before apex
+    left_diff = np.diff(left)
+    frac_up = float(np.mean(left_diff > 0)) if left_diff.size else 0.0
+
+    # 3) Mostly decreasing after apex
+    right_diff = np.diff(right)
+    frac_down = float(np.mean(right_diff < 0)) if right_diff.size else 0.0
+
+    if DEBUG_PEAK_FILTER:
+        print(
+            f"[PeakCheck] apex={apex:.2f} "
+            f"start={left_end:.2f} end={right_end:.2f} "
+            f"frac_up={frac_up:.2f} frac_down={frac_down:.2f}"
+        )
+
+    MIN_FRAC_UP = 0.7
+    MIN_FRAC_DOWN = 0.7
+
+    is_peak = True
+    if frac_up < MIN_FRAC_UP:
+        is_peak = False
+    if frac_down < MIN_FRAC_DOWN:
+        is_peak = False
+
+    return is_peak, frac_up, frac_down, apex, left_end, right_end
+
+
 def analyze_ms_file_plotly(file_path, output_image_path, file_colors, axis_meta_csv=None):
-    """Analyze MS file and generate plotly visualization (no debugging)."""
+    """Analyze MS file and generate plotly visualization."""
 
     group_tag = Config.CURRENT_GROUP.replace(" ", "")
 
-    if os.path.exists(output_image_path):
+    # --- CACHING ---
+    # If we are debugging or exporting debug CSV, caching can prevent debug from saving.
+    use_cache = True
+    if BYPASS_CACHE_WHEN_DEBUG and (DEBUG_PEAK_FILTER or EXPORT_DEBUG_CSV):
+        use_cache = False
+
+    if use_cache and os.path.exists(output_image_path):
         base = os.path.splitext(os.path.basename(file_path))[0]
-        peaks_csv = os.path.join(os.path.dirname(os.path.dirname(output_image_path)), 'csv', f"{base}_peaks_{group_tag}.csv")
+        peaks_csv = os.path.join(
+            os.path.dirname(os.path.dirname(output_image_path)),
+            'csv',
+            f"{base}_peaks_{group_tag}.csv"
+        )
         if os.path.exists(peaks_csv):
             try:
                 return pd.read_csv(peaks_csv).to_dict('records')
@@ -235,6 +332,7 @@ def analyze_ms_file_plotly(file_path, output_image_path, file_colors, axis_meta_
     mass_color_map = {mass_list[i]: mass_colors[i] for i in range(len(mass_list))}
 
     peaks_out = []
+    debug_rows = []
     all_peak_rts = []
 
     rt_vals = np.array(rt_values)
@@ -472,6 +570,27 @@ def analyze_ms_file_plotly(file_path, output_image_path, file_colors, axis_meta_
                 x_peak = rt_vals[left_idx:right_idx + 1]
                 y_peak = intensity_vals[left_idx:right_idx + 1]
 
+                is_peak, frac_up, frac_down, apex, left_end, right_end = looks_like_real_peak(y_peak)
+
+                # log every candidate peak window (pass or fail)
+                debug_rows.append({
+                    "File": base,
+                    "m/z": float(specific_mass),
+                    "scan_start": scan_numbers_arr[left_idx],
+                    "scan_end": scan_numbers_arr[right_idx],
+                    "RT_start": float(rt_vals[left_idx]),
+                    "RT_end": float(rt_vals[right_idx]),
+                    "apex_intensity": float(apex) if np.isfinite(apex) else np.nan,
+                    "start_intensity": float(left_end) if np.isfinite(left_end) else np.nan,
+                    "end_intensity": float(right_end) if np.isfinite(right_end) else np.nan,
+                    "frac_up": float(frac_up) if np.isfinite(frac_up) else np.nan,
+                    "frac_down": float(frac_down) if np.isfinite(frac_down) else np.nan,
+                    "passed_filter": bool(is_peak),
+                })
+
+                if not is_peak:
+                    continue
+
                 if len(y_peak) >= 12:
                     apex_idx_local = np.argmax(y_peak)
                     peak_height = y_peak[apex_idx_local]
@@ -491,7 +610,6 @@ def analyze_ms_file_plotly(file_path, output_image_path, file_colors, axis_meta_
                             if pre_y[crop_candidate_idx] < height_thresh_front:
                                 buffer = int(0.01 * len(pre_y))
                                 safe_idx = max(1, crop_candidate_idx - buffer)
-                                # Convert back from reversed index to forward index
                                 crop_front_idx = apex_idx_local - safe_idx
                                 if crop_front_idx > 0:
                                     x_peak = x_peak[crop_front_idx:]
@@ -548,14 +666,22 @@ def analyze_ms_file_plotly(file_path, output_image_path, file_colors, axis_meta_
 
     if not fig.data:
         print(f"[!] No peaks in {base}; skipping.")
+        # still write debug CSV if requested
+        if EXPORT_DEBUG_CSV:
+            debug_csv = os.path.join(
+                os.path.dirname(os.path.dirname(output_image_path)),
+                'csv',
+                f"{base}_peak_debug_{group_tag}.csv"
+            )
+            os.makedirs(os.path.dirname(debug_csv), exist_ok=True)
+            pd.DataFrame(debug_rows).to_csv(debug_csv, index=False)
+            print(f"[DEBUG] wrote {len(debug_rows)} rows to {debug_csv}")
         return []
 
     # --- FORCE SAME X-AXIS SIZE (>= 6 minutes) FOR EVERY IMAGE ---
-    min_rt = float(np.min(rt_vals))  # earliest RT in the whole run
-    max_rt = float(np.max(rt_vals))  # latest RT in the whole run
+    min_rt = float(np.min(rt_vals))
+    max_rt = float(np.max(rt_vals))
 
-    # If you only plotted peaks, all_peak_rts can be a narrow zoom.
-    # We instead compute a fixed display window:
     if all_peak_rts:
         peaks_min = float(np.min(all_peak_rts))
         peaks_max = float(np.max(all_peak_rts))
@@ -563,29 +689,24 @@ def analyze_ms_file_plotly(file_path, output_image_path, file_colors, axis_meta_
         peaks_min = min_rt
         peaks_max = max_rt
 
-    # Center window around peaks, but enforce minimum width of 6 minutes
     center = 0.5 * (peaks_min + peaks_max)
     half_width = 0.5 * max(MIN_WINDOW_MINUTES, (peaks_max - peaks_min))
 
     x0 = center - half_width - X_PADDING_MINUTES
     x1 = center + half_width + X_PADDING_MINUTES
 
-    # Clamp to actual data range so we don't show nonsense beyond run boundaries
     x0 = max(x0, min_rt)
     x1 = min(x1, max_rt)
 
-    # If clamping made it smaller than 6 min, extend to the right or left when possible
     if (x1 - x0) < MIN_WINDOW_MINUTES:
         needed = MIN_WINDOW_MINUTES - (x1 - x0)
-        # try extend right
         add_right = min(needed, max_rt - x1)
         x1 += add_right
         needed -= add_right
-        # then extend left
         add_left = min(needed, x0 - min_rt)
         x0 -= add_left
 
-    # --- SAVE AXIS METADATA (so resolving.py can map RT -> pixel correctly) ---
+    # --- SAVE AXIS METADATA ---
     if axis_meta_csv is not None:
         os.makedirs(os.path.dirname(axis_meta_csv), exist_ok=True)
         pd.DataFrame([{
@@ -595,13 +716,8 @@ def analyze_ms_file_plotly(file_path, output_image_path, file_colors, axis_meta_
             "png_height": 900,
         }]).to_csv(axis_meta_csv, index=False)
 
-    fig.update_xaxes(
-        range=[x0, x1],
-        showgrid=False, zeroline=False, showticklabels=False
-    )
-    fig.update_yaxes(
-        showgrid=False, zeroline=False, showticklabels=False
-    )
+    fig.update_xaxes(range=[x0, x1], showgrid=False, zeroline=False, showticklabels=False)
+    fig.update_yaxes(showgrid=False, zeroline=False, showticklabels=False)
     fig.update_layout(
         width=1600, height=900,
         margin=dict(l=0, r=0, t=0, b=0),
@@ -633,7 +749,19 @@ def analyze_ms_file_plotly(file_path, output_image_path, file_colors, axis_meta_
             df = df.drop_duplicates(subset=['m/z', 'RT_apex'], keep='first')
             peaks_out = df.to_dict('records')
 
+    # --- WRITE DEBUG CSV (same folder logic as peaks_csv) ---
+    if EXPORT_DEBUG_CSV:
+        debug_csv = os.path.join(
+            os.path.dirname(os.path.dirname(output_image_path)),
+            'csv',
+            f"{base}_peak_debug_{group_tag}.csv"
+        )
+        os.makedirs(os.path.dirname(debug_csv), exist_ok=True)
+        pd.DataFrame(debug_rows).to_csv(debug_csv, index=False)
+        print(f"[DEBUG] wrote {len(debug_rows)} rows to {debug_csv}")
+
     return peaks_out
+
 
 def process_file_checkpoint2(fp, dirs, file_colors, group_name):
     """Checkpoint 2: Build EIC PNG + peaks CSV (group-specific filename)."""
@@ -642,7 +770,6 @@ def process_file_checkpoint2(fp, dirs, file_colors, group_name):
         base = os.path.splitext(os.path.basename(fp))[0]
         group_tag = Config.CURRENT_GROUP.replace(" ", "")
 
-        group_tag = Config.CURRENT_GROUP.replace(" ", "")
         png_path = os.path.join(dirs['png'], f"EIC_{base}_{group_tag}.png")
         peaks_csv = os.path.join(dirs['csv'], f"{base}_peaks_{group_tag}.csv")
 

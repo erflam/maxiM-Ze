@@ -6,7 +6,7 @@ class Config:
     BASE_DIR = Path.home() / "Desktop/maxiMiZe Tests"
     INPUT_SUBDIR = Path("maxiMiZe Files")
     OUTPUT_ROOT = Path("maxiMiZe Checkpoints")
-    ANALYSIS_FOLDER = "maxiMZe Group 1-30 0303 Test 4"
+    ANALYSIS_FOLDER = "maxiMZe Group 1-30 0304 Test 1"
 
     USE_DYNAMIC_MASS_GROUPS = True         # MUST be True (fallback groups removed)
     MAX_GROUPS_TO_RUN = 30                 # None = all, N = first N groups
@@ -27,6 +27,9 @@ class Config:
     CURRENT_GROUP: str | None = None
     MASS_TOLERANCE = 0.0005
     MAX_PEAK_DURATION = 1.5
+
+    # Run specific masses only
+    RUN_ONLY_MASSES = None  # Set to None to run normal dynamic groups
 
     @classmethod
     def _analysis_output_root(cls) -> Path:
@@ -92,6 +95,18 @@ class Config:
         - MassGroups_Cache.json  (for multiprocessing workers)
         - MassGroups_Formatted.csv
         """
+
+        if cls.RUN_ONLY_MASSES is not None:
+            masses = [round(float(m), 4) for m in cls.RUN_ONLY_MASSES]
+
+            cls.MASS_GROUPS = {"Group1": masses}
+            cls.CURRENT_GROUP = "Group1"
+            cls.MASS_LIST = masses
+
+            cls.save_mass_groups_cache()
+            cls.save_mass_groups_formatted_csv()
+            return
+
         if not cls.USE_DYNAMIC_MASS_GROUPS:
             raise ValueError("USE_DYNAMIC_MASS_GROUPS=False but fallback MASS_GROUPS were removed.")
 
