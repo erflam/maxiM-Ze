@@ -27,7 +27,7 @@ N_FILES_TO_PROCESS = 6
 TARGET_GROUP = "target"   # set to None if no target group
 
 SAMPLE_GROUPS: Dict[str, List[str]] = {
-    "drug_treated": [
+    "Group 1": [
         "OE_EF_IsmailBaseline_POS_C072_0005.mzXML",
         "OE_EF_IsmailBaseline_POS_C072_0004.mzXML",
         "OE_EF_IsmailBaseline_POS_C072_0003.mzXML",
@@ -40,7 +40,7 @@ SAMPLE_GROUPS: Dict[str, List[str]] = {
         "OE_EF_IsmailBaseline_POS_C062_0002.mzXML",
         "OE_EF_IsmailBaseline_POS_C057_0001.mzXML",
     ],
-    "placebo": [
+    "Group 2": [
         "OE_EF_IsmailBaseline_POS_C048_0008.mzXML",
         "OE_EF_IsmailBaseline_POS_C048_0004.mzXML",
         "OE_EF_IsmailBaseline_POS_C047_0001.mzXML",
