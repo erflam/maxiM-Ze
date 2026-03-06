@@ -6,10 +6,10 @@ class Config:
     BASE_DIR = Path.home() / "Desktop/maxiMiZe Tests"
     INPUT_SUBDIR = Path("maxiMiZe Files")
     OUTPUT_ROOT = Path("maxiMiZe Checkpoints")
-    ANALYSIS_FOLDER = "maxiMZe Group 1-30 0304 Test 1"
+    ANALYSIS_FOLDER = "maxiMZe Group 1 0306 Test 2"
 
     USE_DYNAMIC_MASS_GROUPS = True         # MUST be True (fallback groups removed)
-    MAX_GROUPS_TO_RUN = 30                 # None = all, N = first N groups
+    MAX_GROUPS_TO_RUN = 1                # None = all, N = first N groups
     REBUILD_MASS_GROUPS = True            # True = ignore cache and recompute
     GROUPING_VERBOSE = False               # True = print per-file processing during grouping
 
@@ -30,6 +30,11 @@ class Config:
 
     # Run specific masses only
     RUN_ONLY_MASSES = None  # Set to None to run normal dynamic groups
+
+    # Library Matching
+    LIB_FILE = r"/Users/elizabethflammer/Desktop/Research/MZMine/POS OE Library Metformin Baseline.csv"
+    LIBRARY_MATCH_MZ_TOL = 0.0005
+    LIBRARY_MATCH_RT_TOL = 0.1
 
     @classmethod
     def _analysis_output_root(cls) -> Path:

@@ -2,6 +2,7 @@ import os
 import time
 import shutil
 from multiprocessing import Pool, cpu_count
+from pathlib import Path
 
 from Config import Config
 from FileUtils import FileUtils
@@ -16,6 +17,7 @@ from Clustering import process_file_cluster_peaks
 from Recluster import process_file_recluster
 from Visualization import process_visualizations
 from ExportExcel import process_export_excel
+from LibraryMatching import process_library_match
 
 def init_worker():
     import matplotlib
@@ -192,12 +194,20 @@ class Pipeline:
         elapsed = time.time() - start_time
         print(f"Checkpoint 10 (Visual QC composites) completed in {elapsed:.2f} seconds!")
 
-    def run_final_checkpoint_excel(self):
+    def run_final_checkpoint_excel(self) -> Path:
         start_time = time.time()
-        msg = process_export_excel(Config)  # uses Config.MASS_GROUPS and output paths
-        print(msg)
+        excel_path = process_export_excel(Config)
+        print(f"Excel export complete → {excel_path}")
         elapsed = time.time() - start_time
         print(f"Final Checkpoint (Excel export) completed in {elapsed:.2f} seconds!")
+        return excel_path
+
+    def run_final_checkpoint_library_match(self, excel_path):
+        start_time = time.time()
+        msg = process_library_match(Config, excel_path)
+        print(msg)
+        elapsed = time.time() - start_time
+        print(f"Final Checkpoint (Library Match) completed in {elapsed:.2f} seconds!")
 
     def run(self):
         total_start = time.time()
@@ -219,7 +229,8 @@ class Pipeline:
             self.run_group_checkpoint9(dirs, group_name)
             self.run_group_checkpoint10(dirs, group_name)
 
-        self.run_final_checkpoint_excel()
+        excel_path = self.run_final_checkpoint_excel()
+        self.run_final_checkpoint_library_match(excel_path)
 
         total_elapsed = time.time() - total_start
 

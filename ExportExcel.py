@@ -140,6 +140,6 @@ def export_all_group_summaries_to_excel(Config) -> Path:
     )
     return excel_path
 
-def process_export_excel(Config) -> str:
+def process_export_excel(Config) -> Path:
     excel_path = export_all_group_summaries_to_excel(Config)
-    return f"Excel export complete → {excel_path}"
+    return excel_path
