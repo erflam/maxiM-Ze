@@ -5,3 +5,7 @@ plotly
 Pillow
 scipy
 opencv-python
+pyteomics
+numba
+openpyxl
+customtkinter
