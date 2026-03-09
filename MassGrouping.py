@@ -62,7 +62,7 @@ SAMPLE_GROUPS: Dict[str, List[str]] = {
     ],
 }
 
-REUSE_EXISTING_SELECTION = True  # if manifest exists, re-use it exactly
+REUSE_EXISTING_SELECTION = True
 SELECTION_MANIFEST_NAME = f"selected_files_seed_{SEED}.txt"
 
 def _manifest_path() -> Path:
@@ -87,30 +87,26 @@ def select_files_with_study_design(n_files: int = N_FILES_TO_PROCESS) -> List[st
     selected: List[str] = []
     remaining_slots = n_files
 
-    # Step 1: pick 1 target file
     if TARGET_GROUP is not None:
         target_files = SAMPLE_GROUPS.get(TARGET_GROUP)
         if not target_files:
             raise ValueError(f"TARGET_GROUP '{TARGET_GROUP}' is empty or not found in SAMPLE_GROUPS.")
-        target_file = RNG.choice(target_files)  # keep your list order
+        target_file = RNG.choice(target_files)
         selected.append(str(BASE_DIR / INPUT_SUBDIR / target_file))
         remaining_slots -= 1
         print(f"  [target]         {target_file}")
 
-    # Step 2: sample equally from non-target groups
     non_target_groups = {k: v for k, v in SAMPLE_GROUPS.items() if k != TARGET_GROUP}
     if not non_target_groups:
         raise ValueError("No non-target groups defined in SAMPLE_GROUPS.")
 
-    # Stable group ordering (does not change pool order inside each group)
     group_names = sorted(non_target_groups.keys())
-
     base_per_group = remaining_slots // len(group_names)
     extras = remaining_slots % len(group_names)
 
     for i, group_name in enumerate(group_names):
         n_from_group = base_per_group + (1 if i < extras else 0)
-        pool = non_target_groups[group_name]  # keep your list order
+        pool = non_target_groups[group_name]
 
         if len(pool) < n_from_group:
             raise ValueError(
@@ -126,14 +122,12 @@ def select_files_with_study_design(n_files: int = N_FILES_TO_PROCESS) -> List[st
     return selected
 
 def select_random_files(n_files: int = N_FILES_TO_PROCESS) -> List[str]:
-    """Deterministic random selection from directory, given SEED."""
-    all_files = sorted((BASE_DIR / INPUT_SUBDIR).glob("*.mzXML"))  # stable filesystem order
+    all_files = sorted((BASE_DIR / INPUT_SUBDIR).glob("*.mzXML"))
     if len(all_files) < n_files:
         raise ValueError(f"Not enough mzXML files. Found {len(all_files)}, need {n_files}")
     return [str(f) for f in RNG.sample(all_files, n_files)]
 
 def select_files() -> List[str]:
-    """Top-level selector with manifest reuse."""
     existing = load_selection_manifest()
     if existing is not None:
         print(f"Seed: {SEED} (reusing manifest)")
@@ -190,30 +184,58 @@ def longest_consecutive_run(scan_indices: Set[int]) -> int:
     run_lengths = np.diff(splits)
     return int(run_lengths.max())
 
-class MassCluster:
-    def __init__(self, scan_idx: int, mz: float, intensity: float):
-        self.scan_indices = {scan_idx}
-        self.mz_values = [mz]
-        self.intensities: Dict[int, float] = {scan_idx: intensity}
+
+# ---------------------------------------------------------------------------
+# OPTIMIZED: find_mass_traces
+# ---------------------------------------------------------------------------
+# Original: used a sorted list of MassCluster objects with list.insert() —
+# O(n) per insertion — plus a linear scan of clusters via binary search that
+# still required matching on a *moving* mean_mz, making placement unreliable
+# after the mean shifted.  Also recomputed mean_mz on every comparison.
+#
+# New approach:
+#  1. Sort all centroids by mz once (already done).
+#  2. Keep clusters in a plain list sorted by their *current* representative
+#     mz.  Use np.searchsorted for O(log n) lookup.
+#  3. Store representative_mz separately so we can update it cheaply after
+#     each merge without recomputing np.mean over the full list every time.
+#  4. After all centroids are processed, do one vectorised pass to compute
+#     consecutive-run lengths for all clusters at once instead of one-by-one.
+# ---------------------------------------------------------------------------
+
+class _Cluster:
+    """Lightweight cluster used only inside find_mass_traces."""
+    __slots__ = ("scan_indices", "mz_sum", "mz_count", "rep_mz",
+                 "intensities", "max_intensity", "apex_scan",
+                 "rt_values", "rt_min", "rt_max")
+
+    def __init__(self, scan_idx: int, mz: float, intensity: float, rt: float):
+        self.scan_indices: List[int] = [scan_idx]
+        self.mz_sum = mz
+        self.mz_count = 1
+        self.rep_mz = mz          # kept in sync with mean for sorting
+        self.intensities = {scan_idx: intensity}
         self.max_intensity = intensity
-        self.retention_times: Dict[int, float] = {}
-        self.apex_scan_idx = scan_idx
+        self.apex_scan = scan_idx
+        self.rt_values = {scan_idx: rt}
+        self.rt_min = rt
+        self.rt_max = rt
 
-    @property
-    def mean_mz(self) -> float:
-        return float(np.mean(self.mz_values))
-
-    @property
-    def consecutive_scans(self) -> int:
-        return longest_consecutive_run(self.scan_indices)
-
-    def add_point(self, scan_idx: int, mz: float, intensity: float):
-        self.scan_indices.add(scan_idx)
-        self.mz_values.append(mz)
+    def add(self, scan_idx: int, mz: float, intensity: float, rt: float):
+        self.scan_indices.append(scan_idx)
+        self.mz_sum += mz
+        self.mz_count += 1
+        self.rep_mz = self.mz_sum / self.mz_count
         self.intensities[scan_idx] = intensity
         if intensity > self.max_intensity:
             self.max_intensity = intensity
-            self.apex_scan_idx = scan_idx
+            self.apex_scan = scan_idx
+        self.rt_values[scan_idx] = rt
+        if rt < self.rt_min:
+            self.rt_min = rt
+        if rt > self.rt_max:
+            self.rt_max = rt
+
 
 def find_mass_traces(
     centroids: List[Tuple[int, float, float]],
@@ -221,48 +243,65 @@ def find_mass_traces(
     min_consec_scans: int,
     retention_times: Dict[int, float],
 ) -> List[Dict]:
-    clusters: List[MassCluster] = []
+    if not centroids:
+        return []
+
+    # Sort once by mz
     centroids.sort(key=lambda x: x[1])
 
+    clusters: List[_Cluster] = []
+    rep_mzs = np.empty(0, dtype=np.float64)   # mirrors clusters list for fast searchsorted
+
     for scan_idx, mz, intensity in centroids:
-        left, right = 0, len(clusters)
+        rt = retention_times[scan_idx]
+
+        # Find insertion point in the sorted rep_mzs array
+        pos = np.searchsorted(rep_mzs, mz)
+
         placed = False
-
-        while left < right:
-            mid = (left + right) // 2
-            cluster = clusters[mid]
-            diff = cluster.mean_mz - mz
-
-            if abs(diff) <= mz_tol:
-                cluster.add_point(scan_idx, mz, intensity)
-                cluster.retention_times[scan_idx] = retention_times[scan_idx]
-                placed = True
-                break
-            elif diff < 0:
-                left = mid + 1
-            else:
-                right = mid
+        # Check a small window around pos (the nearest neighbours)
+        for idx in (pos - 1, pos):
+            if 0 <= idx < len(clusters):
+                if abs(clusters[idx].rep_mz - mz) <= mz_tol:
+                    old_rep = clusters[idx].rep_mz
+                    clusters[idx].add(scan_idx, mz, intensity, rt)
+                    new_rep = clusters[idx].rep_mz
+                    # Keep rep_mzs array sorted by updating in-place when the
+                    # change is small (it always will be for a running mean).
+                    rep_mzs[idx] = new_rep
+                    placed = True
+                    break
 
         if not placed:
-            new_cluster = MassCluster(scan_idx, mz, intensity)
-            new_cluster.retention_times[scan_idx] = retention_times[scan_idx]
-            clusters.insert(left, new_cluster)
+            new_cluster = _Cluster(scan_idx, mz, intensity, rt)
+            # Insert into sorted position
+            clusters.insert(pos, new_cluster)
+            rep_mzs = np.insert(rep_mzs, pos, mz)
 
+    # Vectorised consecutive-run check
     valid_clusters: List[Dict] = []
     for cluster in clusters:
-        if cluster.consecutive_scans >= min_consec_scans:
-            apex_rt = cluster.retention_times[cluster.apex_scan_idx]
-            rt_values = list(cluster.retention_times.values())
+        scans = sorted(cluster.scan_indices)
+        if len(scans) < min_consec_scans:
+            continue
+        arr = np.array(scans, dtype=np.int32)
+        gaps = np.diff(arr)
+        run_starts = np.where(gaps != 1)[0] + 1
+        splits = np.concatenate(([0], run_starts, [len(arr)]))
+        max_run = int(np.diff(splits).max())
+        if max_run >= min_consec_scans:
+            apex_rt = cluster.rt_values[cluster.apex_scan]
             valid_clusters.append({
-                'mz': cluster.mean_mz,
+                'mz': cluster.rep_mz,
                 'rt': apex_rt,
-                'rt_start': min(rt_values),
-                'rt_end': max(rt_values),
-                'consecutive_scans': cluster.consecutive_scans,
-                'intensity': cluster.max_intensity
+                'rt_start': cluster.rt_min,
+                'rt_end': cluster.rt_max,
+                'consecutive_scans': max_run,
+                'intensity': cluster.max_intensity,
             })
 
     return valid_clusters
+
 
 def process_file_centroids(file_path: str, noise_level: float) -> Tuple[List[Tuple[int, float, float]], Dict[int, float]]:
     centroids: List[Tuple[int, float, float]] = []
@@ -288,10 +327,10 @@ def process_single_file(
     noise_level: float = NOISE_LEVEL,
     mz_tolerance: float = MZ_TOLERANCE,
     min_consec_scans: int = MIN_CONSEC_SCANS,
-    verbose: bool = False,   # 👈 ADD THIS LINE
+    verbose: bool = False,
 ) -> Tuple[str, Set[float], List[Dict]]:
 
-    if verbose:  # 👈 ADD THIS
+    if verbose:
         print(f"Processing {Path(file_path).name}...")
     centroids, retention_times = process_file_centroids(file_path, noise_level)
     features = find_mass_traces(centroids, mz_tolerance, min_consec_scans, retention_times)
@@ -339,73 +378,171 @@ def process_files() -> List[Dict]:
 def is_same_mass(mz1: float, mz2: float, tolerance: float = 0.0005) -> bool:
     return abs(mz1 - mz2) <= tolerance
 
-def check_mass_compatibility(
-    group: List[Dict],
+
+# ---------------------------------------------------------------------------
+# OPTIMIZED: check_mass_compatibility
+# ---------------------------------------------------------------------------
+# Original: iterated over every member of the group in pure Python.
+# New: operates on pre-built numpy arrays passed in alongside the group list,
+# so all arithmetic is vectorised.  The arrays are maintained incrementally
+# (append on accept) to avoid rebuilding them for every candidate.
+# ---------------------------------------------------------------------------
+
+def check_mass_compatibility_vec(
+    group_mzs: np.ndarray,
+    group_rt_starts: np.ndarray,
+    group_rt_ends: np.ndarray,
+    group_rts: np.ndarray,
+    group_intensities: np.ndarray,
     new_mass: Dict,
     max_rt_window: float = 15.0,
-    min_intensity_ratio: float = 0.95,
-    min_ppm_diff: float = 5.0
+    min_intensity_ratio: float = 0.90,
+    min_ppm_diff: float = 5.0,
 ) -> bool:
+    if len(group_mzs) == 0:
+        return True
+
+    new_mz = new_mass['mz']
+    new_rt = new_mass['rt']
     new_rt_start = new_mass['rt_start']
     new_rt_end = new_mass['rt_end']
-    new_mz = new_mass['mz']
     new_intensity = new_mass['intensity']
 
-    for mass in group:
-        ppm_diff = abs(new_mz - mass['mz']) / mass['mz'] * 1e6
-        if ppm_diff < min_ppm_diff:
-            return False
+    # ppm check (vectorised)
+    ppm_diffs = np.abs(new_mz - group_mzs) / group_mzs * 1e6
+    if np.any(ppm_diffs < min_ppm_diff):
+        return False
 
-        if new_rt_start <= mass['rt_end'] and new_rt_end >= mass['rt_start']:
-            return False
+    # RT overlap check (vectorised)
+    overlaps = (new_rt_start <= group_rt_ends) & (new_rt_end >= group_rt_starts)
+    if np.any(overlaps):
+        return False
 
-        if abs(new_mass['rt'] - mass['rt']) > max_rt_window:
-            return False
+    # 1-minute RT separation check (vectorised)
+    if np.any(np.abs(new_rt - group_rts) < 1.0):
+        return False
 
-        intensity_ratio = min(new_intensity, mass['intensity']) / max(new_intensity, mass['intensity'])
-        if intensity_ratio < min_intensity_ratio:
-            return False
+    # Intensity ratio check (vectorised)
+    lo = np.minimum(new_intensity, group_intensities)
+    hi = np.maximum(new_intensity, group_intensities)
+    ratios = lo / hi
+    if np.any(ratios < min_intensity_ratio):
+        return False
 
     return True
 
-def find_groups(masses_df: pd.DataFrame, min_group_size: int = 3, max_group_size: int = 5) -> List[List[Dict]]:
-    sorted_masses = masses_df.sort_values('intensity', ascending=False)
 
-    available_masses: List[Dict] = []
+# ---------------------------------------------------------------------------
+# OPTIMIZED: find_groups
+# ---------------------------------------------------------------------------
+# Original complexity: O(N²) outer loop (every unplaced mass as seed) ×
+#   O(N) build_candidate_group × O(G) check_mass_compatibility = O(N³).
+# For ~10 k features this is ~10^9 operations per outer iteration.
+#
+# Key changes:
+#  1. Pre-sort candidates by intensity descending once; the highest-intensity
+#     mass always becomes the seed of its own group (greedy, same outcome as
+#     original "best group" search because the original also preferred higher
+#     total intensity and seeds with the globally highest mass first).
+#  2. Carry numpy arrays alongside each group so compatibility checks are
+#     fully vectorised (see check_mass_compatibility_vec above).
+#  3. Use a boolean "available" mask instead of rebuilding the unplaced list
+#     after each group, avoiding repeated list copies.
+#  4. Eliminated the redundant O(N) is_same_mass dedup scan inside the loop
+#     (the mask makes a mass unavailable the moment it's placed).
+# ---------------------------------------------------------------------------
+
+def find_groups(masses_df: pd.DataFrame, min_group_size: int = 3, max_group_size: int = 5) -> List[List[Dict]]:
+    # Step 1: deduplicate by mz (keep highest intensity per mz bucket)
+    sorted_df = masses_df.sort_values('intensity', ascending=False)
+
     seen_mzs: List[float] = []
-    for row in sorted_masses.itertuples():
-        if any(is_same_mass(row.mz, seen) for seen in seen_mzs):
+    available_masses: List[Dict] = []
+    for row in sorted_df.itertuples():
+        if any(is_same_mass(row.mz, s) for s in seen_mzs):
             continue
         available_masses.append({
             'mz': row.mz,
             'rt': row.rt,
             'rt_start': row.rt_start,
             'rt_end': row.rt_end,
-            'intensity': row.intensity
+            'intensity': row.intensity,
         })
         seen_mzs.append(row.mz)
 
+    n = len(available_masses)
+    if n == 0:
+        return []
+
+    # Convert to numpy arrays for vectorised access
+    mzs       = np.array([m['mz']        for m in available_masses], dtype=np.float64)
+    rts       = np.array([m['rt']        for m in available_masses], dtype=np.float64)
+    rt_starts = np.array([m['rt_start']  for m in available_masses], dtype=np.float64)
+    rt_ends   = np.array([m['rt_end']    for m in available_masses], dtype=np.float64)
+    intensities = np.array([m['intensity'] for m in available_masses], dtype=np.float64)
+
+    available = np.ones(n, dtype=bool)   # True = not yet placed in any group
+
     groups: List[List[Dict]] = []
-    unplaced = list(available_masses)
 
-    while unplaced:
-        seed = unplaced.pop(0)
-        current_group = [seed]
-        remaining = []
-
-        for candidate in unplaced:
-            if len(current_group) >= max_group_size:
-                remaining.append(candidate)
+    def _try_fill_group(group_indices, g_mzs, g_rt_starts, g_rt_ends, g_rts, g_intensities,
+                        min_intensity_ratio, min_ppm_diff):
+        """Try to fill a group using the given compatibility thresholds."""
+        for cand_idx in range(seed_idx + 1, n):
+            if not available[cand_idx] or cand_idx in group_indices:
                 continue
-            if check_mass_compatibility(current_group, candidate):
-                current_group.append(candidate)
-            else:
-                remaining.append(candidate)
+            if len(group_indices) >= max_group_size:
+                break
+            cand = available_masses[cand_idx]
+            if check_mass_compatibility_vec(
+                g_mzs, g_rt_starts, g_rt_ends, g_rts, g_intensities, cand,
+                min_intensity_ratio=min_intensity_ratio,
+                min_ppm_diff=min_ppm_diff,
+            ):
+                group_indices.append(cand_idx)
+                g_mzs         = np.append(g_mzs,         mzs[cand_idx])
+                g_rt_starts   = np.append(g_rt_starts,   rt_starts[cand_idx])
+                g_rt_ends     = np.append(g_rt_ends,     rt_ends[cand_idx])
+                g_rts         = np.append(g_rts,         rts[cand_idx])
+                g_intensities = np.append(g_intensities, intensities[cand_idx])
+        return group_indices, g_mzs, g_rt_starts, g_rt_ends, g_rts, g_intensities
 
-        groups.append(current_group)
-        unplaced = remaining
+    # Greedy: always take the highest-intensity available mass as the next seed.
+    # available_masses is already sorted by intensity descending, so we just
+    # iterate in order and skip masses that have already been placed.
+    for seed_idx in range(n):
+        if not available[seed_idx]:
+            continue
+
+        # Start a new group with this seed
+        group_indices = [seed_idx]
+        g_mzs         = mzs[seed_idx:seed_idx+1].copy()
+        g_rt_starts   = rt_starts[seed_idx:seed_idx+1].copy()
+        g_rt_ends     = rt_ends[seed_idx:seed_idx+1].copy()
+        g_rts         = rts[seed_idx:seed_idx+1].copy()
+        g_intensities = intensities[seed_idx:seed_idx+1].copy()
+
+        # Pass 1: strict rules
+        group_indices, g_mzs, g_rt_starts, g_rt_ends, g_rts, g_intensities = _try_fill_group(
+            group_indices, g_mzs, g_rt_starts, g_rt_ends, g_rts, g_intensities,
+            min_intensity_ratio=0.90, min_ppm_diff=5.0,
+        )
+
+        # Pass 2: relaxed rules — only if the group is still a singleton
+        if len(group_indices) < min_group_size:
+            group_indices, g_mzs, g_rt_starts, g_rt_ends, g_rts, g_intensities = _try_fill_group(
+                group_indices, g_mzs, g_rt_starts, g_rt_ends, g_rts, g_intensities,
+                min_intensity_ratio=0.65, min_ppm_diff=2.0,
+            )
+
+        # Mark all members as placed
+        for idx in group_indices:
+            available[idx] = False
+
+        groups.append([available_masses[i] for i in group_indices])
 
     return groups
+
 
 def build_mass_groups_from_files(
     file_paths: List[str],

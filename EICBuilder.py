@@ -23,10 +23,9 @@ SHOULDER_VALLEY_DROP_FRAC = 0.85
 SHOULDER_LOCALMAX_ORDER = 2
 
 DEBUG_PEAK_FILTER = False
-
 EXPORT_DEBUG_CSV = False
-
 BYPASS_CACHE_WHEN_DEBUG = False
+
 
 def _dark_hex_palette(n: int):
     """Generate n distinct dark-ish hex colors."""
@@ -102,7 +101,7 @@ def improved_peak_cutting(intensity_vals_smooth, rt_vals, peaks, width_results, 
     try:
         width_results_split = peak_widths(intensity_vals_smooth, peaks, rel_height=rel_height_split)
         valid_split = width_results_split[0] > 0
-    except:
+    except Exception:
         valid_split = np.zeros(len(peaks), dtype=bool)
         width_results_split = (
             np.zeros(len(peaks)),
@@ -200,14 +199,12 @@ def looks_like_real_peak(y_raw_window: np.ndarray):
 
     This ALWAYS returns 6 values (so your CSV logging never breaks).
     """
-    # Defaults for "can't judge"
     nan = float("nan")
 
     if y_raw_window is None:
         return True, nan, nan, nan, nan, nan
 
     if len(y_raw_window) < 7:
-        # too short to judge; don't filter
         y = np.asarray(y_raw_window, dtype=float)
         apex = float(np.max(y)) if len(y) else 0.0
         left_end = float(y[0]) if len(y) else 0.0
@@ -227,25 +224,20 @@ def looks_like_real_peak(y_raw_window: np.ndarray):
     left = y[:apex_i + 1]
     right = y[apex_i:]
 
-    # Need points on both sides of apex
     if len(left) < 3 or len(right) < 3:
         return True, nan, nan, apex, left_end, right_end
 
-    # 1) Apex should be clearly higher than both ends (no baseline cutting needed)
-    MIN_RISE_FRAC = 0.25   # apex must be at least 25% above left end
-    MIN_FALL_FRAC = 0.25   # apex must be at least 25% above right end
+    MIN_RISE_FRAC = 0.25
+    MIN_FALL_FRAC = 0.25
 
     if (apex - left_end) / apex < MIN_RISE_FRAC:
-        # Still return full tuple
         return False, nan, nan, apex, left_end, right_end
     if (apex - right_end) / apex < MIN_FALL_FRAC:
         return False, nan, nan, apex, left_end, right_end
 
-    # 2) Mostly increasing before apex
     left_diff = np.diff(left)
     frac_up = float(np.mean(left_diff > 0)) if left_diff.size else 0.0
 
-    # 3) Mostly decreasing after apex
     right_diff = np.diff(right)
     frac_down = float(np.mean(right_diff < 0)) if right_diff.size else 0.0
 
@@ -274,7 +266,6 @@ def analyze_ms_file_plotly(file_path, output_image_path, file_colors, axis_meta_
     group_tag = Config.CURRENT_GROUP.replace(" ", "")
 
     # --- CACHING ---
-    # If we are debugging or exporting debug CSV, caching can prevent debug from saving.
     use_cache = True
     if BYPASS_CACHE_WHEN_DEBUG and (DEBUG_PEAK_FILTER or EXPORT_DEBUG_CSV):
         use_cache = False
@@ -289,7 +280,7 @@ def analyze_ms_file_plotly(file_path, output_image_path, file_colors, axis_meta_
         if os.path.exists(peaks_csv):
             try:
                 return pd.read_csv(peaks_csv).to_dict('records')
-            except:
+            except Exception:
                 pass
 
     analyzer = MSFileAnalyzer(file_path)
@@ -327,7 +318,7 @@ def analyze_ms_file_plotly(file_path, output_image_path, file_colors, axis_meta_
 
     fig = go.Figure()
 
-    # One dark color per mass
+    # Keep different color for each mass
     mass_colors = _dark_hex_palette(len(mass_list))
     mass_color_map = {mass_list[i]: mass_colors[i] for i in range(len(mass_list))}
 
@@ -339,8 +330,8 @@ def analyze_ms_file_plotly(file_path, output_image_path, file_colors, axis_meta_
     scan_numbers_arr = np.array(scan_numbers, dtype=object)
 
     def split_shoulders_in_window(
-            rt_vals, scan_numbers_arr, intensity_raw, intensity_smooth,
-            left_idx, right_idx, noise_level, mass_str, base_name
+        rt_vals, scan_numbers_arr, intensity_raw, intensity_smooth,
+        left_idx, right_idx, noise_level, mass_str, base_name
     ):
         x_win = rt_vals[left_idx:right_idx + 1]
         y_raw_win = intensity_raw[left_idx:right_idx + 1]
@@ -503,7 +494,7 @@ def analyze_ms_file_plotly(file_path, output_image_path, file_colors, axis_meta_
         if window_length >= 3:
             try:
                 intensity_vals_smooth = savgol_filter(intensity_vals, window_length=window_length, polyorder=2)
-            except:
+            except Exception:
                 intensity_vals_smooth = intensity_vals
         else:
             intensity_vals_smooth = intensity_vals
@@ -570,9 +561,9 @@ def analyze_ms_file_plotly(file_path, output_image_path, file_colors, axis_meta_
                 x_peak = rt_vals[left_idx:right_idx + 1]
                 y_peak = intensity_vals[left_idx:right_idx + 1]
 
+                # Keep debug logging, but do NOT reject here.
                 is_peak, frac_up, frac_down, apex, left_end, right_end = looks_like_real_peak(y_peak)
 
-                # log every candidate peak window (pass or fail)
                 debug_rows.append({
                     "File": base,
                     "m/z": float(specific_mass),
@@ -588,37 +579,12 @@ def analyze_ms_file_plotly(file_path, output_image_path, file_colors, axis_meta_
                     "passed_filter": bool(is_peak),
                 })
 
-                if not is_peak:
-                    continue
-
+                # IMPORTANT:
+                # - no front crop
+                # - no looks_like_real_peak rejection
+                # - keep only the older tail crop behavior
                 if len(y_peak) >= 12:
                     apex_idx_local = np.argmax(y_peak)
-                    peak_height = y_peak[apex_idx_local]
-
-                    # --- FRONTING DETECTION (mirrored tailing logic) ---
-                    pre_y = y_peak[:apex_idx_local + 1][::-1]  # reverse so we walk away from apex
-                    slope_front = np.abs(np.diff(pre_y))
-
-                    slope_thresh_front = 0.006 * peak_height
-                    height_thresh_front = 0.025 * peak_height
-                    stable_len = 2
-
-                    for j in range(len(slope_front) - stable_len):
-                        window = slope_front[j:j + stable_len]
-                        if np.all(window < slope_thresh_front):
-                            crop_candidate_idx = j + 1
-                            if pre_y[crop_candidate_idx] < height_thresh_front:
-                                buffer = int(0.01 * len(pre_y))
-                                safe_idx = max(1, crop_candidate_idx - buffer)
-                                crop_front_idx = apex_idx_local - safe_idx
-                                if crop_front_idx > 0:
-                                    x_peak = x_peak[crop_front_idx:]
-                                    y_peak = y_peak[crop_front_idx:]
-                                    left_idx = left_idx + crop_front_idx
-                                break
-
-                    # --- EXISTING TAILING CROP (unchanged) ---
-                    apex_idx_local = np.argmax(y_peak)  # recalculate after possible front crop
                     peak_height = y_peak[apex_idx_local]
                     post_y = y_peak[apex_idx_local + 1:]
                     slope = np.abs(np.diff(post_y))
@@ -666,7 +632,6 @@ def analyze_ms_file_plotly(file_path, output_image_path, file_colors, axis_meta_
 
     if not fig.data:
         print(f"[!] No peaks in {base}; skipping.")
-        # still write debug CSV if requested
         if EXPORT_DEBUG_CSV:
             debug_csv = os.path.join(
                 os.path.dirname(os.path.dirname(output_image_path)),
@@ -749,7 +714,6 @@ def analyze_ms_file_plotly(file_path, output_image_path, file_colors, axis_meta_
             df = df.drop_duplicates(subset=['m/z', 'RT_apex'], keep='first')
             peaks_out = df.to_dict('records')
 
-    # --- WRITE DEBUG CSV (same folder logic as peaks_csv) ---
     if EXPORT_DEBUG_CSV:
         debug_csv = os.path.join(
             os.path.dirname(os.path.dirname(output_image_path)),
