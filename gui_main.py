@@ -49,6 +49,9 @@ class MainWindow(ctk.CTk):
         self.target_files = []
         self.use_target = False
 
+        # Mass groups JSON import
+        self.import_json_path = None      # path string or None
+
         self._group_frames = []
         self._target_frame_data = None
 
@@ -162,24 +165,78 @@ class MainWindow(ctk.CTk):
                      text="Leave blank to run all groups. Enter a number (e.g. 30) to limit for testing.",
                      text_color="gray", font=ctk.CTkFont(size=11)).pack(anchor="w", padx=20, pady=(0, 15))
 
-        # ── 2. Output Folder ──────────────────────────────────────────
+        # ── 2. Output Folder + Run Name ───────────────────────────────
         output_frame = ctk.CTkFrame(page, fg_color="#FFFFFF", border_width=1, border_color="#FFFFFF")
         output_frame.pack(fill="x", pady=(0, 15))
 
-        ctk.CTkLabel(output_frame, text="2. Output Folder",
+        ctk.CTkLabel(output_frame, text="2. Output Folder & Run Name",
                      font=ctk.CTkFont(size=18, weight="bold"), text_color="#0B1F3B").pack(pady=(15, 10), anchor="w", padx=20)
 
         ctk.CTkButton(output_frame, text="Select Output Folder",
                       command=self.select_output_folder, height=40).pack(fill="x", padx=20, pady=5)
 
         self.output_status = ctk.CTkLabel(output_frame, text="No folder selected", text_color="#555")
-        self.output_status.pack(pady=(5, 15), padx=20, anchor="w")
+        self.output_status.pack(pady=(5, 8), padx=20, anchor="w")
 
-        # ── 3. Compound Library ───────────────────────────────────────
+        # Run name field
+        run_name_row = ctk.CTkFrame(output_frame, fg_color="transparent")
+        run_name_row.pack(fill="x", padx=20, pady=(0, 5))
+        ctk.CTkLabel(run_name_row, text="Run Name:", text_color="#0B1F3B",
+                     font=ctk.CTkFont(weight="bold")).pack(side="left")
+        self.run_name_var = ctk.StringVar(value="")
+        self.run_name_entry = ctk.CTkEntry(
+            run_name_row,
+            textvariable=self.run_name_var,
+            placeholder_text="e.g.  MyStudy_POS_Run1",
+            width=340,
+        )
+        self.run_name_entry.pack(side="left", padx=(12, 0))
+
+        ctk.CTkLabel(output_frame,
+                     text="A subfolder with this name will be created inside your output folder.",
+                     text_color="gray", font=ctk.CTkFont(size=11)).pack(anchor="w", padx=20, pady=(0, 15))
+
+        # ── 3. Mass Groups JSON (optional import) ─────────────────────
+        json_frame = ctk.CTkFrame(page, fg_color="#FFFFFF", border_width=1, border_color="#FFFFFF")
+        json_frame.pack(fill="x", pady=(0, 15))
+
+        ctk.CTkLabel(json_frame, text="3. Mass Groups (Detection)",
+                     font=ctk.CTkFont(size=18, weight="bold"), text_color="#0B1F3B").pack(pady=(15, 5), anchor="w", padx=20)
+
+        # Default: fresh detection every run
+        self.import_json_var = ctk.BooleanVar(value=False)
+        self._json_check = ctk.CTkCheckBox(
+            json_frame,
+            text="Import previous MassGroups_Cache.json from same sample set\n"
+                 "(skips re-detection — use when re-running with identical samples)",
+            variable=self.import_json_var,
+            command=self._on_json_toggle,
+            text_color="#0B1F3B",
+        )
+        self._json_check.pack(anchor="w", padx=20, pady=(0, 8))
+
+        # JSON import row — hidden until checkbox ticked
+        self._json_import_row = ctk.CTkFrame(json_frame, fg_color="transparent")
+        self._json_btn = ctk.CTkButton(
+            self._json_import_row, text="Select MassGroups_Cache.json",
+            command=self.select_mass_groups_json, height=36,
+        )
+        self._json_btn.pack(side="left", padx=(0, 12))
+        self._json_status = ctk.CTkLabel(self._json_import_row, text="No file selected", text_color="#555")
+        self._json_status.pack(side="left")
+
+        self._json_default_label = ctk.CTkLabel(
+            json_frame,
+            text="Default: mass groups will be freshly detected from your input files each run.",
+            text_color="gray", font=ctk.CTkFont(size=11),
+        )
+        self._json_default_label.pack(anchor="w", padx=20, pady=(0, 15))
+
+        # ── 4. Compound Library ───────────────────────────────────────
         library_frame = ctk.CTkFrame(page, fg_color="#FFFFFF", border_width=1, border_color="#FFFFFF")
         library_frame.pack(fill="x", pady=(0, 15))
 
-        ctk.CTkLabel(library_frame, text="3. Compound Library Import",
+        ctk.CTkLabel(library_frame, text="4. Compound Library Import",
                      font=ctk.CTkFont(size=18, weight="bold"), text_color="#0B1F3B").pack(pady=(15, 5), anchor="w", padx=20)
 
         ctk.CTkLabel(library_frame, text="CSV and XLSX accepted (optional)",
@@ -379,6 +436,17 @@ class MainWindow(ctk.CTk):
         else:
             self._target_slot_frame.pack_forget()
 
+    def _on_json_toggle(self):
+        """Show or hide the JSON file picker based on the checkbox state."""
+        if self.import_json_var.get():
+            self._json_default_label.pack_forget()
+            self._json_import_row.pack(anchor="w", padx=20, pady=(0, 8))
+            self._json_default_label.pack(anchor="w", padx=20, pady=(0, 15))
+        else:
+            self._json_import_row.pack_forget()
+            self.import_json_path = None
+            self._json_status.configure(text="No file selected")
+
     def _collect_study_groups(self) -> dict:
         out = {}
         for gd in self._group_frames:
@@ -408,6 +476,20 @@ class MainWindow(ctk.CTk):
             self.library_file = file
             self.library_status.configure(text=f"Library: {Path(file).name}")
             print(f"Library file: {file}")
+
+    def select_mass_groups_json(self):
+        """Let the user pick a MassGroups_Cache.json from a previous run."""
+        file = filedialog.askopenfilename(
+            title="Select MassGroups_Cache.json from previous run",
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
+        )
+        if file:
+            self.import_json_path = file
+            self._json_status.configure(
+                text=f"{Path(file).name}  ({Path(file).parent.name})",
+                text_color="#2BB673",
+            )
+            print(f"Mass groups JSON: {file}")
 
     # ------------------------------------------------------------------
     # About page
@@ -463,9 +545,33 @@ class MainWindow(ctk.CTk):
             raw = self.max_groups_var.get().strip()
             Config.MAX_GROUPS_TO_RUN = int(raw) if raw.isdigit() else None
 
+            # Custom run name — fall back to a sensible default if blank
+            run_name = self.run_name_var.get().strip()
+            if not run_name:
+                from datetime import datetime
+                run_name = "maxiMZe_Run_" + datetime.now().strftime("%Y%m%d_%H%M")
+            Config.ANALYSIS_FOLDER = run_name
+
+            # Mass groups: fresh detection by default; import JSON if requested
+            if self.import_json_var.get() and self.import_json_path:
+                Config.REBUILD_MASS_GROUPS = False   # we are supplying groups externally
+                Config._imported_json_path = self.import_json_path
+            else:
+                Config.REBUILD_MASS_GROUPS = True
+                Config._imported_json_path = None
+
     def run_analysis(self):
         if not self.output_folder:
             messagebox.showwarning("Missing Output", "Please select an output folder")
+            return
+
+        # Validate JSON import if checkbox is ticked
+        if self.import_json_var.get() and not self.import_json_path:
+            messagebox.showwarning(
+                "Missing JSON",
+                "You checked 'Import previous MassGroups_Cache.json' but haven't selected a file.\n"
+                "Please select a JSON file or uncheck the option to detect groups fresh.",
+            )
             return
 
         if self.use_study_design:
@@ -519,19 +625,26 @@ class MainWindow(ctk.CTk):
                 print("=" * 70)
                 print("Starting maxiM-Ze Analysis Pipeline")
                 print("=" * 70)
-                print(f"Study design: {'enabled' if self.use_study_design else 'disabled (random)'}")
-                print(f"Input files:  {len(self.input_files)}")
+                print(f"Run name:      {Config.ANALYSIS_FOLDER}")
+                print(f"Study design:  {'enabled' if self.use_study_design else 'disabled (random)'}")
+                print(f"Input files:   {len(self.input_files)}")
                 print(f"Output folder: {self.output_folder}")
                 raw = self.max_groups_var.get().strip()
                 print(f"Max groups to run: {int(raw) if raw.isdigit() else 'all'}")
+                if self.import_json_var.get() and self.import_json_path:
+                    print(f"Mass groups:   imported from {self.import_json_path}")
+                else:
+                    print("Mass groups:   freshly detected from input files")
                 if self.library_file:
-                    print(f"Library file: {self.library_file}")
+                    print(f"Library file:  {self.library_file}")
                 if self.use_study_design:
                     for gname, gfiles in self.study_groups.items():
                         print(f"  [{gname}]: {len(gfiles)} file(s)")
                 print("=" * 70)
 
-                pipeline = Pipeline()
+                # Pass import_json_path into initialize_mass_groups
+                imported_json = getattr(Config, "_imported_json_path", None)
+                pipeline = Pipeline(import_json_path=imported_json)
                 pipeline.run()
 
                 FileUtils.get_file_paths = original_get_file_paths
