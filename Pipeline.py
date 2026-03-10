@@ -19,12 +19,23 @@ from Visualization import process_visualizations
 from ExportExcel import process_export_excel
 from LibraryMatching import process_library_match
 
-def init_worker():
+
+def init_worker(analysis_folder, base_dir):
+    """Worker initializer — restores the runtime Config values so that
+    ensure_mass_groups_loaded() finds the cache at the correct path.
+    Spawned workers re-import Config from disk and get hardcoded defaults,
+    so we must set ANALYSIS_FOLDER and BASE_DIR explicitly here."""
     import matplotlib
     matplotlib.use('Agg')
     import os
     os.environ['KALEIDO_DISABLE'] = '1'
     os.environ['PLOTLY_RENDERER'] = 'json'
+    from Config import Config
+    from pathlib import Path
+    Config.ANALYSIS_FOLDER = analysis_folder
+    Config.BASE_DIR = Path(base_dir)
+    Config.ensure_mass_groups_loaded()
+
 
 class Pipeline:
     def __init__(self):
@@ -35,6 +46,14 @@ class Pipeline:
             os.path.splitext(os.path.basename(fp))[0]: FileUtils.random_dark_hex_color()
             for fp in self.file_paths
         }
+
+    def _pool(self):
+        """Return a Pool with the worker initializer pre-loaded with runtime Config values."""
+        return Pool(
+            processes=max(1, cpu_count() - 1),
+            initializer=init_worker,
+            initargs=(Config.ANALYSIS_FOLDER, str(Config.BASE_DIR)),
+        )
 
     def _delete_group_outputs(self, group_name):
         Config.set_mass_group(group_name)
@@ -72,7 +91,7 @@ class Pipeline:
         start_time = time.time()
         args = [(fp, dirs, group_name) for fp in files_to_process]
 
-        with Pool(processes=max(1, cpu_count() - 1), initializer=init_worker) as pool:
+        with self._pool() as pool:
             results = pool.starmap(process_file_checkpoint1, args)
 
         for r in results:
@@ -90,7 +109,7 @@ class Pipeline:
         start_time = time.time()
         args = [(fp, dirs, self.file_colors, group_name) for fp in files_to_process]
 
-        with Pool(processes=max(1, cpu_count() - 1), initializer=init_worker) as pool:
+        with self._pool() as pool:
             results = pool.starmap(process_file_checkpoint2, args)
 
         for r in results:
@@ -108,13 +127,12 @@ class Pipeline:
         start_time = time.time()
         args = [(fp, dirs, group_name) for fp in files_to_process]
 
-        with Pool(processes=max(1, cpu_count() - 1), initializer=init_worker) as pool:
+        with self._pool() as pool:
             results = pool.starmap(process_file_checkpoint3, args)
 
         for r in results:
             print(r)
 
-        # Summary after resolving
         print(count_peaks_per_file_summary(dirs, group_name))
 
         elapsed = time.time() - start_time
@@ -122,7 +140,7 @@ class Pipeline:
 
     def run_group_checkpoint4(self, dirs, group_name):
         png_dir = dirs['png']
-        group_tag = str(group_name).replace(" ", "")  # "Group 1" -> "Group1"
+        group_tag = str(group_name).replace(" ", "")
 
         pngs = [
             os.path.join(png_dir, f)
@@ -143,7 +161,7 @@ class Pipeline:
         start_time = time.time()
         args = [(png, dirs, group_name) for png in pngs]
 
-        with Pool(processes=max(1, cpu_count() - 1), initializer=init_worker) as pool:
+        with self._pool() as pool:
             results = pool.starmap(process_file_checkpoint4, args)
 
         for r in results:
@@ -173,11 +191,11 @@ class Pipeline:
         print(f"Checkpoint 7 (Coelution valley reslicing) completed in {elapsed:.2f} seconds!")
 
     def run_group_checkpoint8(self, dirs, group_name):
-         start_time = time.time()
-         msg = process_file_cluster_peaks(dirs, group_name)
-         print(msg)
-         elapsed = time.time() - start_time
-         print(f"Checkpoint 8 (Peak clustering/alignment) completed in {elapsed:.2f} seconds!")
+        start_time = time.time()
+        msg = process_file_cluster_peaks(dirs, group_name)
+        print(msg)
+        elapsed = time.time() - start_time
+        print(f"Checkpoint 8 (Peak clustering/alignment) completed in {elapsed:.2f} seconds!")
 
     def run_group_checkpoint9(self, dirs: dict, group_name: str) -> None:
         start_time = time.time()
@@ -188,8 +206,8 @@ class Pipeline:
 
     def run_group_checkpoint10(self, dirs, group_name):
         start_time = time.time()
-        self.dirs = dirs  # required for Visualization.py
-        msg = process_visualizations(self, group_name)  # <-- FIXED
+        self.dirs = dirs
+        msg = process_visualizations(self, group_name)
         print(msg)
         elapsed = time.time() - start_time
         print(f"Checkpoint 10 (Visual QC composites) completed in {elapsed:.2f} seconds!")
@@ -234,7 +252,6 @@ class Pipeline:
 
         total_elapsed = time.time() - total_start
 
-        # Convert to hours, minutes, seconds
         hours = int(total_elapsed // 3600)
         minutes = int((total_elapsed % 3600) // 60)
         seconds = total_elapsed % 60
@@ -247,10 +264,9 @@ class Pipeline:
         print("🐊" * 33)
         print("Go Gators! Go Garrett Lab!")
 
+
 if __name__ == "__main__":
     import multiprocessing
     multiprocessing.set_start_method("spawn", force=True)
     pipeline = Pipeline()
-    # Use clean_run() for profiling to delete all previous outputs
-    # Use run() for normal execution that skips existing files
     pipeline.clean_run()

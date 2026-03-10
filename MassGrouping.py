@@ -79,7 +79,8 @@ def _manifest_path() -> Path:
     cfg = _get_config()
     base = getattr(cfg, "BASE_DIR", BASE_DIR) if cfg else BASE_DIR
     root = getattr(cfg, "OUTPUT_ROOT", OUTPUT_ROOT) if cfg else OUTPUT_ROOT
-    out_dir = base / root
+    folder = getattr(cfg, "ANALYSIS_FOLDER", "") if cfg else ""
+    out_dir = base / root / folder if folder else base / root
     out_dir.mkdir(parents=True, exist_ok=True)
     return out_dir / SELECTION_MANIFEST_NAME
 
