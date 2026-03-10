@@ -6,7 +6,11 @@ class Config:
     BASE_DIR = Path.home() / "Desktop/maxiMiZe Tests"
     INPUT_SUBDIR = Path("maxiMiZe Files")
     OUTPUT_ROOT = Path("")
-    ANALYSIS_FOLDER = "maxiMZe Group 1-30 0309 Test 1"
+
+    # ── Run name ──────────────────────────────────────────────────────
+    # Set by the GUI via Config.ANALYSIS_FOLDER = <user input>.
+    # Defaults to an empty string so the output root is BASE_DIR/OUTPUT_ROOT.
+    ANALYSIS_FOLDER = "maxiMZe Run"
 
     USE_DYNAMIC_MASS_GROUPS = True         # MUST be True (fallback groups removed)
     MAX_GROUPS_TO_RUN = 30                # None = all, N = first N groups
@@ -29,7 +33,7 @@ class Config:
     MAX_PEAK_DURATION = 1.5
 
     # Run specific masses only
-    RUN_ONLY_MASSES = None #[247.1540] or set to None to run normal dynamic groups
+    RUN_ONLY_MASSES = None  # [247.1540] or set to None to run normal dynamic groups
 
     # Library Matching
     LIB_FILE = r"/Users/elizabethflammer/Desktop/Research/MZMine/POS OE Library Metformin Baseline.csv"
@@ -38,8 +42,6 @@ class Config:
 
     @classmethod
     def _analysis_output_root(cls) -> Path:
-        # User requested:
-        # output_root = Path(Config.BASE_DIR) / Path(Config.OUTPUT_ROOT) / Config.ANALYSIS_FOLDER
         return Path(cls.BASE_DIR) / Path(cls.OUTPUT_ROOT) / cls.ANALYSIS_FOLDER
 
     @classmethod
@@ -58,14 +60,38 @@ class Config:
         digits = "".join(ch for ch in name if ch.isdigit())
         return f"'Group {digits}':" if digits else f"'{name}':"
 
+    # ── Environment variable used to pass cache path to spawned workers ──
+    _CACHE_PATH_ENV = "MAXIMIZE_CACHE_PATH"
+
     @classmethod
     def save_mass_groups_cache(cls) -> None:
+        """
+        Write MASS_GROUPS to disk and record the path in an env var so that
+        spawned worker processes (which re-import Config with class defaults)
+        can still locate the correct file.
+        """
+        import os
         p = cls._mass_groups_cache_path()
         p.write_text(json.dumps(cls.MASS_GROUPS, indent=2), encoding="utf-8")
+        # Publish the absolute path so workers inherit it via os.environ
+        os.environ[cls._CACHE_PATH_ENV] = str(p)
+        print(f"[Config] Mass groups cache saved → {p}")
+
+    @classmethod
+    def _resolve_cache_path(cls) -> Path:
+        """
+        Return the cache path to use.  Workers get it from the env var written
+        by the main process; the main process derives it from class variables.
+        """
+        import os
+        env_path = os.environ.get(cls._CACHE_PATH_ENV)
+        if env_path:
+            return Path(env_path)
+        return cls._mass_groups_cache_path()
 
     @classmethod
     def load_mass_groups_cache(cls) -> bool:
-        p = cls._mass_groups_cache_path()
+        p = cls._resolve_cache_path()
         if not p.exists():
             return False
         data = json.loads(p.read_text(encoding="utf-8"))
@@ -73,41 +99,79 @@ class Config:
         return True
 
     @classmethod
+    def load_mass_groups_from_json(cls, json_path: str | Path) -> bool:
+        """
+        Load MASS_GROUPS from an *external* JSON file supplied by the user
+        (e.g. a cache from a previous run on the same sample set).
+        Returns True on success.
+        """
+        p = Path(json_path)
+        if not p.exists():
+            return False
+        data = json.loads(p.read_text(encoding="utf-8"))
+        cls.MASS_GROUPS = {k: [float(x) for x in v] for k, v in data.items()}
+        # Write to current run's cache location and register the path in env
+        cls.save_mass_groups_cache()
+        return True
+
+    @classmethod
     def ensure_mass_groups_loaded(cls) -> None:
         """
         Used by multiprocessing workers.
-        Workers won't inherit runtime-modified class variables from the parent
-        (spawn), so they must load MASS_GROUPS from disk.
+        Spawned workers re-import Config from scratch, so class variables set
+        at runtime in the parent process are lost.  We locate the cache via
+        the MAXIMIZE_CACHE_PATH env var, which is inherited by child processes.
         """
         if cls.MASS_GROUPS:
             return
         if not cls.load_mass_groups_cache():
+            cache_path = cls._resolve_cache_path()
             raise RuntimeError(
                 "MASS_GROUPS not initialized in this process and cache not found.\n"
-                f"Expected cache at: {cls._mass_groups_cache_path()}\n"
+                f"Expected cache at: {cache_path}\n"
                 "Fix: make sure the main process calls Config.initialize_mass_groups(...) "
                 "before starting multiprocessing."
             )
 
     @classmethod
-    def initialize_mass_groups(cls, _pipeline_file_paths_ignored: list[str] | None = None) -> None:
+    def initialize_mass_groups(
+        cls,
+        _pipeline_file_paths_ignored: list[str] | None = None,
+        *,
+        import_json_path: str | Path | None = None,
+    ) -> None:
         """
-        Builds MASS_GROUPS using what is defined in MassGrouping.py:
-        - select_files() (study design + manifest) -> typically 6 files
-        - build_mass_groups_from_files() -> groups
+        Builds or loads MASS_GROUPS, then writes the cache so workers can find it.
 
-        Also writes:
-        - MassGroups_Cache.json  (for multiprocessing workers)
-        - MassGroups_Formatted.csv
+        Parameters
+        ----------
+        import_json_path
+            If provided (and the file exists), load groups from this JSON and skip
+            detection entirely.  This is the "import previous JSON" option from the GUI.
         """
 
+        # ── Option 0: caller supplied a previous JSON cache ───────────
+        if import_json_path is not None:
+            p = Path(import_json_path)
+            if not p.exists():
+                raise FileNotFoundError(
+                    f"Imported JSON cache not found: {p}\n"
+                    "Make sure you selected the correct MassGroups_Cache.json file."
+                )
+            print(f"[Config] Loading mass groups from imported JSON: {p}")
+            if not cls.load_mass_groups_from_json(p):
+                raise ValueError(f"Failed to parse mass groups from: {p}")
+            first_group = sorted(cls.MASS_GROUPS.keys(), key=cls._group_sort_key)[0]
+            cls.set_mass_group(first_group)
+            cls.save_mass_groups_formatted_csv()
+            return
+
+        # ── Option 1: run-specific masses override everything ─────────
         if cls.RUN_ONLY_MASSES is not None:
             masses = [round(float(m), 4) for m in cls.RUN_ONLY_MASSES]
-
             cls.MASS_GROUPS = {"Group1": masses}
             cls.CURRENT_GROUP = "Group1"
             cls.MASS_LIST = masses
-
             cls.save_mass_groups_cache()
             cls.save_mass_groups_formatted_csv()
             return
@@ -115,22 +179,23 @@ class Config:
         if not cls.USE_DYNAMIC_MASS_GROUPS:
             raise ValueError("USE_DYNAMIC_MASS_GROUPS=False but fallback MASS_GROUPS were removed.")
 
-        # If we already have groups in memory and we're not rebuilding, keep them.
+        # ── Option 2: already in memory and not forcing rebuild ────────
         if cls.MASS_GROUPS and not cls.REBUILD_MASS_GROUPS:
+            cls.save_mass_groups_cache()          # ensure workers can find it
             cls.save_mass_groups_formatted_csv()
             return
 
-        # Try cache first (fast)
+        # ── Option 3: load from this run's own cache ───────────────────
         if not cls.REBUILD_MASS_GROUPS and cls.load_mass_groups_cache():
-            # set default current group
             first_group = sorted(cls.MASS_GROUPS.keys(), key=cls._group_sort_key)[0]
             cls.set_mass_group(first_group)
             cls.save_mass_groups_formatted_csv()
             return
 
-        # Build fresh (slow)
+        # ── Option 4: build fresh (slow path) ─────────────────────────
         from MassGrouping import select_files, build_mass_groups_from_files
 
+        print("[Config] Detecting mass groups fresh (this may take a few minutes)...")
         grouping_files = select_files()
 
         cls.MASS_GROUPS = build_mass_groups_from_files(
@@ -141,18 +206,16 @@ class Config:
             min_sample_presence=cls.GROUP_MIN_SAMPLE_PRESENCE,
             min_group_size=cls.GROUP_MIN_GROUP_SIZE,
             max_group_size=cls.GROUP_MAX_GROUP_SIZE,
-            # If you add verbose support to MassGrouping.build_mass_groups_from_files, it will use this:
             verbose=getattr(cls, "GROUPING_VERBOSE", False),
         )
 
         if not cls.MASS_GROUPS:
             raise ValueError("Dynamic mass grouping produced 0 groups.")
 
-        # Set default current group
         first_group = sorted(cls.MASS_GROUPS.keys(), key=cls._group_sort_key)[0]
         cls.set_mass_group(first_group)
 
-        # Persist for multiprocessing workers + export CSV
+        # CRITICAL: write cache BEFORE any multiprocessing workers are spawned
         cls.save_mass_groups_cache()
         cls.save_mass_groups_formatted_csv()
 
@@ -166,9 +229,7 @@ class Config:
 
     @classmethod
     def set_mass_group(cls, group_name: str) -> None:
-        # Multiprocessing-safe: if a worker calls this first, it will load cache.
         cls.ensure_mass_groups_loaded()
-
         if group_name not in cls.MASS_GROUPS:
             available = sorted(cls.MASS_GROUPS.keys(), key=cls._group_sort_key)
             raise ValueError(

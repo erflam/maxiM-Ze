@@ -27,10 +27,26 @@ def init_worker():
     os.environ['PLOTLY_RENDERER'] = 'json'
 
 class Pipeline:
-    def __init__(self):
+    def __init__(self, import_json_path: str | Path | None = None):
+        """
+        Parameters
+        ----------
+        import_json_path
+            If provided, mass groups are loaded from this JSON file instead of
+            being detected fresh from the input files.  Pass None (default) to
+            always detect groups fresh.
+        """
         self.config = Config()
         self.file_paths = FileUtils.get_file_paths()
-        Config.initialize_mass_groups(self.file_paths)
+
+        # initialize_mass_groups MUST finish (and write the cache) before any
+        # multiprocessing Pool is created, so workers can call
+        # Config.ensure_mass_groups_loaded() successfully.
+        Config.initialize_mass_groups(
+            self.file_paths,
+            import_json_path=import_json_path,
+        )
+
         self.file_colors = {
             os.path.splitext(os.path.basename(fp))[0]: FileUtils.random_dark_hex_color()
             for fp in self.file_paths
@@ -189,7 +205,7 @@ class Pipeline:
     def run_group_checkpoint10(self, dirs, group_name):
         start_time = time.time()
         self.dirs = dirs  # required for Visualization.py
-        msg = process_visualizations(self, group_name)  # <-- FIXED
+        msg = process_visualizations(self, group_name)
         print(msg)
         elapsed = time.time() - start_time
         print(f"Checkpoint 10 (Visual QC composites) completed in {elapsed:.2f} seconds!")
@@ -234,7 +250,6 @@ class Pipeline:
 
         total_elapsed = time.time() - total_start
 
-        # Convert to hours, minutes, seconds
         hours = int(total_elapsed // 3600)
         minutes = int((total_elapsed % 3600) // 60)
         seconds = total_elapsed % 60
@@ -251,6 +266,4 @@ if __name__ == "__main__":
     import multiprocessing
     multiprocessing.set_start_method("spawn", force=True)
     pipeline = Pipeline()
-    # Use clean_run() for profiling to delete all previous outputs
-    # Use run() for normal execution that skips existing files
     pipeline.clean_run()
