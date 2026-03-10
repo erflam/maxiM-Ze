@@ -378,11 +378,27 @@ def process_file_centroids(file_path: str, noise_level: float) -> Tuple[List[Tup
 
 def process_single_file(
     file_path: str,
-    noise_level: float = NOISE_LEVEL,
-    mz_tolerance: float = MZ_TOLERANCE,
-    min_consec_scans: int = MIN_CONSEC_SCANS,
+    noise_level: float = None,
+    mz_tolerance: float = None,
+    min_consec_scans: int = None,
     verbose: bool = False,
 ) -> Tuple[str, Set[float], List[Dict]]:
+    # Always resolve from Config so the GUI-set values are used in workers
+    try:
+        from Config import Config
+        if noise_level is None:
+            noise_level = Config.GROUP_NOISE_LEVEL
+        if mz_tolerance is None:
+            mz_tolerance = Config.GROUP_MZ_TOLERANCE
+        if min_consec_scans is None:
+            min_consec_scans = Config.GROUP_MIN_CONSEC_SCANS
+    except Exception:
+        if noise_level is None:
+            noise_level = NOISE_LEVEL
+        if mz_tolerance is None:
+            mz_tolerance = MZ_TOLERANCE
+        if min_consec_scans is None:
+            min_consec_scans = MIN_CONSEC_SCANS
 
     if verbose:
         print(f"Processing {Path(file_path).name}...")
@@ -619,10 +635,12 @@ def build_mass_groups_from_files(
     mass_groups = find_groups(df, min_group_size=min_group_size, max_group_size=max_group_size)
 
     out: Dict[str, List[float]] = {}
+    out_intensities: Dict[str, List[float]] = {}
     for i, group in enumerate(mass_groups, 1):
         out[f"Group{i}"] = [float(m["mz"]) for m in group]
+        out_intensities[f"Group{i}"] = [float(m["intensity"]) for m in group]
 
-    return out
+    return out, out_intensities
 
 def main():
     features = process_files()

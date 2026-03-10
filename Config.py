@@ -27,6 +27,7 @@ class Config:
     MASS_GROUPS_CACHE_NAME = "MassGroups_Cache.json"
     MASS_GROUPS_EXPORT_NAME = "MassGroups_Formatted.csv"
     MASS_GROUPS: dict[str, list[float]] = {}   # populated by initialize_mass_groups() or cache
+    MASS_GROUPS_INTENSITIES: dict[str, list[float]] = {}  # parallel intensities for CSV export
     MASS_LIST: list[float] = []               # active group's masses
     CURRENT_GROUP: str | None = None
     MASS_TOLERANCE = 0.0005
@@ -205,7 +206,7 @@ class Config:
             target_files=cls.TARGET_FILES or [],
         )
 
-        cls.MASS_GROUPS = build_mass_groups_from_files(
+        cls.MASS_GROUPS, cls.MASS_GROUPS_INTENSITIES = build_mass_groups_from_files(
             grouping_files,
             noise_level=cls.GROUP_NOISE_LEVEL,
             mz_tolerance=cls.GROUP_MZ_TOLERANCE,
@@ -262,11 +263,13 @@ class Config:
 
         with out_path.open("w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
-            writer.writerow(["Group", "Size", "Masses"])
+            writer.writerow(["Group", "Size", "Masses", "Intensities"])
             for name in group_names:
                 masses = cls.MASS_GROUPS.get(name, [])
+                intensities = cls.MASS_GROUPS_INTENSITIES.get(name, [])
                 masses_str = "[" + ", ".join(f"{float(m):.4f}" for m in masses) + "]"
-                writer.writerow([cls._display_group_label(name), len(masses), masses_str])
+                intensities_str = "[" + ", ".join(f"{float(x):.0f}" for x in intensities) + "]" if intensities else "N/A"
+                writer.writerow([cls._display_group_label(name), len(masses), masses_str, intensities_str])
 
         return out_path
 

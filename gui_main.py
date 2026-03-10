@@ -560,6 +560,9 @@ class MainWindow(ctk.CTk):
                 Config.REBUILD_MASS_GROUPS = True
                 Config._imported_json_path = None
 
+            # Target files — always pass through so MassGrouping guarantees one is picked
+            Config.TARGET_FILES = list(self.target_files) if self.use_target else []
+
     def run_analysis(self):
         if not self.output_folder:
             messagebox.showwarning("Missing Output", "Please select an output folder")
