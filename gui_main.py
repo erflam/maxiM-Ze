@@ -130,7 +130,7 @@ class MainWindow(ctk.CTk):
         design_outer.pack(fill="x", pady=(0, 15))
 
         ctk.CTkLabel(
-            design_outer, text="1. Study Design",
+            design_outer, text="1. Import mzXML or mzML Files",
             font=ctk.CTkFont(size=18, weight="bold"),
             text_color="#0B1F3B",
         ).pack(pady=(15, 5), anchor="w", padx=20)
@@ -142,7 +142,7 @@ class MainWindow(ctk.CTk):
         self.study_design_var = ctk.BooleanVar(value=False)
         self._mode_check = ctk.CTkCheckBox(
             mode_row,
-            text="Use Study Design  (define experimental groups)",
+            text="Option A — Use Predefined Study Groups\ni.e. Group 1: Drug Treated, Group 2: Placebo, etc.\nSamples will be pulled from each group for mass grouping",
             variable=self.study_design_var,
             command=self._on_mode_toggle,
             text_color="#0B1F3B",
@@ -151,7 +151,7 @@ class MainWindow(ctk.CTk):
 
         self.study_info = ctk.CTkLabel(
             design_outer,
-            text="Option B active — add your files below; samples will be randomly selected for mass grouping.",
+            text="Option B active — add your files below and samples will be randomly selected for mass grouping",
             text_color="gray",
         )
         self.study_info.pack(anchor="w", padx=20, pady=(0, 5))
@@ -205,13 +205,19 @@ class MainWindow(ctk.CTk):
         library_frame.pack(fill="x", pady=(0, 15))
 
         ctk.CTkLabel(
-            library_frame, text="3. Compound Library (Optional)",
+            library_frame, text="3. Compound Library Import",
             font=ctk.CTkFont(size=18, weight="bold"),
             text_color="#0B1F3B",
-        ).pack(pady=(15, 10), anchor="w", padx=20)
+        ).pack(pady=(15, 5), anchor="w", padx=20)
+
+        ctk.CTkLabel(
+            library_frame, text="CSV and XLSX accepted (optional)",
+            font=ctk.CTkFont(size=13),
+            text_color="#0B1F3B",
+        ).pack(anchor="w", padx=20, pady=(0, 10))
 
         ctk.CTkButton(
-            library_frame, text="Select Library File (CSV/XLSX)",
+            library_frame, text="Select Library File",
             command=self.select_library_file, height=40,
         ).pack(fill="x", padx=20, pady=5)
 
@@ -226,7 +232,7 @@ class MainWindow(ctk.CTk):
 
         rt_tol_row = ctk.CTkFrame(library_frame, fg_color="transparent")
         rt_tol_row.pack(fill="x", padx=20, pady=(3, 15))
-        ctk.CTkLabel(rt_tol_row, text="RT Tolerance (min):", text_color="#0B1F3B").pack(side="left")
+        ctk.CTkLabel(rt_tol_row, text="Retention Time Tolerance (min):", text_color="#0B1F3B").pack(side="left")
         self.rt_tolerance_var = ctk.DoubleVar(value=0.1)
         ctk.CTkEntry(rt_tol_row, width=120, textvariable=self.rt_tolerance_var).pack(side="right")
 
@@ -281,7 +287,7 @@ class MainWindow(ctk.CTk):
         self._use_target_var = ctk.BooleanVar(value=False)
         ctk.CTkCheckBox(
             target_toggle_row,
-            text="Include target samples  (e.g. pooled plasma controls)",
+            text="Include target samples (i.e. pooled plasma controls)",
             variable=self._use_target_var,
             command=self._on_target_toggle,
         ).pack(side="left")
@@ -494,12 +500,11 @@ class MainWindow(ctk.CTk):
 
     def select_input_files(self):
         files = filedialog.askopenfilenames(
-            title="Select Input Files",
+            title="Select Files",
             filetypes=[
                 ("MS files", "*.mzxml *.mzml"),
                 ("mzXML files", "*.mzxml"),
                 ("mzML files", "*.mzml"),
-                ("All files", "*.*"),
             ],
         )
         if files:
