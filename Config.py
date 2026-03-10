@@ -35,6 +35,10 @@ class Config:
     # Run specific masses only
     RUN_ONLY_MASSES = None  # [247.1540] or set to None to run normal dynamic groups
 
+    # Target files (pooled controls) — set by GUI when use_target is enabled.
+    # When non-empty, MassGrouping.select_files() guarantees one is picked.
+    TARGET_FILES: list[str] = []
+
     # Library Matching
     LIB_FILE = r"/Users/elizabethflammer/Desktop/Research/MZMine/POS OE Library Metformin Baseline.csv"
     LIBRARY_MATCH_MZ_TOL = 0.0005
