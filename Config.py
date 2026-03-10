@@ -5,7 +5,7 @@ import json
 class Config:
     BASE_DIR = Path.home() / "Desktop/maxiMiZe Tests"
     INPUT_SUBDIR = Path("maxiMiZe Files")
-    OUTPUT_ROOT = Path("")
+    OUTPUT_ROOT = Path("maxiMiZe Checkpoints")
     ANALYSIS_FOLDER = "maxiMZe Group 1-30 0309 Test 1"
 
     USE_DYNAMIC_MASS_GROUPS = True         # MUST be True (fallback groups removed)

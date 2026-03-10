@@ -75,14 +75,7 @@ def load_selection_manifest() -> List[str] | None:
     p = _manifest_path()
     if REUSE_EXISTING_SELECTION and p.exists():
         lines = [line.strip() for line in p.read_text().splitlines() if line.strip()]
-        if not lines:
-            return None
-        missing = [l for l in lines if not Path(l).exists()]
-        if missing:
-            print(f"Manifest stale — {len(missing)} file(s) no longer exist. Reselecting.")
-            p.unlink()
-            return None
-        return lines
+        return lines if lines else None
     return None
 
 def save_selection_manifest(selected: List[str]) -> None:
