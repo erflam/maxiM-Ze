@@ -38,7 +38,7 @@ class MainWindow(ctk.CTk):
 
         self.title("maxiM-Ze")
         self.geometry("1200x900")
-        self.configure(fg_color="#F2FAFF")
+        self.configure(fg_color="#2BB673")
 
         self.input_files = []
         self.library_file = None
@@ -100,7 +100,7 @@ class MainWindow(ctk.CTk):
         self.about_btn.grid(row=2, column=0, padx=20, pady=10)
 
         # Main frame
-        self.main_frame = ctk.CTkFrame(self, fg_color="#F2FAFF")
+        self.main_frame = ctk.CTkFrame(self, fg_color="#FFFFFF")
         self.main_frame.grid(row=0, column=1, sticky="nsew", padx=20, pady=20)
 
         self.create_pages()
@@ -116,7 +116,7 @@ class MainWindow(ctk.CTk):
         self.pages["about"] = self.create_about_page()
 
     def create_home_page(self):
-        page = ctk.CTkScrollableFrame(self.main_frame, fg_color="#F2FAFF")
+        page = ctk.CTkScrollableFrame(self.main_frame, fg_color="#FFFFFF")
 
         title = ctk.CTkLabel(
             page, text="Analysis Setup",
@@ -126,7 +126,7 @@ class MainWindow(ctk.CTk):
         title.pack(pady=(0, 20))
 
         # ── 1. Study Design ───────────────────────────────────────────
-        design_outer = ctk.CTkFrame(page, fg_color="#FFFFFF", border_width=1, border_color="#D0E8F5")
+        design_outer = ctk.CTkFrame(page, fg_color="#FFFFFF", border_width=1, border_color="#FFFFFF")
         design_outer.pack(fill="x", pady=(0, 15))
 
         ctk.CTkLabel(
@@ -183,7 +183,7 @@ class MainWindow(ctk.CTk):
         ctk.CTkEntry(noise_row, width=120, textvariable=self.noise_var).pack(side="right")
 
         # ── 2. Output Folder ──────────────────────────────────────────
-        output_frame = ctk.CTkFrame(page, fg_color="#FFFFFF", border_width=1, border_color="#D0E8F5")
+        output_frame = ctk.CTkFrame(page, fg_color="#FFFFFF", border_width=1, border_color="#FFFFFF")
         output_frame.pack(fill="x", pady=(0, 15))
 
         ctk.CTkLabel(
@@ -201,7 +201,7 @@ class MainWindow(ctk.CTk):
         self.output_status.pack(pady=(5, 15), padx=20, anchor="w")
 
         # ── 3. Compound Library ───────────────────────────────────────
-        library_frame = ctk.CTkFrame(page, fg_color="#FFFFFF", border_width=1, border_color="#D0E8F5")
+        library_frame = ctk.CTkFrame(page, fg_color="#FFFFFF", border_width=1, border_color="#FFFFFF")
         library_frame.pack(fill="x", pady=(0, 15))
 
         ctk.CTkLabel(
@@ -240,7 +240,7 @@ class MainWindow(ctk.CTk):
         self.run_btn.pack(fill="x", pady=20)
 
         # ── Console ───────────────────────────────────────────────────
-        console_frame = ctk.CTkFrame(page, fg_color="#FFFFFF", border_width=1, border_color="#D0E8F5")
+        console_frame = ctk.CTkFrame(page, fg_color="#FFFFFF", border_width=4, border_color="#D0E8F5")
         console_frame.pack(fill="both", expand=True, pady=(0, 20))
 
         ctk.CTkLabel(
@@ -306,7 +306,7 @@ class MainWindow(ctk.CTk):
 
     def _add_group_card(self, group_number: int):
         """Add a single group card to the scroll area."""
-        card = ctk.CTkFrame(self._groups_scroll, border_width=1, border_color="#2BB673")
+        card = ctk.CTkFrame(self._groups_scroll, border_width=2, border_color="#2BB673")
         card.pack(fill="x", pady=5)
 
         # Header row
@@ -353,7 +353,7 @@ class MainWindow(ctk.CTk):
 
     def _build_target_slot(self, parent):
         """Build the target sample file slot inside parent."""
-        card = ctk.CTkFrame(parent, border_width=1, border_color="#F59E0B")
+        card = ctk.CTkFrame(parent, border_width=2, border_color="#2BB673")
         card.pack(fill="x", padx=20, pady=4)
 
         header = ctk.CTkFrame(card, fg_color="transparent")
@@ -361,7 +361,7 @@ class MainWindow(ctk.CTk):
 
         ctk.CTkLabel(
             header, text="Target Samples  (pooled controls)",
-            font=ctk.CTkFont(weight="bold"), text_color="#F59E0B",
+            font=ctk.CTkFont(weight="bold"), text_color="#2BB673",
         ).pack(side="left")
 
         self._target_count_label = ctk.CTkLabel(header, text="0 file(s)", text_color="gray")
@@ -530,7 +530,7 @@ class MainWindow(ctk.CTk):
             print(f"Library file: {file}")
 
     def create_about_page(self):
-        page = ctk.CTkScrollableFrame(self.main_frame, fg_color="#F2FAFF")
+        page = ctk.CTkScrollableFrame(self.main_frame, fg_color="#FFFFFF")
 
         ctk.CTkLabel(
             page, text="About maxiM-Ze",
@@ -538,7 +538,7 @@ class MainWindow(ctk.CTk):
             text_color="#0B1F3B",
         ).pack(pady=(0, 20))
 
-        info_frame = ctk.CTkFrame(page, fg_color="#FFFFFF", border_width=1, border_color="#D0E8F5")
+        info_frame = ctk.CTkFrame(page, fg_color="#FFFFFF", border_width=2, border_color="#D0E8F5")
         info_frame.pack(fill="x", pady=(0, 15))
 
         ctk.CTkLabel(
