@@ -43,7 +43,7 @@ class Pipeline:
         # multiprocessing Pool is created, so workers can call
         # Config.ensure_mass_groups_loaded() successfully.
         Config.initialize_mass_groups(
-            self.file_paths,
+            self.file_paths,          # all_input_files — used by select_files()
             import_json_path=import_json_path,
         )
 

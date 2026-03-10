@@ -140,7 +140,7 @@ class Config:
     @classmethod
     def initialize_mass_groups(
         cls,
-        _pipeline_file_paths_ignored: list[str] | None = None,
+        all_input_files: list[str] | None = None,
         *,
         import_json_path: str | Path | None = None,
     ) -> None:
@@ -200,7 +200,10 @@ class Config:
         from MassGrouping import select_files, build_mass_groups_from_files
 
         print("[Config] Detecting mass groups fresh (this may take a few minutes)...")
-        grouping_files = select_files()
+        grouping_files = select_files(
+            all_input_files=all_input_files,
+            target_files=cls.TARGET_FILES or [],
+        )
 
         cls.MASS_GROUPS = build_mass_groups_from_files(
             grouping_files,
