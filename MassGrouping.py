@@ -600,6 +600,19 @@ def build_mass_groups_from_files(
         if mz_round not in unique_features:
             unique_features[mz_round] = feature
 
+    # Hard noise floor: drop any feature whose max intensity is below the
+    # noise level before grouping.  This catches clusters that scraped past
+    # the per-scan filter but whose overall intensity is still sub-noise.
+    above_noise = {
+        mz: feat for mz, feat in unique_features.items()
+        if feat['intensity'] >= noise_level
+    }
+    n_dropped = len(unique_features) - len(above_noise)
+    if n_dropped:
+        print(f"[MassGrouping] Dropped {n_dropped} feature(s) below noise floor "
+              f"({noise_level:.0f}) before grouping.")
+    unique_features = above_noise
+
     features_sorted = sorted(unique_features.values(), key=lambda x: x['mz'])
     df = pd.DataFrame(features_sorted)
 
