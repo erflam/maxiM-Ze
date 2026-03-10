@@ -65,8 +65,21 @@ SAMPLE_GROUPS: Dict[str, List[str]] = {
 REUSE_EXISTING_SELECTION = True
 SELECTION_MANIFEST_NAME = f"selected_files_seed_{SEED}.txt"
 
+
+def _get_config():
+    """Safely import Config, return None if unavailable."""
+    try:
+        from Config import Config
+        return Config
+    except Exception:
+        return None
+
+
 def _manifest_path() -> Path:
-    out_dir = BASE_DIR / OUTPUT_ROOT
+    cfg = _get_config()
+    base = getattr(cfg, "BASE_DIR", BASE_DIR) if cfg else BASE_DIR
+    root = getattr(cfg, "OUTPUT_ROOT", OUTPUT_ROOT) if cfg else OUTPUT_ROOT
+    out_dir = base / root
     out_dir.mkdir(parents=True, exist_ok=True)
     return out_dir / SELECTION_MANIFEST_NAME
 
@@ -91,19 +104,35 @@ def save_selection_manifest(selected: List[str]) -> None:
 
 
 def select_files_with_study_design(n_files: int = N_FILES_TO_PROCESS) -> List[str]:
+    # Pull live values from Config if available, fall back to module constants
+    cfg = _get_config()
+    _target_group  = getattr(cfg, "TARGET_GROUP",  TARGET_GROUP)  if cfg else TARGET_GROUP
+    _sample_groups = getattr(cfg, "SAMPLE_GROUPS", SAMPLE_GROUPS) if cfg else SAMPLE_GROUPS
+    _base_dir      = getattr(cfg, "BASE_DIR",      BASE_DIR)      if cfg else BASE_DIR
+    _input_subdir  = getattr(cfg, "INPUT_SUBDIR",  INPUT_SUBDIR)  if cfg else INPUT_SUBDIR
+
+    # SAMPLE_GROUPS from Config contains full absolute paths (set by GUI),
+    # so we only join BASE_DIR/INPUT_SUBDIR when the value looks like a bare filename.
+    def _resolve(file_entry: str) -> str:
+        p = Path(file_entry)
+        if p.is_absolute():
+            return str(p)
+        return str(_base_dir / _input_subdir / file_entry)
+
     selected: List[str] = []
     remaining_slots = n_files
 
-    if TARGET_GROUP is not None:
-        target_files = SAMPLE_GROUPS.get(TARGET_GROUP)
+    if _target_group is not None:
+        target_files = _sample_groups.get(_target_group)
         if not target_files:
-            raise ValueError(f"TARGET_GROUP '{TARGET_GROUP}' is empty or not found in SAMPLE_GROUPS.")
+            raise ValueError(f"TARGET_GROUP '{_target_group}' is empty or not found in SAMPLE_GROUPS.")
         target_file = RNG.choice(target_files)
-        selected.append(str(BASE_DIR / INPUT_SUBDIR / target_file))
+        resolved = _resolve(target_file)
+        selected.append(resolved)
         remaining_slots -= 1
-        print(f"  [target]         {target_file}")
+        print(f"  [target]         {Path(resolved).name}")
 
-    non_target_groups = {k: v for k, v in SAMPLE_GROUPS.items() if k != TARGET_GROUP}
+    non_target_groups = {k: v for k, v in _sample_groups.items() if k != _target_group}
     if not non_target_groups:
         raise ValueError("No non-target groups defined in SAMPLE_GROUPS.")
 
@@ -122,16 +151,21 @@ def select_files_with_study_design(n_files: int = N_FILES_TO_PROCESS) -> List[st
 
         chosen = RNG.sample(pool, n_from_group)
         for f in chosen:
-            selected.append(str(BASE_DIR / INPUT_SUBDIR / f))
+            resolved = _resolve(f)
+            selected.append(resolved)
             padding = " " * max(1, 15 - len(group_name))
-            print(f"  [{group_name}]{padding}{f}")
+            print(f"  [{group_name}]{padding}{Path(resolved).name}")
 
     return selected
 
 def select_random_files(n_files: int = N_FILES_TO_PROCESS) -> List[str]:
-    all_files = sorted((BASE_DIR / INPUT_SUBDIR).glob("*.mzXML"))
+    cfg = _get_config()
+    _base_dir     = getattr(cfg, "BASE_DIR",     BASE_DIR)     if cfg else BASE_DIR
+    _input_subdir = getattr(cfg, "INPUT_SUBDIR", INPUT_SUBDIR) if cfg else INPUT_SUBDIR
+    all_files = sorted((_base_dir / _input_subdir).glob("*.mzXML")) + \
+                sorted((_base_dir / _input_subdir).glob("*.mzML"))
     if len(all_files) < n_files:
-        raise ValueError(f"Not enough mzXML files. Found {len(all_files)}, need {n_files}")
+        raise ValueError(f"Not enough mzXML/mzML files. Found {len(all_files)}, need {n_files}")
     return [str(f) for f in RNG.sample(all_files, n_files)]
 
 def select_files() -> List[str]:
@@ -143,9 +177,13 @@ def select_files() -> List[str]:
             print(f"  {Path(f).name}")
         return existing
 
+    # Read USE_STUDY_DESIGN from Config at call time
+    cfg = _get_config()
+    _use_study_design = getattr(cfg, "USE_STUDY_DESIGN", USE_STUDY_DESIGN) if cfg else USE_STUDY_DESIGN
+
     print(f"Seed: {SEED}")
     print("Selected files:")
-    if USE_STUDY_DESIGN:
+    if _use_study_design:
         selected = select_files_with_study_design(N_FILES_TO_PROCESS)
     else:
         selected = select_random_files(N_FILES_TO_PROCESS)
@@ -192,24 +230,6 @@ def longest_consecutive_run(scan_indices: Set[int]) -> int:
     return int(run_lengths.max())
 
 
-# ---------------------------------------------------------------------------
-# OPTIMIZED: find_mass_traces
-# ---------------------------------------------------------------------------
-# Original: used a sorted list of MassCluster objects with list.insert() —
-# O(n) per insertion — plus a linear scan of clusters via binary search that
-# still required matching on a *moving* mean_mz, making placement unreliable
-# after the mean shifted.  Also recomputed mean_mz on every comparison.
-#
-# New approach:
-#  1. Sort all centroids by mz once (already done).
-#  2. Keep clusters in a plain list sorted by their *current* representative
-#     mz.  Use np.searchsorted for O(log n) lookup.
-#  3. Store representative_mz separately so we can update it cheaply after
-#     each merge without recomputing np.mean over the full list every time.
-#  4. After all centroids are processed, do one vectorised pass to compute
-#     consecutive-run lengths for all clusters at once instead of one-by-one.
-# ---------------------------------------------------------------------------
-
 class _Cluster:
     """Lightweight cluster used only inside find_mass_traces."""
     __slots__ = ("scan_indices", "mz_sum", "mz_count", "rep_mz",
@@ -220,7 +240,7 @@ class _Cluster:
         self.scan_indices: List[int] = [scan_idx]
         self.mz_sum = mz
         self.mz_count = 1
-        self.rep_mz = mz          # kept in sync with mean for sorting
+        self.rep_mz = mz
         self.intensities = {scan_idx: intensity}
         self.max_intensity = intensity
         self.apex_scan = scan_idx
@@ -253,39 +273,29 @@ def find_mass_traces(
     if not centroids:
         return []
 
-    # Sort once by mz
     centroids.sort(key=lambda x: x[1])
 
     clusters: List[_Cluster] = []
-    rep_mzs = np.empty(0, dtype=np.float64)   # mirrors clusters list for fast searchsorted
+    rep_mzs = np.empty(0, dtype=np.float64)
 
     for scan_idx, mz, intensity in centroids:
         rt = retention_times[scan_idx]
-
-        # Find insertion point in the sorted rep_mzs array
         pos = np.searchsorted(rep_mzs, mz)
 
         placed = False
-        # Check a small window around pos (the nearest neighbours)
         for idx in (pos - 1, pos):
             if 0 <= idx < len(clusters):
                 if abs(clusters[idx].rep_mz - mz) <= mz_tol:
-                    old_rep = clusters[idx].rep_mz
                     clusters[idx].add(scan_idx, mz, intensity, rt)
-                    new_rep = clusters[idx].rep_mz
-                    # Keep rep_mzs array sorted by updating in-place when the
-                    # change is small (it always will be for a running mean).
-                    rep_mzs[idx] = new_rep
+                    rep_mzs[idx] = clusters[idx].rep_mz
                     placed = True
                     break
 
         if not placed:
             new_cluster = _Cluster(scan_idx, mz, intensity, rt)
-            # Insert into sorted position
             clusters.insert(pos, new_cluster)
             rep_mzs = np.insert(rep_mzs, pos, mz)
 
-    # Vectorised consecutive-run check
     valid_clusters: List[Dict] = []
     for cluster in clusters:
         scans = sorted(cluster.scan_indices)
@@ -386,15 +396,6 @@ def is_same_mass(mz1: float, mz2: float, tolerance: float = 0.0005) -> bool:
     return abs(mz1 - mz2) <= tolerance
 
 
-# ---------------------------------------------------------------------------
-# OPTIMIZED: check_mass_compatibility
-# ---------------------------------------------------------------------------
-# Original: iterated over every member of the group in pure Python.
-# New: operates on pre-built numpy arrays passed in alongside the group list,
-# so all arithmetic is vectorised.  The arrays are maintained incrementally
-# (append on accept) to avoid rebuilding them for every candidate.
-# ---------------------------------------------------------------------------
-
 def check_mass_compatibility_vec(
     group_mzs: np.ndarray,
     group_rt_starts: np.ndarray,
@@ -415,21 +416,17 @@ def check_mass_compatibility_vec(
     new_rt_end = new_mass['rt_end']
     new_intensity = new_mass['intensity']
 
-    # ppm check (vectorised)
     ppm_diffs = np.abs(new_mz - group_mzs) / group_mzs * 1e6
     if np.any(ppm_diffs < min_ppm_diff):
         return False
 
-    # RT overlap check (vectorised)
     overlaps = (new_rt_start <= group_rt_ends) & (new_rt_end >= group_rt_starts)
     if np.any(overlaps):
         return False
 
-    # 1-minute RT separation check (vectorised)
     if np.any(np.abs(new_rt - group_rts) < 1.0):
         return False
 
-    # Intensity ratio check (vectorised)
     lo = np.minimum(new_intensity, group_intensities)
     hi = np.maximum(new_intensity, group_intensities)
     ratios = lo / hi
@@ -439,28 +436,7 @@ def check_mass_compatibility_vec(
     return True
 
 
-# ---------------------------------------------------------------------------
-# OPTIMIZED: find_groups
-# ---------------------------------------------------------------------------
-# Original complexity: O(N²) outer loop (every unplaced mass as seed) ×
-#   O(N) build_candidate_group × O(G) check_mass_compatibility = O(N³).
-# For ~10 k features this is ~10^9 operations per outer iteration.
-#
-# Key changes:
-#  1. Pre-sort candidates by intensity descending once; the highest-intensity
-#     mass always becomes the seed of its own group (greedy, same outcome as
-#     original "best group" search because the original also preferred higher
-#     total intensity and seeds with the globally highest mass first).
-#  2. Carry numpy arrays alongside each group so compatibility checks are
-#     fully vectorised (see check_mass_compatibility_vec above).
-#  3. Use a boolean "available" mask instead of rebuilding the unplaced list
-#     after each group, avoiding repeated list copies.
-#  4. Eliminated the redundant O(N) is_same_mass dedup scan inside the loop
-#     (the mask makes a mass unavailable the moment it's placed).
-# ---------------------------------------------------------------------------
-
 def find_groups(masses_df: pd.DataFrame, min_group_size: int = 3, max_group_size: int = 5) -> List[List[Dict]]:
-    # Step 1: deduplicate by mz (keep highest intensity per mz bucket)
     sorted_df = masses_df.sort_values('intensity', ascending=False)
 
     seen_mzs: List[float] = []
@@ -481,20 +457,18 @@ def find_groups(masses_df: pd.DataFrame, min_group_size: int = 3, max_group_size
     if n == 0:
         return []
 
-    # Convert to numpy arrays for vectorised access
     mzs       = np.array([m['mz']        for m in available_masses], dtype=np.float64)
     rts       = np.array([m['rt']        for m in available_masses], dtype=np.float64)
     rt_starts = np.array([m['rt_start']  for m in available_masses], dtype=np.float64)
     rt_ends   = np.array([m['rt_end']    for m in available_masses], dtype=np.float64)
     intensities = np.array([m['intensity'] for m in available_masses], dtype=np.float64)
 
-    available = np.ones(n, dtype=bool)   # True = not yet placed in any group
+    available = np.ones(n, dtype=bool)
 
     groups: List[List[Dict]] = []
 
     def _try_fill_group(group_indices, g_mzs, g_rt_starts, g_rt_ends, g_rts, g_intensities,
                         min_intensity_ratio, min_ppm_diff):
-        """Try to fill a group using the given compatibility thresholds."""
         for cand_idx in range(seed_idx + 1, n):
             if not available[cand_idx] or cand_idx in group_indices:
                 continue
@@ -514,14 +488,10 @@ def find_groups(masses_df: pd.DataFrame, min_group_size: int = 3, max_group_size
                 g_intensities = np.append(g_intensities, intensities[cand_idx])
         return group_indices, g_mzs, g_rt_starts, g_rt_ends, g_rts, g_intensities
 
-    # Greedy: always take the highest-intensity available mass as the next seed.
-    # available_masses is already sorted by intensity descending, so we just
-    # iterate in order and skip masses that have already been placed.
     for seed_idx in range(n):
         if not available[seed_idx]:
             continue
 
-        # Start a new group with this seed
         group_indices = [seed_idx]
         g_mzs         = mzs[seed_idx:seed_idx+1].copy()
         g_rt_starts   = rt_starts[seed_idx:seed_idx+1].copy()
@@ -529,20 +499,17 @@ def find_groups(masses_df: pd.DataFrame, min_group_size: int = 3, max_group_size
         g_rts         = rts[seed_idx:seed_idx+1].copy()
         g_intensities = intensities[seed_idx:seed_idx+1].copy()
 
-        # Pass 1: strict rules
         group_indices, g_mzs, g_rt_starts, g_rt_ends, g_rts, g_intensities = _try_fill_group(
             group_indices, g_mzs, g_rt_starts, g_rt_ends, g_rts, g_intensities,
             min_intensity_ratio=0.90, min_ppm_diff=5.0,
         )
 
-        # Pass 2: relaxed rules — only if the group is still a singleton
         if len(group_indices) < min_group_size:
             group_indices, g_mzs, g_rt_starts, g_rt_ends, g_rts, g_intensities = _try_fill_group(
                 group_indices, g_mzs, g_rt_starts, g_rt_ends, g_rts, g_intensities,
                 min_intensity_ratio=0.65, min_ppm_diff=2.0,
             )
 
-        # Mark all members as placed
         for idx in group_indices:
             available[idx] = False
 
