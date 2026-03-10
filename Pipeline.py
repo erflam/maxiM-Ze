@@ -41,7 +41,9 @@ class Pipeline:
     def __init__(self):
         self.config = Config()
         self.file_paths = FileUtils.get_file_paths()
-        Config.initialize_mass_groups(self.file_paths)
+        # Mass groups are initialized by the caller (GUI) before Pipeline is created.
+        # If running Pipeline directly (not via GUI), uncomment the next line:
+        # Config.initialize_mass_groups(self.file_paths)
         self.file_colors = {
             os.path.splitext(os.path.basename(fp))[0]: FileUtils.random_dark_hex_color()
             for fp in self.file_paths
@@ -269,4 +271,5 @@ if __name__ == "__main__":
     import multiprocessing
     multiprocessing.set_start_method("spawn", force=True)
     pipeline = Pipeline()
+    Config.initialize_mass_groups(pipeline.file_paths)
     pipeline.clean_run()
