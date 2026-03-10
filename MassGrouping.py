@@ -192,21 +192,26 @@ def select_files(
         Pooled-control file paths.  When provided (and USE_STUDY_DESIGN is
         False) one is always included in the grouping selection.
     """
-    # Pull target_files from Config if not passed explicitly
+    # Resolve target_files from Config if not passed explicitly
     if target_files is None:
         try:
             from Config import Config
-            target_files = Config.TARGET_FILES or []
+            target_files = list(Config.TARGET_FILES) if Config.TARGET_FILES else []
         except Exception:
             target_files = []
 
-    existing = load_selection_manifest()
-    if existing is not None:
-        print(f"Seed: {SEED} (reusing manifest)")
-        print("Selected files (manifest):")
-        for f in existing:
-            print(f"  {Path(f).name}")
-        return existing
+    # Only reuse the manifest if the current file list and target files are
+    # consistent with what was selected before.  When the GUI supplies a fresh
+    # file list we always detect fresh — the manifest is for the standalone
+    # script workflow only.
+    if all_input_files is None and not target_files:
+        existing = load_selection_manifest()
+        if existing is not None:
+            print(f"Seed: {SEED} (reusing manifest)")
+            print("Selected files (manifest):")
+            for f in existing:
+                print(f"  {Path(f).name}")
+            return existing
 
     print(f"Seed: {SEED}")
     print("Selected files:")
