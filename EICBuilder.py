@@ -322,16 +322,12 @@ def analyze_ms_file_plotly(file_path, output_image_path, file_colors, axis_meta_
     mass_colors = _dark_hex_palette(len(mass_list))
     mass_color_map = {mass_list[i]: mass_colors[i] for i in range(len(mass_list))}
 
-    peaks_out = []          # peaks that pass the noise filter — written to peaks_{group}.csv
-    peaks_prefilter = []    # ALL detected peaks before noise filter — written to peaks_prefilter_{group}.csv
+    peaks_out = []
     debug_rows = []
     all_peak_rts = []
 
     rt_vals = np.array(rt_values)
     scan_numbers_arr = np.array(scan_numbers, dtype=object)
-
-    # Noise threshold from GUI
-    gui_noise_level = Config.GROUP_NOISE_LEVEL
 
     def split_shoulders_in_window(
         rt_vals, scan_numbers_arr, intensity_raw, intensity_smooth,
@@ -565,6 +561,7 @@ def analyze_ms_file_plotly(file_path, output_image_path, file_colors, axis_meta_
                 x_peak = rt_vals[left_idx:right_idx + 1]
                 y_peak = intensity_vals[left_idx:right_idx + 1]
 
+                # Keep debug logging, but do NOT reject here.
                 is_peak, frac_up, frac_down, apex, left_end, right_end = looks_like_real_peak(y_peak)
 
                 debug_rows.append({
@@ -582,6 +579,10 @@ def analyze_ms_file_plotly(file_path, output_image_path, file_colors, axis_meta_
                     "passed_filter": bool(is_peak),
                 })
 
+                # IMPORTANT:
+                # - no front crop
+                # - no looks_like_real_peak rejection
+                # - keep only the older tail crop behavior
                 if len(y_peak) >= 12:
                     apex_idx_local = np.argmax(y_peak)
                     peak_height = y_peak[apex_idx_local]
@@ -615,28 +616,22 @@ def analyze_ms_file_plotly(file_path, output_image_path, file_colors, axis_meta_
                     mass_str=mass_list_str[mass_idx],
                     base_name=base
                 )
+                peaks_out.extend(new_records)
 
-                # ── Always add to prefilter list ──────────────────────
-                peaks_prefilter.extend(new_records)
-
-                # ── Only plot and keep peaks above the GUI noise level ─
-                passing_records = [r for r in new_records if r.get('height', 0) >= gui_noise_level]
-                if passing_records:
-                    peaks_out.extend(passing_records)
-                    fig.add_trace(go.Scatter(
-                        x=x_peak, y=y_peak,
-                        mode='lines',
-                        line=dict(color=mass_color_map[specific_mass], width=3),
-                        showlegend=False
-                    ))
-                    all_peak_rts.extend(x_peak.tolist())
+                fig.add_trace(go.Scatter(
+                    x=x_peak, y=y_peak,
+                    mode='lines',
+                    line=dict(color=mass_color_map[specific_mass], width=3),
+                    showlegend=False
+                ))
+                all_peak_rts.extend(x_peak.tolist())
 
             except Exception as e:
                 print(f"Error processing peak {i} for mass {mass_list_str[mass_idx]}: {str(e)}")
                 continue
 
     if not fig.data:
-        print(f"[!] No peaks above noise ({gui_noise_level:.0f}) in {base}; skipping.")
+        print(f"[!] No peaks in {base}; skipping.")
         if EXPORT_DEBUG_CSV:
             debug_csv = os.path.join(
                 os.path.dirname(os.path.dirname(output_image_path)),
@@ -646,7 +641,7 @@ def analyze_ms_file_plotly(file_path, output_image_path, file_colors, axis_meta_
             os.makedirs(os.path.dirname(debug_csv), exist_ok=True)
             pd.DataFrame(debug_rows).to_csv(debug_csv, index=False)
             print(f"[DEBUG] wrote {len(debug_rows)} rows to {debug_csv}")
-        return peaks_out, peaks_prefilter
+        return []
 
     # --- FORCE SAME X-AXIS SIZE (>= 6 minutes) FOR EVERY IMAGE ---
     min_rt = float(np.min(rt_vals))
@@ -676,6 +671,7 @@ def analyze_ms_file_plotly(file_path, output_image_path, file_colors, axis_meta_
         add_left = min(needed, x0 - min_rt)
         x0 -= add_left
 
+    # --- SAVE AXIS METADATA ---
     if axis_meta_csv is not None:
         os.makedirs(os.path.dirname(axis_meta_csv), exist_ok=True)
         pd.DataFrame([{
@@ -718,15 +714,6 @@ def analyze_ms_file_plotly(file_path, output_image_path, file_colors, axis_meta_
             df = df.drop_duplicates(subset=['m/z', 'RT_apex'], keep='first')
             peaks_out = df.to_dict('records')
 
-    if peaks_prefilter:
-        df_pre = pd.DataFrame(peaks_prefilter)
-        if ('m/z' in df_pre.columns) and ('RT_apex' in df_pre.columns) and ('Peak Area' in df_pre.columns):
-            df_pre['RT_apex'] = pd.to_numeric(df_pre['RT_apex'], errors='coerce')
-            df_pre['Peak Area'] = pd.to_numeric(df_pre['Peak Area'], errors='coerce')
-            df_pre = df_pre.sort_values(['m/z', 'RT_apex', 'Peak Area'], ascending=[True, True, False])
-            df_pre = df_pre.drop_duplicates(subset=['m/z', 'RT_apex'], keep='first')
-            peaks_prefilter = df_pre.to_dict('records')
-
     if EXPORT_DEBUG_CSV:
         debug_csv = os.path.join(
             os.path.dirname(os.path.dirname(output_image_path)),
@@ -737,7 +724,7 @@ def analyze_ms_file_plotly(file_path, output_image_path, file_colors, axis_meta_
         pd.DataFrame(debug_rows).to_csv(debug_csv, index=False)
         print(f"[DEBUG] wrote {len(debug_rows)} rows to {debug_csv}")
 
-    return peaks_out, peaks_prefilter
+    return peaks_out
 
 
 def process_file_checkpoint2(fp, dirs, file_colors, group_name):
@@ -749,26 +736,16 @@ def process_file_checkpoint2(fp, dirs, file_colors, group_name):
 
         png_path = os.path.join(dirs['png'], f"EIC_{base}_{group_tag}.png")
         peaks_csv = os.path.join(dirs['csv'], f"{base}_peaks_{group_tag}.csv")
-        peaks_prefilter_csv = os.path.join(dirs['csv'], f"{base}_peaks_prefilter_{group_tag}.csv")
 
         if os.path.exists(png_path) and os.path.exists(peaks_csv):
             return f"[↷] {base} (png+peaks cached)"
 
         axis_meta_csv = os.path.join(dirs['csv'], f"{base}_axis_{group_tag}.csv")
-        peaks, peaks_prefilter = analyze_ms_file_plotly(fp, png_path, file_colors, axis_meta_csv=axis_meta_csv)
+        peaks = analyze_ms_file_plotly(fp, png_path, file_colors, axis_meta_csv=axis_meta_csv)
 
-        # Save prefilter CSV (all detected peaks, no noise filter applied)
-        if peaks_prefilter:
-            pd.DataFrame(peaks_prefilter).to_csv(peaks_prefilter_csv, index=False, float_format='%.3f')
-
-        # Save filtered CSV (only peaks with height >= GUI noise level)
         if peaks:
             pd.DataFrame(peaks).to_csv(peaks_csv, index=False, float_format='%.3f')
 
-        n_total = len(peaks_prefilter)
-        n_kept = len(peaks)
-        n_dropped = n_total - n_kept
-        return f"[✔] {base} (png+peaks) — {n_kept} peaks kept, {n_dropped} below noise ({Config.GROUP_NOISE_LEVEL:.0f})"
-
+        return f"[✔] {base} (png+peaks)"
     except Exception as e:
         return f"[!] Error: {os.path.basename(fp)}: {str(e)[:50]}"
