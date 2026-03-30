@@ -104,6 +104,8 @@ def checkpoint_visualization_static_composite(cls, group_name: str) -> Optional[
     print(f"[Visualization] Static composite saved → {out_path}")
     return out_path
 
+import base64
+
 def checkpoint_visualization_interactive_patches(cls, group_name: str) -> Optional[Path]:
 
     cluster_dir = Path(cls.dirs["clustering"])
@@ -148,7 +150,7 @@ def checkpoint_visualization_interactive_patches(cls, group_name: str) -> Option
             file_base,
             mass,
             peak_num,
-            group_name,  # FIXED
+            group_name,
         )
 
         if not patch_path.exists():
@@ -156,9 +158,16 @@ def checkpoint_visualization_interactive_patches(cls, group_name: str) -> Option
 
         rt_start = aligned_center - (width / 2)
 
+        with open(patch_path, "rb") as f:
+            encoded = base64.b64encode(f.read()).decode("utf-8")
+
+        suffix = patch_path.suffix.lstrip(".")
+        mime = "image/svg+xml" if suffix == "svg" else f"image/{suffix}"
+        data_uri = f"data:{mime};base64,{encoded}"
+
         fig.add_layout_image(
             dict(
-                source=str(patch_path),
+                source=data_uri,
                 x=rt_start,
                 y=1,
                 sizex=width,
