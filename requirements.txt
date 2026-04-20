@@ -9,3 +9,4 @@ pyteomics
 numba
 openpyxl
 customtkinter
+aiofiles

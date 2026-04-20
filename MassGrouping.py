@@ -1,14 +1,16 @@
 import random
+import asyncio
 import numpy as np
 import pandas as pd
 from pathlib import Path
 from pyteomics import mzxml
 from typing import List, Tuple, Set, Dict
 from collections import defaultdict
+from bisect import bisect_left
 import multiprocessing
 from concurrent.futures import ProcessPoolExecutor
 
-SEED = 12345
+SEED = 67
 RNG = random.Random(SEED)
 np.random.seed(SEED)
 
@@ -24,7 +26,7 @@ MIN_SAMPLE_PRESENCE = 1
 
 USE_STUDY_DESIGN = False
 N_FILES_TO_PROCESS = 6
-TARGET_GROUP = "target"   # set to None if no target group
+TARGET_GROUP = "target"  # set to None if no target group
 
 SAMPLE_GROUPS: Dict[str, List[str]] = {
     "Group 1": [
@@ -65,6 +67,7 @@ SAMPLE_GROUPS: Dict[str, List[str]] = {
 REUSE_EXISTING_SELECTION = True
 SELECTION_MANIFEST_NAME = f"selected_files_seed_{SEED}.txt"
 
+
 def _manifest_path() -> Path:
     out_dir = BASE_DIR / OUTPUT_ROOT
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -78,6 +81,7 @@ def load_selection_manifest() -> List[str] | None:
         return lines if lines else None
     return None
 
+
 def save_selection_manifest(selected: List[str]) -> None:
     p = _manifest_path()
     p.write_text("\n".join(selected) + "\n")
@@ -90,7 +94,9 @@ def select_files_with_study_design(n_files: int = N_FILES_TO_PROCESS) -> List[st
     if TARGET_GROUP is not None:
         target_files = SAMPLE_GROUPS.get(TARGET_GROUP)
         if not target_files:
-            raise ValueError(f"TARGET_GROUP '{TARGET_GROUP}' is empty or not found in SAMPLE_GROUPS.")
+            raise ValueError(
+                f"TARGET_GROUP '{TARGET_GROUP}' is empty or not found in SAMPLE_GROUPS."
+            )
         target_file = RNG.choice(target_files)
         selected.append(str(BASE_DIR / INPUT_SUBDIR / target_file))
         remaining_slots -= 1
@@ -196,6 +202,7 @@ def select_files(
     if target_files is None:
         try:
             from Config import Config
+
             target_files = list(Config.TARGET_FILES) if Config.TARGET_FILES else []
         except Exception:
             target_files = []
@@ -227,7 +234,10 @@ def select_files(
     save_selection_manifest(selected)
     return selected
 
-def centroid_scan(scan_idx: int, mzs: np.ndarray, intensities: np.ndarray, noise_level: float) -> List[Tuple[int, float, float]]:
+
+def centroid_scan(
+    scan_idx: int, mzs: np.ndarray, intensities: np.ndarray, noise_level: float
+) -> List[Tuple[int, float, float]]:
     if len(intensities) < 3:
         return []
 
@@ -239,7 +249,9 @@ def centroid_scan(scan_idx: int, mzs: np.ndarray, intensities: np.ndarray, noise
     intensities = intensities[mask]
 
     peak_mask = np.zeros(len(intensities), dtype=bool)
-    peak_mask[1:-1] = (intensities[1:-1] > intensities[:-2]) & (intensities[1:-1] > intensities[2:])
+    peak_mask[1:-1] = (intensities[1:-1] > intensities[:-2]) & (
+        intensities[1:-1] > intensities[2:]
+    )
 
     intense_mask = intensities > (noise_level * 10)
     peak_mask = peak_mask | intense_mask
@@ -252,6 +264,7 @@ def centroid_scan(scan_idx: int, mzs: np.ndarray, intensities: np.ndarray, noise
 
     peak_indices = np.where(peak_mask)[0]
     return [(scan_idx, float(mzs[i]), float(intensities[i])) for i in peak_indices]
+
 
 def longest_consecutive_run(scan_indices: Set[int]) -> int:
     if not scan_indices:
@@ -266,9 +279,19 @@ def longest_consecutive_run(scan_indices: Set[int]) -> int:
 
 class _Cluster:
     """Lightweight cluster used only inside find_mass_traces."""
-    __slots__ = ("scan_indices", "mz_sum", "mz_count", "rep_mz",
-                 "intensities", "max_intensity", "apex_scan",
-                 "rt_values", "rt_min", "rt_max")
+
+    __slots__ = (
+        "scan_indices",
+        "mz_sum",
+        "mz_count",
+        "rep_mz",
+        "intensities",
+        "max_intensity",
+        "apex_scan",
+        "rt_values",
+        "rt_min",
+        "rt_max",
+    )
 
     def __init__(self, scan_idx: int, mz: float, intensity: float, rt: float):
         self.scan_indices: List[int] = [scan_idx]
@@ -307,74 +330,110 @@ def find_mass_traces(
     if not centroids:
         return []
 
-    centroids.sort(key=lambda x: x[1])
-
-    clusters: List[_Cluster] = []
-    rep_mzs = np.empty(0, dtype=np.float64)
+    mz_tol_int = int(mz_tol * 1e6)
+    mz_buckets: Dict[int, List[_Cluster]] = defaultdict(list)
 
     for scan_idx, mz, intensity in centroids:
         rt = retention_times[scan_idx]
-
-        pos = np.searchsorted(rep_mzs, mz)
+        mz_key = int(mz * 1e6)
+        bucket = mz_buckets[mz_key]
 
         placed = False
-        for idx in (pos - 1, pos):
-            if 0 <= idx < len(clusters):
-                if abs(clusters[idx].rep_mz - mz) <= mz_tol:
-                    old_rep = clusters[idx].rep_mz
-                    clusters[idx].add(scan_idx, mz, intensity, rt)
-                    new_rep = clusters[idx].rep_mz
-                    rep_mzs[idx] = new_rep
-                    placed = True
-                    break
+        for cluster in bucket:
+            if abs(cluster.rep_mz - mz) <= mz_tol:
+                cluster.add(scan_idx, mz, intensity, rt)
+                placed = True
+                break
 
         if not placed:
-            new_cluster = _Cluster(scan_idx, mz, intensity, rt)
-            clusters.insert(pos, new_cluster)
-            rep_mzs = np.insert(rep_mzs, pos, mz)
+            bucket.append(_Cluster(scan_idx, mz, intensity, rt))
+
+    clusters: List[_Cluster] = []
+    for bucket in mz_buckets.values():
+        clusters.extend(bucket)
 
     valid_clusters: List[Dict] = []
     for cluster in clusters:
         scans = sorted(cluster.scan_indices)
         if len(scans) < min_consec_scans:
             continue
-        arr = np.array(scans, dtype=np.int32)
-        gaps = np.diff(arr)
-        run_starts = np.where(gaps != 1)[0] + 1
-        splits = np.concatenate(([0], run_starts, [len(arr)]))
-        max_run = int(np.diff(splits).max())
+        max_run = longest_consecutive_run(set(scans))
         if max_run >= min_consec_scans:
             apex_rt = cluster.rt_values[cluster.apex_scan]
-            valid_clusters.append({
-                'mz': cluster.rep_mz,
-                'rt': apex_rt,
-                'rt_start': cluster.rt_min,
-                'rt_end': cluster.rt_max,
-                'consecutive_scans': max_run,
-                'intensity': cluster.max_intensity,
-            })
+            valid_clusters.append(
+                {
+                    "mz": cluster.rep_mz,
+                    "rt": apex_rt,
+                    "rt_start": cluster.rt_min,
+                    "rt_end": cluster.rt_max,
+                    "consecutive_scans": max_run,
+                    "intensity": cluster.max_intensity,
+                }
+            )
 
     return valid_clusters
 
 
-def process_file_centroids(file_path: str, noise_level: float) -> Tuple[List[Tuple[int, float, float]], Dict[int, float]]:
+SCAN_BATCH_SIZE = 500
+
+
+def process_file_centroids(
+    file_path: str, noise_level: float
+) -> Tuple[List[Tuple[int, float, float]], Dict[int, float]]:
     centroids: List[Tuple[int, float, float]] = []
     retention_times: Dict[int, float] = {}
+    batch_buffer: List[Tuple[Tuple[int, float, float], float]] = []
 
     with mzxml.read(file_path) as reader:
         for scan in reader:
-            if scan.get('msLevel', 0) == 1:
-                scan_number = int(scan['num'])
-                mzs = np.array(scan['m/z array'], dtype=np.float32)
-                intensities = np.array(scan['intensity array'], dtype=np.float32)
-                rt = float(scan['retentionTime'])
+            if scan.get("msLevel", 0) == 1:
+                scan_number = int(scan["num"])
+                mzs = np.array(scan["m/z array"], dtype=np.float32)
+                intensities = np.array(scan["intensity array"], dtype=np.float32)
+                rt = float(scan["retentionTime"])
 
                 if len(mzs) > 0:
-                    scan_centroids = centroid_scan(scan_number, mzs, intensities, noise_level)
-                    centroids.extend(scan_centroids)
+                    scan_centroids = centroid_scan(
+                        scan_number, mzs, intensities, noise_level
+                    )
+                    batch_buffer.extend((sc, rt) for sc in scan_centroids)
                     retention_times[scan_number] = rt
 
+                if len(batch_buffer) > SCAN_BATCH_SIZE * 100:
+                    centroids.extend(item[0] for item in batch_buffer)
+                    batch_buffer.clear()
+
+    centroids.extend(item[0] for item in batch_buffer)
     return centroids, retention_times
+
+
+async def process_file_centroids_async(
+    file_path: str, noise_level: float
+) -> Tuple[List[Tuple[int, float, float]], Dict[int, float]]:
+    return await asyncio.to_thread(process_file_centroids, file_path, noise_level)
+
+
+async def process_files_async(
+    file_paths: List[str],
+    noise_level: float,
+    mz_tolerance: float,
+    min_consec_scans: int,
+) -> Tuple[Dict[str, Set[float]], List[Dict]]:
+    tasks = [process_file_centroids_async(f, noise_level) for f in file_paths]
+    results = await asyncio.gather(*tasks)
+
+    masses_by_file: Dict[str, Set[float]] = {}
+    all_features: List[Dict] = []
+
+    for file_path, (centroids, retention_times) in zip(file_paths, results):
+        features = find_mass_traces(
+            centroids, mz_tolerance, min_consec_scans, retention_times
+        )
+        masses_by_file[file_path] = {feature["mz"] for feature in features}
+        all_features.extend(features)
+
+    return masses_by_file, all_features
+
 
 def process_single_file(
     file_path: str,
@@ -386,6 +445,7 @@ def process_single_file(
     # Always resolve from Config so the GUI-set values are used in workers
     try:
         from Config import Config
+
         if noise_level is None:
             noise_level = Config.GROUP_NOISE_LEVEL
         if mz_tolerance is None:
@@ -403,9 +463,12 @@ def process_single_file(
     if verbose:
         print(f"Processing {Path(file_path).name}...")
     centroids, retention_times = process_file_centroids(file_path, noise_level)
-    features = find_mass_traces(centroids, mz_tolerance, min_consec_scans, retention_times)
-    unique_masses = {feature['mz'] for feature in features}
+    features = find_mass_traces(
+        centroids, mz_tolerance, min_consec_scans, retention_times
+    )
+    unique_masses = {feature["mz"] for feature in features}
     return file_path, unique_masses, features
+
 
 def process_files() -> List[Dict]:
     selected_files = select_files()
@@ -413,7 +476,9 @@ def process_files() -> List[Dict]:
     masses_by_file: Dict[str, Set[float]] = {}
     all_features: List[Dict] = []
 
-    with ProcessPoolExecutor(max_workers=min(N_FILES_TO_PROCESS, multiprocessing.cpu_count())) as executor:
+    with ProcessPoolExecutor(
+        max_workers=min(N_FILES_TO_PROCESS, multiprocessing.cpu_count())
+    ) as executor:
         futures = [executor.submit(process_single_file, f) for f in selected_files]
         for fut in futures:
             file_path, masses, features = fut.result()
@@ -427,23 +492,30 @@ def process_files() -> List[Dict]:
         for mz in rounded_masses:
             mass_counts[float(mz)] += 1
 
-    valid_masses = {mz for mz, count in mass_counts.items() if count >= MIN_SAMPLE_PRESENCE}
-    print(f"\nUnique masses across selected files (pre MIN_SAMPLE_PRESENCE): {len(mass_counts)}")
-    print(f"Masses kept with MIN_SAMPLE_PRESENCE={MIN_SAMPLE_PRESENCE}: {len(valid_masses)}")
+    valid_masses = {
+        mz for mz, count in mass_counts.items() if count >= MIN_SAMPLE_PRESENCE
+    }
+    print(
+        f"\nUnique masses across selected files (pre MIN_SAMPLE_PRESENCE): {len(mass_counts)}"
+    )
+    print(
+        f"Masses kept with MIN_SAMPLE_PRESENCE={MIN_SAMPLE_PRESENCE}: {len(valid_masses)}"
+    )
 
     valid_features = []
     for feature in all_features:
-        mz_round = round(feature['mz'], 6)
+        mz_round = round(feature["mz"], 6)
         if mz_round in valid_masses:
             valid_features.append(feature)
 
     unique_features: Dict[float, Dict] = {}
-    for feature in sorted(valid_features, key=lambda x: x['intensity'], reverse=True):
-        mz_round = round(feature['mz'], 6)
+    for feature in sorted(valid_features, key=lambda x: x["intensity"], reverse=True):
+        mz_round = round(feature["mz"], 6)
         if mz_round not in unique_features:
             unique_features[mz_round] = feature
 
-    return sorted(unique_features.values(), key=lambda x: x['mz'])
+    return sorted(unique_features.values(), key=lambda x: x["mz"])
+
 
 def is_same_mass(mz1: float, mz2: float, tolerance: float = 0.0005) -> bool:
     return abs(mz1 - mz2) <= tolerance
@@ -463,11 +535,11 @@ def check_mass_compatibility_vec(
     if len(group_mzs) == 0:
         return True
 
-    new_mz = new_mass['mz']
-    new_rt = new_mass['rt']
-    new_rt_start = new_mass['rt_start']
-    new_rt_end = new_mass['rt_end']
-    new_intensity = new_mass['intensity']
+    new_mz = new_mass["mz"]
+    new_rt = new_mass["rt"]
+    new_rt_start = new_mass["rt_start"]
+    new_rt_end = new_mass["rt_end"]
+    new_intensity = new_mass["intensity"]
 
     ppm_diffs = np.abs(new_mz - group_mzs) / group_mzs * 1e6
     if np.any(ppm_diffs < min_ppm_diff):
@@ -489,39 +561,52 @@ def check_mass_compatibility_vec(
     return True
 
 
-def find_groups(masses_df: pd.DataFrame, min_group_size: int = 3, max_group_size: int = 5) -> List[List[Dict]]:
-    sorted_df = masses_df.sort_values('intensity', ascending=False)
+def find_groups(
+    masses_df: pd.DataFrame, min_group_size: int = 3, max_group_size: int = 5
+) -> List[List[Dict]]:
+    sorted_df = masses_df.sort_values("intensity", ascending=False)
 
-    seen_mzs: List[float] = []
+    seen_mzs: Set[float] = set()
     available_masses: List[Dict] = []
     for row in sorted_df.itertuples():
-        if any(is_same_mass(row.mz, s) for s in seen_mzs):
+        mz_rounded = round(row.mz, 6)
+        if mz_rounded in seen_mzs:
             continue
-        available_masses.append({
-            'mz': row.mz,
-            'rt': row.rt,
-            'rt_start': row.rt_start,
-            'rt_end': row.rt_end,
-            'intensity': row.intensity,
-        })
-        seen_mzs.append(row.mz)
+        seen_mzs.add(mz_rounded)
+        available_masses.append(
+            {
+                "mz": row.mz,
+                "rt": row.rt,
+                "rt_start": row.rt_start,
+                "rt_end": row.rt_end,
+                "intensity": row.intensity,
+            }
+        )
 
     n = len(available_masses)
     if n == 0:
         return []
 
-    mzs       = np.array([m['mz']        for m in available_masses], dtype=np.float64)
-    rts       = np.array([m['rt']        for m in available_masses], dtype=np.float64)
-    rt_starts = np.array([m['rt_start']  for m in available_masses], dtype=np.float64)
-    rt_ends   = np.array([m['rt_end']    for m in available_masses], dtype=np.float64)
-    intensities = np.array([m['intensity'] for m in available_masses], dtype=np.float64)
+    mzs = np.array([m["mz"] for m in available_masses], dtype=np.float64)
+    rts = np.array([m["rt"] for m in available_masses], dtype=np.float64)
+    rt_starts = np.array([m["rt_start"] for m in available_masses], dtype=np.float64)
+    rt_ends = np.array([m["rt_end"] for m in available_masses], dtype=np.float64)
+    intensities = np.array([m["intensity"] for m in available_masses], dtype=np.float64)
 
     available = np.ones(n, dtype=bool)
 
     groups: List[List[Dict]] = []
 
-    def _try_fill_group(group_indices, g_mzs, g_rt_starts, g_rt_ends, g_rts, g_intensities,
-                        min_intensity_ratio, min_ppm_diff):
+    def _try_fill_group(
+        group_indices,
+        g_mzs,
+        g_rt_starts,
+        g_rt_ends,
+        g_rts,
+        g_intensities,
+        min_intensity_ratio,
+        min_ppm_diff,
+    ):
         for cand_idx in range(seed_idx + 1, n):
             if not available[cand_idx] or cand_idx in group_indices:
                 continue
@@ -529,15 +614,20 @@ def find_groups(masses_df: pd.DataFrame, min_group_size: int = 3, max_group_size
                 break
             cand = available_masses[cand_idx]
             if check_mass_compatibility_vec(
-                g_mzs, g_rt_starts, g_rt_ends, g_rts, g_intensities, cand,
+                g_mzs,
+                g_rt_starts,
+                g_rt_ends,
+                g_rts,
+                g_intensities,
+                cand,
                 min_intensity_ratio=min_intensity_ratio,
                 min_ppm_diff=min_ppm_diff,
             ):
                 group_indices.append(cand_idx)
-                g_mzs         = np.append(g_mzs,         mzs[cand_idx])
-                g_rt_starts   = np.append(g_rt_starts,   rt_starts[cand_idx])
-                g_rt_ends     = np.append(g_rt_ends,     rt_ends[cand_idx])
-                g_rts         = np.append(g_rts,         rts[cand_idx])
+                g_mzs = np.append(g_mzs, mzs[cand_idx])
+                g_rt_starts = np.append(g_rt_starts, rt_starts[cand_idx])
+                g_rt_ends = np.append(g_rt_ends, rt_ends[cand_idx])
+                g_rts = np.append(g_rts, rts[cand_idx])
                 g_intensities = np.append(g_intensities, intensities[cand_idx])
         return group_indices, g_mzs, g_rt_starts, g_rt_ends, g_rts, g_intensities
 
@@ -546,21 +636,37 @@ def find_groups(masses_df: pd.DataFrame, min_group_size: int = 3, max_group_size
             continue
 
         group_indices = [seed_idx]
-        g_mzs         = mzs[seed_idx:seed_idx+1].copy()
-        g_rt_starts   = rt_starts[seed_idx:seed_idx+1].copy()
-        g_rt_ends     = rt_ends[seed_idx:seed_idx+1].copy()
-        g_rts         = rts[seed_idx:seed_idx+1].copy()
-        g_intensities = intensities[seed_idx:seed_idx+1].copy()
+        g_mzs = mzs[seed_idx : seed_idx + 1].copy()
+        g_rt_starts = rt_starts[seed_idx : seed_idx + 1].copy()
+        g_rt_ends = rt_ends[seed_idx : seed_idx + 1].copy()
+        g_rts = rts[seed_idx : seed_idx + 1].copy()
+        g_intensities = intensities[seed_idx : seed_idx + 1].copy()
 
-        group_indices, g_mzs, g_rt_starts, g_rt_ends, g_rts, g_intensities = _try_fill_group(
-            group_indices, g_mzs, g_rt_starts, g_rt_ends, g_rts, g_intensities,
-            min_intensity_ratio=0.90, min_ppm_diff=5.0,
+        group_indices, g_mzs, g_rt_starts, g_rt_ends, g_rts, g_intensities = (
+            _try_fill_group(
+                group_indices,
+                g_mzs,
+                g_rt_starts,
+                g_rt_ends,
+                g_rts,
+                g_intensities,
+                min_intensity_ratio=0.90,
+                min_ppm_diff=5.0,
+            )
         )
 
         if len(group_indices) < min_group_size:
-            group_indices, g_mzs, g_rt_starts, g_rt_ends, g_rts, g_intensities = _try_fill_group(
-                group_indices, g_mzs, g_rt_starts, g_rt_ends, g_rts, g_intensities,
-                min_intensity_ratio=0.65, min_ppm_diff=2.0,
+            group_indices, g_mzs, g_rt_starts, g_rt_ends, g_rts, g_intensities = (
+                _try_fill_group(
+                    group_indices,
+                    g_mzs,
+                    g_rt_starts,
+                    g_rt_ends,
+                    g_rts,
+                    g_intensities,
+                    min_intensity_ratio=0.65,
+                    min_ppm_diff=2.0,
+                )
             )
 
         for idx in group_indices:
@@ -585,9 +691,18 @@ def build_mass_groups_from_files(
     masses_by_file: Dict[str, Set[float]] = {}
     all_features: List[Dict] = []
 
-    with ProcessPoolExecutor(max_workers=min(len(file_paths), multiprocessing.cpu_count())) as executor:
+    with ProcessPoolExecutor(
+        max_workers=min(len(file_paths), multiprocessing.cpu_count())
+    ) as executor:
         futures = [
-            executor.submit(process_single_file, f, noise_level, mz_tolerance, min_consec_scans, verbose)
+            executor.submit(
+                process_single_file,
+                f,
+                noise_level,
+                mz_tolerance,
+                min_consec_scans,
+                verbose,
+            )
             for f in file_paths
         ]
         for fut in futures:
@@ -602,17 +717,19 @@ def build_mass_groups_from_files(
         for mz in rounded_masses:
             mass_counts[float(mz)] += 1
 
-    valid_masses = {mz for mz, count in mass_counts.items() if count >= min_sample_presence}
+    valid_masses = {
+        mz for mz, count in mass_counts.items() if count >= min_sample_presence
+    }
 
     valid_features = []
     for feature in all_features:
-        mz_round = round(feature['mz'], 6)
+        mz_round = round(feature["mz"], 6)
         if mz_round in valid_masses:
             valid_features.append(feature)
 
     unique_features: Dict[float, Dict] = {}
-    for feature in sorted(valid_features, key=lambda x: x['intensity'], reverse=True):
-        mz_round = round(feature['mz'], 6)
+    for feature in sorted(valid_features, key=lambda x: x["intensity"], reverse=True):
+        mz_round = round(feature["mz"], 6)
         if mz_round not in unique_features:
             unique_features[mz_round] = feature
 
@@ -620,19 +737,24 @@ def build_mass_groups_from_files(
     # noise level before grouping.  This catches clusters that scraped past
     # the per-scan filter but whose overall intensity is still sub-noise.
     above_noise = {
-        mz: feat for mz, feat in unique_features.items()
-        if feat['intensity'] >= noise_level
+        mz: feat
+        for mz, feat in unique_features.items()
+        if feat["intensity"] >= noise_level
     }
     n_dropped = len(unique_features) - len(above_noise)
     if n_dropped:
-        print(f"[MassGrouping] Dropped {n_dropped} feature(s) below noise floor "
-              f"({noise_level:.0f}) before grouping.")
+        print(
+            f"[MassGrouping] Dropped {n_dropped} feature(s) below noise floor "
+            f"({noise_level:.0f}) before grouping."
+        )
     unique_features = above_noise
 
-    features_sorted = sorted(unique_features.values(), key=lambda x: x['mz'])
+    features_sorted = sorted(unique_features.values(), key=lambda x: x["mz"])
     df = pd.DataFrame(features_sorted)
 
-    mass_groups = find_groups(df, min_group_size=min_group_size, max_group_size=max_group_size)
+    mass_groups = find_groups(
+        df, min_group_size=min_group_size, max_group_size=max_group_size
+    )
 
     out: Dict[str, List[float]] = {}
     out_intensities: Dict[str, List[float]] = {}
@@ -642,6 +764,63 @@ def build_mass_groups_from_files(
 
     return out, out_intensities
 
+
+async def build_mass_groups_from_files_async(
+    file_paths: List[str],
+    *,
+    noise_level: float = NOISE_LEVEL,
+    mz_tolerance: float = MZ_TOLERANCE,
+    min_consec_scans: int = MIN_CONSEC_SCANS,
+    min_sample_presence: int = MIN_SAMPLE_PRESENCE,
+    min_group_size: int = 3,
+    max_group_size: int = 5,
+    verbose: bool = False,
+) -> Tuple[Dict[str, List[float]], Dict[str, List[float]]]:
+    masses_by_file, all_features = await process_files_async(
+        file_paths, noise_level, mz_tolerance, min_consec_scans
+    )
+
+    mass_counts = defaultdict(int)
+    for masses in masses_by_file.values():
+        rounded_masses = np.round(list(masses), decimals=6)
+        for mz in rounded_masses:
+            mass_counts[float(mz)] += 1
+
+    valid_masses = {
+        mz for mz, count in mass_counts.items() if count >= min_sample_presence
+    }
+
+    valid_features = [f for f in all_features if round(f["mz"], 6) in valid_masses]
+
+    unique_features: Dict[float, Dict] = {}
+    for feature in sorted(valid_features, key=lambda x: x["intensity"], reverse=True):
+        mz_round = round(feature["mz"], 6)
+        if mz_round not in unique_features:
+            unique_features[mz_round] = feature
+
+    above_noise = {
+        mz: feat
+        for mz, feat in unique_features.items()
+        if feat["intensity"] >= noise_level
+    }
+    unique_features = above_noise
+
+    features_sorted = sorted(unique_features.values(), key=lambda x: x["mz"])
+    df = pd.DataFrame(features_sorted)
+
+    mass_groups = find_groups(
+        df, min_group_size=min_group_size, max_group_size=max_group_size
+    )
+
+    out: Dict[str, List[float]] = {}
+    out_intensities: Dict[str, List[float]] = {}
+    for i, group in enumerate(mass_groups, 1):
+        out[f"Group{i}"] = [float(m["mz"]) for m in group]
+        out_intensities[f"Group{i}"] = [float(m["intensity"]) for m in group]
+
+    return out, out_intensities
+
+
 def main():
     features = process_files()
 
@@ -649,12 +828,12 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     df = pd.DataFrame(features)
-    top_50 = df.nlargest(50, 'intensity')
+    top_50 = df.nlargest(50, "intensity")
 
-    output_file = output_dir / 'mass_features_4.xlsx'
-    with pd.ExcelWriter(output_file, engine='openpyxl') as writer:
-        df.to_excel(writer, sheet_name='All Features', index=False)
-        top_50.to_excel(writer, sheet_name='Top 50 Intense Peaks', index=False)
+    output_file = output_dir / "mass_features_4.xlsx"
+    with pd.ExcelWriter(output_file, engine="openpyxl") as writer:
+        df.to_excel(writer, sheet_name="All Features", index=False)
+        top_50.to_excel(writer, sheet_name="Top 50 Intense Peaks", index=False)
 
     print(f"\nFound {len(features)} features")
     print(f"Results saved to {output_file}")
@@ -670,7 +849,9 @@ def main():
     min_group_size = 3
     max_group_size = 5
 
-    mass_groups = find_groups(df, min_group_size=min_group_size, max_group_size=max_group_size)
+    mass_groups = find_groups(
+        df, min_group_size=min_group_size, max_group_size=max_group_size
+    )
 
     group_data = []
     total_grouped_masses = 0
@@ -678,34 +859,39 @@ def main():
 
     for i, group in enumerate(mass_groups, 1):
         for mass in group:
-            if any(is_same_mass(mass['mz'], used) for used in all_used_masses):
-                print(f"Warning: Mass {mass['mz']:.6f} appears multiple times in groups!")
+            if any(is_same_mass(mass["mz"], used) for used in all_used_masses):
+                print(
+                    f"Warning: Mass {mass['mz']:.6f} appears multiple times in groups!"
+                )
                 continue
-            group_data.append({
-                'Group': f'Group {i}',
-                'Mass (m/z)': mass['mz'],
-                'RT (min)': mass['rt'],
-                'RT Start (min)': mass['rt_start'],
-                'RT End (min)': mass['rt_end'],
-                'Intensity': mass['intensity']
-            })
-            all_used_masses.append(mass['mz'])
+            group_data.append(
+                {
+                    "Group": f"Group {i}",
+                    "Mass (m/z)": mass["mz"],
+                    "RT (min)": mass["rt"],
+                    "RT Start (min)": mass["rt_start"],
+                    "RT End (min)": mass["rt_end"],
+                    "Intensity": mass["intensity"],
+                }
+            )
+            all_used_masses.append(mass["mz"])
             total_grouped_masses += 1
 
     groups_df = pd.DataFrame(group_data)
     groups_df = groups_df.sort_values(
-        by='Group',
-        key=lambda col: col.str.extract(r'(\d+)').astype(int)[0]
+        by="Group", key=lambda col: col.str.extract(r"(\d+)").astype(int)[0]
     )
 
     formatted_groups = []
     for i, group in enumerate(mass_groups, 1):
         group_masses = [f"{mass['mz']:.4f}" for mass in group]
-        formatted_groups.append({
-            'Group': f"'Group {i}': ",
-            'Size': len(group),
-            'Masses': f"[{', '.join(group_masses)}]"
-        })
+        formatted_groups.append(
+            {
+                "Group": f"'Group {i}': ",
+                "Size": len(group),
+                "Masses": f"[{', '.join(group_masses)}]",
+            }
+        )
 
     formatted_df = pd.DataFrame(formatted_groups)
 
@@ -717,17 +903,22 @@ def main():
     print(f"\nFound {len(mass_groups)} mass groups")
     print(f"Total masses in groups: {total_grouped_masses}")
     print(f"Average group size: {total_grouped_masses / len(mass_groups):.1f}")
-    print(f"Groups with 3-5 members: {n_in_target}/{len(mass_groups)} ({pct_in_target:.1f}%)")
+    print(
+        f"Groups with 3-5 members: {n_in_target}/{len(mass_groups)} ({pct_in_target:.1f}%)"
+    )
     print("\nGroup size distribution:")
     for size, count in size_counts.items():
         print(f"  Size {size}: {count} group(s)")
 
-    with pd.ExcelWriter(output_file, engine='openpyxl', mode='a', if_sheet_exists='replace') as writer:
-        groups_df.to_excel(writer, sheet_name='Mass Groups', index=False)
-        formatted_df.to_excel(writer, sheet_name='Formatted Groups', index=False)
+    with pd.ExcelWriter(
+        output_file, engine="openpyxl", mode="a", if_sheet_exists="replace"
+    ) as writer:
+        groups_df.to_excel(writer, sheet_name="Mass Groups", index=False)
+        formatted_df.to_excel(writer, sheet_name="Formatted Groups", index=False)
 
     print(f"\nGrouping results appended to {output_file}")
     print(f"Selection manifest saved at: {_manifest_path()}")
+
 
 if __name__ == "__main__":
     main()
