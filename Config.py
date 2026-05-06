@@ -21,13 +21,21 @@ class Config:
     GROUP_MZ_TOLERANCE = 0.0005
     GROUP_MIN_CONSEC_SCANS = 7
     GROUP_MIN_SAMPLE_PRESENCE = 1
-    GROUP_MIN_GROUP_SIZE = 3
+    GROUP_MIN_GROUP_SIZE = 2
     GROUP_MAX_GROUP_SIZE = 5
 
     MASS_GROUPS_CACHE_NAME = "MassGroups_Cache.json"
     MASS_GROUPS_EXPORT_NAME = "MassGroups_Formatted.csv"
     MASS_GROUPS: dict[str, list[float]] = {}   # populated by initialize_mass_groups() or cache
     MASS_GROUPS_INTENSITIES: dict[str, list[float]] = {}  # parallel intensities for CSV export
+    MASS_GROUPS_RTS: dict[str, list[float | None]] = {}  # parallel RT apex values for CSV export
+    MASS_GROUPS_RT_STARTS: dict[str, list[float | None]] = {}  # parallel RT start values
+    MASS_GROUPS_RT_ENDS: dict[str, list[float | None]] = {}  # parallel RT end values
+
+    # Easy grouping diagnostics/tuning
+    GROUP_RT_APEX_SEPARATION = 1.0       # candidates closer than this RT distance are not grouped
+    GROUP_MIN_INTENSITY_RATIO = 0.55     # MUST stay 0.55 per your requirement
+    GROUP_REQUIRE_NO_RT_OVERLAP = True   # True = RT windows cannot overlap
     MASS_LIST: list[float] = []               # active group's masses
     CURRENT_GROUP: str | None = None
     MASS_TOLERANCE = 0.0005
@@ -71,21 +79,43 @@ class Config:
     @classmethod
     def save_mass_groups_cache(cls) -> None:
         """
-        Write MASS_GROUPS to disk and record the path in an env var so that
-        spawned worker processes (which re-import Config with class defaults)
-        can still locate the correct file.
+        Write mass groups to disk and record the path in an env var so spawned
+        worker processes can locate the same cache.
+
+        This cache supports both:
+          - old format: {"Group1": [mz1, mz2]}
+          - new rich format with masses/intensities/RTs
         """
         import os
         p = cls._mass_groups_cache_path()
-        p.write_text(json.dumps(cls.MASS_GROUPS, indent=2), encoding="utf-8")
-        # Publish the absolute path so workers inherit it via os.environ
+
+        cache_data = {}
+        for name, masses in cls.MASS_GROUPS.items():
+            cache_data[name] = {
+                "masses": [float(x) for x in masses],
+                "intensities": [float(x) for x in cls.MASS_GROUPS_INTENSITIES.get(name, [])],
+                "rts": [
+                    None if x is None else float(x)
+                    for x in cls.MASS_GROUPS_RTS.get(name, [])
+                ],
+                "rt_starts": [
+                    None if x is None else float(x)
+                    for x in cls.MASS_GROUPS_RT_STARTS.get(name, [])
+                ],
+                "rt_ends": [
+                    None if x is None else float(x)
+                    for x in cls.MASS_GROUPS_RT_ENDS.get(name, [])
+                ],
+            }
+
+        p.write_text(json.dumps(cache_data, indent=2), encoding="utf-8")
         os.environ[cls._CACHE_PATH_ENV] = str(p)
         print(f"[Config] Mass groups cache saved → {p}")
 
     @classmethod
     def _resolve_cache_path(cls) -> Path:
         """
-        Return the cache path to use.  Workers get it from the env var written
+        Return the cache path to use. Workers get it from the env var written
         by the main process; the main process derives it from class variables.
         """
         import os
@@ -99,25 +129,62 @@ class Config:
         p = cls._resolve_cache_path()
         if not p.exists():
             return False
+
         data = json.loads(p.read_text(encoding="utf-8"))
-        cls.MASS_GROUPS = {k: [float(x) for x in v] for k, v in data.items()}
+
+        cls.MASS_GROUPS = {}
+        cls.MASS_GROUPS_INTENSITIES = {}
+        cls.MASS_GROUPS_RTS = {}
+        cls.MASS_GROUPS_RT_STARTS = {}
+        cls.MASS_GROUPS_RT_ENDS = {}
+
+        for name, value in data.items():
+            # Backward compatible old format: "Group1": [166.0862, 116.0706]
+            if isinstance(value, list):
+                cls.MASS_GROUPS[name] = [float(x) for x in value]
+                continue
+
+            # New rich format
+            cls.MASS_GROUPS[name] = [float(x) for x in value.get("masses", [])]
+            cls.MASS_GROUPS_INTENSITIES[name] = [float(x) for x in value.get("intensities", [])]
+            cls.MASS_GROUPS_RTS[name] = [
+                None if x is None else float(x)
+                for x in value.get("rts", [])
+            ]
+            cls.MASS_GROUPS_RT_STARTS[name] = [
+                None if x is None else float(x)
+                for x in value.get("rt_starts", [])
+            ]
+            cls.MASS_GROUPS_RT_ENDS[name] = [
+                None if x is None else float(x)
+                for x in value.get("rt_ends", [])
+            ]
+
         return True
 
     @classmethod
     def load_mass_groups_from_json(cls, json_path: str | Path) -> bool:
         """
-        Load MASS_GROUPS from an *external* JSON file supplied by the user
-        (e.g. a cache from a previous run on the same sample set).
-        Returns True on success.
+        Load MASS_GROUPS from an external JSON file supplied by the user.
+        Supports both old list-only cache and new rich cache with RTs.
         """
         p = Path(json_path)
         if not p.exists():
             return False
-        data = json.loads(p.read_text(encoding="utf-8"))
-        cls.MASS_GROUPS = {k: [float(x) for x in v] for k, v in data.items()}
-        # Write to current run's cache location and register the path in env
-        cls.save_mass_groups_cache()
-        return True
+
+        # Temporarily point loader at the imported JSON
+        import os
+        old_env = os.environ.get(cls._CACHE_PATH_ENV)
+        os.environ[cls._CACHE_PATH_ENV] = str(p)
+        ok = cls.load_mass_groups_cache()
+        if old_env is None:
+            os.environ.pop(cls._CACHE_PATH_ENV, None)
+        else:
+            os.environ[cls._CACHE_PATH_ENV] = old_env
+
+        if ok:
+            cls.save_mass_groups_cache()
+        return ok
 
     @classmethod
     def ensure_mass_groups_loaded(cls) -> None:
@@ -206,7 +273,7 @@ class Config:
             target_files=cls.TARGET_FILES or [],
         )
 
-        cls.MASS_GROUPS, cls.MASS_GROUPS_INTENSITIES = build_mass_groups_from_files(
+        grouping_result = build_mass_groups_from_files(
             grouping_files,
             noise_level=cls.GROUP_NOISE_LEVEL,
             mz_tolerance=cls.GROUP_MZ_TOLERANCE,
@@ -216,6 +283,25 @@ class Config:
             max_group_size=cls.GROUP_MAX_GROUP_SIZE,
             verbose=getattr(cls, "GROUPING_VERBOSE", False),
         )
+
+        # Supports either:
+        #   old MassGrouping return: (groups, intensities)
+        #   new MassGrouping return: (groups, intensities, rts, rt_starts, rt_ends)
+        if len(grouping_result) == 2:
+            cls.MASS_GROUPS, cls.MASS_GROUPS_INTENSITIES = grouping_result
+            cls.MASS_GROUPS_RTS = {}
+            cls.MASS_GROUPS_RT_STARTS = {}
+            cls.MASS_GROUPS_RT_ENDS = {}
+            print("[Config] WARNING: MassGrouping returned only masses/intensities, so RT columns will be blank.")
+            print("[Config] Update MassGrouping.py to return RT dictionaries; see patch below.")
+        else:
+            (
+                cls.MASS_GROUPS,
+                cls.MASS_GROUPS_INTENSITIES,
+                cls.MASS_GROUPS_RTS,
+                cls.MASS_GROUPS_RT_STARTS,
+                cls.MASS_GROUPS_RT_ENDS,
+            ) = grouping_result
 
         if not cls.MASS_GROUPS:
             raise ValueError("Dynamic mass grouping produced 0 groups.")
@@ -250,8 +336,13 @@ class Config:
     @classmethod
     def save_mass_groups_formatted_csv(cls) -> Path:
         """
-        Saves ALL groups (not limited by MAX_GROUPS_TO_RUN) to:
-          BASE_DIR / OUTPUT_ROOT / ANALYSIS_FOLDER / MassGroups_Formatted.csv
+        Saves ALL groups to MassGroups_Formatted.csv.
+
+        Output shape:
+          Group, Size, Masses, Intensities,
+          Mass1, RT1, Intensity1, Mass2, RT2, Intensity2, ...
+
+        RT columns will populate only when MassGrouping.py returns RT dictionaries.
         """
         cls.ensure_mass_groups_loaded()
 
@@ -260,16 +351,41 @@ class Config:
         out_path = out_dir / cls.MASS_GROUPS_EXPORT_NAME
 
         group_names = sorted(cls.MASS_GROUPS.keys(), key=cls._group_sort_key)
+        max_size = max((len(cls.MASS_GROUPS.get(name, [])) for name in group_names), default=0)
+
+        header = ["Group", "Size", "Masses", "Intensities"]
+        for i in range(1, max_size + 1):
+            header.extend([f"Mass{i}", f"RT{i}", f"Intensity{i}"])
 
         with out_path.open("w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
-            writer.writerow(["Group", "Size", "Masses", "Intensities"])
+            writer.writerow(header)
+
             for name in group_names:
                 masses = cls.MASS_GROUPS.get(name, [])
                 intensities = cls.MASS_GROUPS_INTENSITIES.get(name, [])
+                rts = cls.MASS_GROUPS_RTS.get(name, [])
+
                 masses_str = "[" + ", ".join(f"{float(m):.4f}" for m in masses) + "]"
-                intensities_str = "[" + ", ".join(f"{float(x):.0f}" for x in intensities) + "]" if intensities else "N/A"
-                writer.writerow([cls._display_group_label(name), len(masses), masses_str, intensities_str])
+                intensities_str = (
+                    "[" + ", ".join(f"{float(x):.0f}" for x in intensities) + "]"
+                    if intensities else "N/A"
+                )
+
+                row = [cls._display_group_label(name), len(masses), masses_str, intensities_str]
+
+                for i in range(max_size):
+                    mass = masses[i] if i < len(masses) else ""
+                    intensity = intensities[i] if i < len(intensities) else ""
+                    rt = rts[i] if i < len(rts) else ""
+
+                    row.extend([
+                        "" if mass == "" else f"{float(mass):.4f}",
+                        "" if rt in ("", None) else f"{float(rt):.4f}",
+                        "" if intensity == "" else f"{float(intensity):.0f}",
+                    ])
+
+                writer.writerow(row)
 
         return out_path
 
