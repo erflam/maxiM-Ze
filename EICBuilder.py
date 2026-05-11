@@ -26,6 +26,10 @@ DEBUG_PEAK_FILTER = False
 EXPORT_DEBUG_CSV = False
 BYPASS_CACHE_WHEN_DEBUG = False
 
+# Noise detection: any m/z with more than this many peaks in a single file
+# is considered noise and removed from the group for that file.
+NOISE_PEAK_COUNT_THRESHOLD = 15
+
 
 def _dark_hex_palette(n: int):
     """Generate n distinct dark-ish hex colors."""
@@ -261,7 +265,15 @@ def looks_like_real_peak(y_raw_window: np.ndarray):
 
 
 def analyze_ms_file_plotly(file_path, output_image_path, file_colors, axis_meta_csv=None):
-    """Analyze MS file and generate plotly visualization."""
+    """Analyze MS file and generate plotly visualization.
+
+    Returns
+    -------
+    tuple: (peaks_out, peaks_prefilter, noisy_masses)
+        peaks_out       — filtered peak records written to peaks_{group}.csv
+        peaks_prefilter — all detected peak records written to peaks_prefilter_{group}.csv
+        noisy_masses    — set of m/z strings that exceeded NOISE_PEAK_COUNT_THRESHOLD
+    """
 
     group_tag = Config.CURRENT_GROUP.replace(" ", "")
 
@@ -279,7 +291,7 @@ def analyze_ms_file_plotly(file_path, output_image_path, file_colors, axis_meta_
         )
         if os.path.exists(peaks_csv):
             try:
-                return pd.read_csv(peaks_csv).to_dict('records')
+                return pd.read_csv(peaks_csv).to_dict('records'), [], set()
             except Exception:
                 pass
 
@@ -316,21 +328,15 @@ def analyze_ms_file_plotly(file_path, output_image_path, file_colors, axis_meta_
                 print(f"Error processing scan: {str(e)}")
                 continue
 
-    fig = go.Figure()
+    # peaks_prefilter_by_mass collects records per mass string so we can
+    # apply the noise count check before touching the figure.
+    peaks_prefilter_by_mass: dict[str, list] = {mz_str: [] for mz_str in mass_list_str}
 
-    # Keep different color for each mass
-    mass_colors = _dark_hex_palette(len(mass_list))
-    mass_color_map = {mass_list[i]: mass_colors[i] for i in range(len(mass_list))}
-
-    peaks_out = []          # peaks that pass the noise filter — written to peaks_{group}.csv
-    peaks_prefilter = []    # ALL detected peaks before noise filter — written to peaks_prefilter_{group}.csv
     debug_rows = []
-    all_peak_rts = []
 
     rt_vals = np.array(rt_values)
     scan_numbers_arr = np.array(scan_numbers, dtype=object)
 
-    # Noise threshold from GUI
     gui_noise_level = Config.GROUP_NOISE_LEVEL
 
     def split_shoulders_in_window(
@@ -487,6 +493,11 @@ def analyze_ms_file_plotly(file_path, output_image_path, file_colors, axis_meta_
             }
         ]
 
+    # ── Per-mass peak detection — collect into peaks_prefilter_by_mass ──
+    # We also stash (mass_idx, x_peak, y_peak, specific_mass) for every
+    # passing record so we can add figure traces after the noise check.
+    trace_candidates: list[tuple] = []  # (mass_str, x_peak, y_peak, specific_mass)
+
     for mass_idx, specific_mass in enumerate(mass_list):
         intensity_vals = np.array(intensity_by_mass[specific_mass])
         if len(intensity_vals) < 3 or np.max(intensity_vals) == 0:
@@ -537,6 +548,8 @@ def analyze_ms_file_plotly(file_path, output_image_path, file_colors, axis_meta_
         except Exception as e:
             print(f"Error finding peaks for mass {mass_list_str[mass_idx]}: {str(e)}")
             continue
+
+        mz_str = mass_list_str[mass_idx]
 
         for i, idx in enumerate(peaks):
             try:
@@ -612,28 +625,54 @@ def analyze_ms_file_plotly(file_path, output_image_path, file_colors, axis_meta_
                     left_idx=left_idx,
                     right_idx=right_idx,
                     noise_level=noise_level,
-                    mass_str=mass_list_str[mass_idx],
+                    mass_str=mz_str,
                     base_name=base
                 )
 
-                # ── Always add to prefilter list ──────────────────────
-                peaks_prefilter.extend(new_records)
+                # Collect into per-mass prefilter bucket
+                peaks_prefilter_by_mass[mz_str].extend(new_records)
 
-                # ── Only plot and keep peaks above the GUI noise level ─
+                # Stash trace candidate for later (after noise check)
                 passing_records = [r for r in new_records if r.get('height', 0) >= gui_noise_level]
                 if passing_records:
-                    peaks_out.extend(passing_records)
-                    fig.add_trace(go.Scatter(
-                        x=x_peak, y=y_peak,
-                        mode='lines',
-                        line=dict(color=mass_color_map[specific_mass], width=3),
-                        showlegend=False
-                    ))
-                    all_peak_rts.extend(x_peak.tolist())
+                    trace_candidates.append((mz_str, x_peak.copy(), y_peak.copy(), specific_mass))
 
             except Exception as e:
                 print(f"Error processing peak {i} for mass {mass_list_str[mass_idx]}: {str(e)}")
                 continue
+
+    # ── Noise check: flag any m/z with > NOISE_PEAK_COUNT_THRESHOLD peaks ──
+    noisy_masses: set[str] = set()
+    for mz_str, records in peaks_prefilter_by_mass.items():
+        if len(records) > NOISE_PEAK_COUNT_THRESHOLD:
+            noisy_masses.add(mz_str)
+            print(f"[Noise] m/z {mz_str} detected as noise ({len(records)} peaks in {base})")
+
+    # ── Build flat prefilter and filtered lists, excluding noisy masses ──
+    peaks_prefilter: list[dict] = []
+    peaks_out: list[dict] = []
+    for mz_str, records in peaks_prefilter_by_mass.items():
+        if mz_str in noisy_masses:
+            continue
+        peaks_prefilter.extend(records)
+        peaks_out.extend([r for r in records if r.get('height', 0) >= gui_noise_level])
+
+    # ── Build figure from stashed trace candidates, skipping noisy masses ──
+    fig = go.Figure()
+    mass_colors = _dark_hex_palette(len(mass_list))
+    mass_color_map = {mass_list[i]: mass_colors[i] for i in range(len(mass_list))}
+    all_peak_rts: list[float] = []
+
+    for (mz_str, x_peak, y_peak, specific_mass) in trace_candidates:
+        if mz_str in noisy_masses:
+            continue
+        fig.add_trace(go.Scatter(
+            x=x_peak, y=y_peak,
+            mode='lines',
+            line=dict(color=mass_color_map[specific_mass], width=3),
+            showlegend=False
+        ))
+        all_peak_rts.extend(x_peak.tolist())
 
     if not fig.data:
         print(f"[!] No peaks above noise ({gui_noise_level:.0f}) in {base}; skipping.")
@@ -646,7 +685,7 @@ def analyze_ms_file_plotly(file_path, output_image_path, file_colors, axis_meta_
             os.makedirs(os.path.dirname(debug_csv), exist_ok=True)
             pd.DataFrame(debug_rows).to_csv(debug_csv, index=False)
             print(f"[DEBUG] wrote {len(debug_rows)} rows to {debug_csv}")
-        return peaks_out, peaks_prefilter
+        return peaks_out, peaks_prefilter, noisy_masses
 
     # --- FORCE SAME X-AXIS SIZE (>= 6 minutes) FOR EVERY IMAGE ---
     min_rt = float(np.min(rt_vals))
@@ -737,7 +776,7 @@ def analyze_ms_file_plotly(file_path, output_image_path, file_colors, axis_meta_
         pd.DataFrame(debug_rows).to_csv(debug_csv, index=False)
         print(f"[DEBUG] wrote {len(debug_rows)} rows to {debug_csv}")
 
-    return peaks_out, peaks_prefilter
+    return peaks_out, peaks_prefilter, noisy_masses
 
 
 def process_file_checkpoint2(fp, dirs, file_colors, group_name):
@@ -755,9 +794,17 @@ def process_file_checkpoint2(fp, dirs, file_colors, group_name):
             return f"[↷] {base} (png+peaks cached)"
 
         axis_meta_csv = os.path.join(dirs['csv'], f"{base}_axis_{group_tag}.csv")
-        peaks, peaks_prefilter = analyze_ms_file_plotly(fp, png_path, file_colors, axis_meta_csv=axis_meta_csv)
+        peaks, peaks_prefilter, noisy_masses = analyze_ms_file_plotly(
+            fp, png_path, file_colors, axis_meta_csv=axis_meta_csv
+        )
 
-        # Save prefilter CSV (all detected peaks, no noise filter applied)
+        # If every mass in the group was flagged as noise, skip entirely
+        if noisy_masses:
+            remaining = [m for m in [f"{x:.4f}" for x in Config.MASS_LIST] if m not in noisy_masses]
+            if not remaining:
+                return f"[–] {base} skipped — all masses detected as noise"
+
+        # Save prefilter CSV (all detected peaks, noisy masses already excluded)
         if peaks_prefilter:
             pd.DataFrame(peaks_prefilter).to_csv(peaks_prefilter_csv, index=False, float_format='%.3f')
 
@@ -768,7 +815,11 @@ def process_file_checkpoint2(fp, dirs, file_colors, group_name):
         n_total = len(peaks_prefilter)
         n_kept = len(peaks)
         n_dropped = n_total - n_kept
-        return f"[✔] {base} (png+peaks) — {n_kept} peaks kept, {n_dropped} below noise ({Config.GROUP_NOISE_LEVEL:.0f})"
+        noise_note = f", {len(noisy_masses)} noisy m/z removed" if noisy_masses else ""
+        return (
+            f"[✔] {base} (png+peaks) — {n_kept} peaks kept, "
+            f"{n_dropped} below noise ({Config.GROUP_NOISE_LEVEL:.0f}){noise_note}"
+        )
 
     except Exception as e:
         return f"[!] Error: {os.path.basename(fp)}: {str(e)[:50]}"

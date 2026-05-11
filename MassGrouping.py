@@ -27,15 +27,15 @@ MIN_SAMPLE_PRESENCE = 2
 # Mass grouping parameters
 # IMPORTANT:
 # RT grouping rule below means APEX RT must be AT LEAST 1.0 minute apart.
-MIN_GROUP_SIZE = 3
-MAX_GROUP_SIZE = 5
+MIN_GROUP_SIZE = 2
+MAX_GROUP_SIZE = 4
 RELAXED_MIN_GROUP_SIZE = 2
-RELAXED_MAX_GROUP_SIZE = 5
+RELAXED_MAX_GROUP_SIZE = 4
 
 GROUP_RT_APEX_SEPARATION = 1.0       # minutes; apex RT difference MUST be >= 1.0
 GROUP_MIN_INTENSITY_RATIO = 0.55     # keep at 0.55
-GROUP_REQUIRE_NO_RT_OVERLAP = False  # False = only enforce apex RT >= 1.0 min.
-                                     # True can block many otherwise valid RT-separated groups.
+GROUP_REQUIRE_NO_RT_OVERLAP = True   # FIX: now always True; incompatible masses are
+                                     # those whose RT windows overlap on ANY peak.
 
 USE_STUDY_DESIGN = False
 N_FILES_TO_PROCESS = 6
@@ -427,11 +427,29 @@ def is_same_mass(mz1: float, mz2: float, tolerance: float = 0.0005) -> bool:
     return abs(mz1 - mz2) <= tolerance
 
 
+# ---------------------------------------------------------------------------
+# FIX: Multi-peak RT overlap helpers
+# ---------------------------------------------------------------------------
+
+def _peaks_overlap(peaks_a: List[Tuple[float, float]], peaks_b: List[Tuple[float, float]]) -> bool:
+    """
+    Return True if ANY peak window from mass A overlaps with ANY peak window from mass B.
+
+    A window (start_i, end_i) overlaps (start_j, end_j) when:
+        start_i <= end_j  AND  start_j <= end_i
+    """
+    for (start_a, end_a) in peaks_a:
+        for (start_b, end_b) in peaks_b:
+            if start_a <= end_b and start_b <= end_a:
+                return True
+    return False
+
+
 def build_compatibility_matrix(
         mass_data: np.ndarray,
         rt_apex_separation: float,
         min_intensity_ratio: float,
-        require_no_rt_overlap: bool,
+        all_peaks_by_index: List[List[Tuple[float, float]]],
 ) -> np.ndarray:
     """
     Precompute compatibility once.
@@ -439,36 +457,44 @@ def build_compatibility_matrix(
     mass_data columns:
         [rt, intensity, mz, rt_start, rt_end]
 
-    Required rule:
-        abs(RT_i - RT_j) >= 1.0 minute
+    Rules:
+        1. abs(apex_RT_i - apex_RT_j) >= rt_apex_separation  (1.0 min)
+        2. intensity ratio >= min_intensity_ratio             (0.55)
+        3. NO RT window overlap across ALL peaks for the pair
+           (checked via all_peaks_by_index — a list of [(rt_start, rt_end), ...]
+            for every peak of each mass, not just the representative one)
 
-    Optional:
-        If require_no_rt_overlap=True, RT windows must also not overlap.
-        Default is False because the user's stated rule is apex RT >= 1 minute.
+    Parameters
+    ----------
+    all_peaks_by_index : list of length n
+        all_peaks_by_index[i] is the list of (rt_start, rt_end) tuples
+        for every detected peak belonging to mass i.
     """
+    n = len(mass_data)
     rts = mass_data[:, 0]
     intensities = mass_data[:, 1]
-    rt_starts = mass_data[:, 3]
-    rt_ends = mass_data[:, 4]
 
+    # --- Rule 1: apex RT separation ---
     rt_ok = np.abs(rts[:, None] - rts[None, :]) >= rt_apex_separation
 
+    # --- Rule 2: intensity ratio ---
     intensity_ratio = (
         np.minimum(intensities[:, None], intensities[None, :]) /
         np.maximum(intensities[:, None], intensities[None, :])
     )
     intensity_ok = intensity_ratio >= min_intensity_ratio
 
-    if require_no_rt_overlap:
-        overlap = (
-            (rt_starts[:, None] <= rt_ends[None, :]) &
-            (rt_starts[None, :] <= rt_ends[:, None])
-        )
-        rt_window_ok = ~overlap
-    else:
-        rt_window_ok = np.ones_like(rt_ok, dtype=bool)
+    # --- Rule 3: strict all-peaks RT overlap check ---
+    # Build a boolean matrix: no_overlap[i, j] = True if masses i and j
+    # share NO overlapping RT window across ALL their peaks.
+    no_overlap = np.ones((n, n), dtype=bool)
+    for i in range(n):
+        for j in range(i + 1, n):
+            if _peaks_overlap(all_peaks_by_index[i], all_peaks_by_index[j]):
+                no_overlap[i, j] = False
+                no_overlap[j, i] = False
 
-    compat = rt_ok & intensity_ok & rt_window_ok
+    compat = rt_ok & intensity_ok & no_overlap
     np.fill_diagonal(compat, False)
     return compat
 
@@ -510,9 +536,7 @@ def group_from_available_seed_repack(
 
             candidate_indices = np.concatenate(([seed_idx], compatible))
 
-            # Keep highest intensity candidates.
-            # Because available_masses/mass_data are already intensity sorted,
-            # this preserves the user's "go down the list" behavior.
+            # Keep highest intensity candidates up to max_group_size.
             final_indices = sorted(
                 candidate_indices,
                 key=lambda i: mass_data[i][1],
@@ -536,28 +560,42 @@ def group_from_available_seed_repack(
 
 def find_groups_two_tier(
         masses_df: pd.DataFrame,
+        all_features: List[Dict],
         min_group_size: int = MIN_GROUP_SIZE,
         max_group_size: int = MAX_GROUP_SIZE,
         rt_apex_separation: float = GROUP_RT_APEX_SEPARATION,
         min_intensity_ratio: float = GROUP_MIN_INTENSITY_RATIO,
-        require_no_rt_overlap: bool = GROUP_REQUIRE_NO_RT_OVERLAP,
 ) -> Tuple[List[List[Dict]], List[List[Dict]]]:
     """
     FAST grouping strategy.
 
     Phase 1:
-        Build 3-5 groups.
+        Build 3-4 groups.
 
     Phase 2:
-        Repack leftovers into 2-5 groups using the same tolerances.
+        Repack leftovers into 2-4 groups using the same tolerances.
 
     Phase 3:
         Remaining masses become true singleton groups.
+
+    Parameters
+    ----------
+    all_features : list of every detected feature (including duplicates per mass).
+        Used to build the full per-mass peak list for the strict RT overlap check.
     """
     start_time = time.time()
 
     if masses_df.empty:
         return [], []
+
+    # ------------------------------------------------------------------
+    # Build a mapping: rounded_mz -> list of (rt_start, rt_end) windows
+    # across ALL detected peaks for that mass.
+    # ------------------------------------------------------------------
+    all_peaks_map: Dict[float, List[Tuple[float, float]]] = defaultdict(list)
+    for feat in all_features:
+        mz_key = round(feat['mz'], 6)
+        all_peaks_map[mz_key].append((feat['rt_start'], feat['rt_end']))
 
     sorted_df = masses_df.sort_values('intensity', ascending=False)
 
@@ -598,16 +636,28 @@ def find_groups_two_tier(
         for m in available_masses
     ], dtype=np.float64)
 
+    # Build the per-index peak list for the overlap check.
+    # Each entry is the list of ALL (rt_start, rt_end) windows for that mass.
+    all_peaks_by_index: List[List[Tuple[float, float]]] = []
+    for m in available_masses:
+        mz_key = round(m['mz'], 6)
+        peaks = all_peaks_map.get(mz_key)
+        if peaks:
+            all_peaks_by_index.append(peaks)
+        else:
+            # Fallback: use only the representative window
+            all_peaks_by_index.append([(m['rt_start'], m['rt_end'])])
+
     print("  Building compatibility matrix...")
-    print(f"    Required apex RT separation: >= {rt_apex_separation:.4f} min")
-    print(f"    Required intensity ratio:    >= {min_intensity_ratio:.4f}")
-    print(f"    Require no RT window overlap: {require_no_rt_overlap}")
+    print(f"    Required apex RT separation:     >= {rt_apex_separation:.4f} min")
+    print(f"    Required intensity ratio:        >= {min_intensity_ratio:.4f}")
+    print(f"    RT overlap check:                strict (all peaks)")
 
     compat_matrix = build_compatibility_matrix(
         mass_data=mass_data,
         rt_apex_separation=rt_apex_separation,
         min_intensity_ratio=min_intensity_ratio,
-        require_no_rt_overlap=require_no_rt_overlap,
+        all_peaks_by_index=all_peaks_by_index,
     )
 
     available = np.ones(n, dtype=bool)
@@ -646,8 +696,8 @@ def find_groups_two_tier(
     elapsed = time.time() - start_time
 
     print(f"  Grouping completed in {elapsed:.2f} seconds")
-    print(f"    Strict 3-5 groups:     {len(strict_groups)}")
-    print(f"    Relaxed 2-5 groups:    {len(relaxed_multi_groups)}")
+    print(f"    Strict {MIN_GROUP_SIZE}-{MAX_GROUP_SIZE} groups:     {len(strict_groups)}")
+    print(f"    Relaxed {RELAXED_MIN_GROUP_SIZE}-{RELAXED_MAX_GROUP_SIZE} groups:    {len(relaxed_multi_groups)}")
     print(f"    Singleton groups:      {len(singleton_groups)}")
 
     return strict_groups, relaxed_groups
@@ -695,6 +745,10 @@ def build_mass_groups_from_files(
         if mz_round in valid_masses:
             valid_features.append(feature)
 
+    # Keep all features (not deduplicated) for the multi-peak overlap check.
+    # The representative (highest-intensity) feature per mass is used for
+    # apex RT, intensity, and the mass_data array; but all features feed
+    # all_peaks_by_index inside find_groups_two_tier.
     unique_features: Dict[float, Dict] = {}
     for feature in sorted(valid_features, key=lambda x: x['intensity'], reverse=True):
         mz_round = round(feature['mz'], 6)
@@ -713,14 +767,21 @@ def build_mass_groups_from_files(
     features_sorted = sorted(unique_features.values(), key=lambda x: x['mz'])
     df = pd.DataFrame(features_sorted)
 
+    # Also keep valid_features (all, not deduplicated) for the overlap check.
+    above_noise_mzs = set(above_noise.keys())
+    valid_features_above_noise = [
+        f for f in valid_features
+        if round(f['mz'], 6) in above_noise_mzs
+    ]
+
     print(f"\nGrouping {len(df)} eligible masses...")
     strict_groups, relaxed_groups = find_groups_two_tier(
         df,
+        all_features=valid_features_above_noise,
         min_group_size=min_group_size,
         max_group_size=max_group_size,
         rt_apex_separation=GROUP_RT_APEX_SEPARATION,
         min_intensity_ratio=GROUP_MIN_INTENSITY_RATIO,
-        require_no_rt_overlap=GROUP_REQUIRE_NO_RT_OVERLAP,
     )
 
     all_groups = strict_groups + relaxed_groups
@@ -812,13 +873,45 @@ def main():
         print(f"RT:        {df['rt'].min():.2f} - {df['rt'].max():.2f} min")
         print(f"Intensity: {df['intensity'].min():.0f} - {df['intensity'].max():.0f}")
 
+    # Build full feature list for multi-peak overlap check in main().
+    # process_files() returns deduplicated features; re-derive all_features here
+    # by running select_files + process_single_file again — or simply pass df
+    # and use only representative windows if called standalone. For the full
+    # fix we collect all_features inside build_mass_groups_from_files; in
+    # main() we replicate the same logic below.
+
+    selected_files = select_files()
+    all_features_main: List[Dict] = []
+    masses_by_file_main: Dict[str, Set[float]] = {}
+
+    with ProcessPoolExecutor(max_workers=min(N_FILES_TO_PROCESS, multiprocessing.cpu_count())) as executor:
+        future_to_file = {executor.submit(process_single_file, f): f for f in selected_files}
+        raw_results: Dict[str, tuple] = {}
+        for fut, f in future_to_file.items():
+            raw_results[f] = fut.result()
+
+    for f in selected_files:
+        file_path, masses, file_features = raw_results[f]
+        masses_by_file_main[file_path] = masses
+        all_features_main.extend(file_features)
+
+    mass_counts = defaultdict(int)
+    for f in selected_files:
+        for mz in sorted(masses_by_file_main[f]):
+            mass_counts[round(mz, 6)] += 1
+    valid_masses = {mz for mz, count in mass_counts.items() if count >= MIN_SAMPLE_PRESENCE}
+    all_features_valid = [
+        feat for feat in all_features_main
+        if round(feat['mz'], 6) in valid_masses and feat['intensity'] >= NOISE_LEVEL
+    ]
+
     strict_groups, relaxed_groups = find_groups_two_tier(
         df,
+        all_features=all_features_valid,
         min_group_size=MIN_GROUP_SIZE,
         max_group_size=MAX_GROUP_SIZE,
         rt_apex_separation=GROUP_RT_APEX_SEPARATION,
         min_intensity_ratio=GROUP_MIN_INTENSITY_RATIO,
-        require_no_rt_overlap=GROUP_REQUIRE_NO_RT_OVERLAP,
     )
 
     all_groups = strict_groups + relaxed_groups
@@ -902,7 +995,7 @@ def main():
     print(
         f"Criteria: apex RT separation >= {GROUP_RT_APEX_SEPARATION} min, "
         f"Intensity ratio >= {GROUP_MIN_INTENSITY_RATIO:.0%}, "
-        f"No RT window overlap={GROUP_REQUIRE_NO_RT_OVERLAP}, "
+        f"No RT window overlap (all peaks), "
         f"Strict size {MIN_GROUP_SIZE}-{MAX_GROUP_SIZE}, "
         f"Relaxed size {RELAXED_MIN_GROUP_SIZE}-{RELAXED_MAX_GROUP_SIZE}"
     )
@@ -910,9 +1003,15 @@ def main():
     overlap_count = 0
     intensity_violations = 0
     rt_sep_violations = 0
+    size_violations = 0
 
     for group_name in groups_df['Group'].unique():
         group_masses = groups_df[groups_df['Group'] == group_name]
+
+        # Check group size
+        if len(group_masses) > MAX_GROUP_SIZE:
+            print(f"  ⚠ {group_name}: size {len(group_masses)} exceeds MAX_GROUP_SIZE {MAX_GROUP_SIZE}")
+            size_violations += 1
 
         if len(group_masses) == 1:
             continue
@@ -927,9 +1026,10 @@ def main():
                     print(f"  ⚠ {group_name}: RT apex separation {rt_diff:.4f} < {GROUP_RT_APEX_SEPARATION}")
                     rt_sep_violations += 1
 
-                if GROUP_REQUIRE_NO_RT_OVERLAP and (row1['RT Start (min)'] <= row2['RT End (min)']) and (
+                # RT window overlap (representative windows only; full check is in matrix)
+                if (row1['RT Start (min)'] <= row2['RT End (min)']) and (
                         row2['RT Start (min)'] <= row1['RT End (min)']):
-                    print(f"  ⚠ {group_name}: RT overlap!")
+                    print(f"  ⚠ {group_name}: RT overlap (representative windows)!")
                     overlap_count += 1
 
                 ratio = min(row1['Intensity'], row2['Intensity']) / max(row1['Intensity'], row2['Intensity'])
@@ -937,7 +1037,7 @@ def main():
                     print(f"  ⚠ {group_name}: Intensity ratio {ratio:.2%} < {GROUP_MIN_INTENSITY_RATIO:.0%}")
                     intensity_violations += 1
 
-    if overlap_count == 0 and intensity_violations == 0 and rt_sep_violations == 0:
+    if overlap_count == 0 and intensity_violations == 0 and rt_sep_violations == 0 and size_violations == 0:
         print("  ✓ All groups pass validation!")
 
     with pd.ExcelWriter(output_file, engine='openpyxl', mode='a', if_sheet_exists='replace') as writer:

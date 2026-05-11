@@ -22,7 +22,7 @@ class Config:
     GROUP_MIN_CONSEC_SCANS = 7
     GROUP_MIN_SAMPLE_PRESENCE = 1
     GROUP_MIN_GROUP_SIZE = 2
-    GROUP_MAX_GROUP_SIZE = 5
+    GROUP_MAX_GROUP_SIZE = 4
 
     MASS_GROUPS_CACHE_NAME = "MassGroups_Cache.json"
     MASS_GROUPS_EXPORT_NAME = "MassGroups_Formatted.csv"
@@ -35,7 +35,6 @@ class Config:
     # Easy grouping diagnostics/tuning
     GROUP_RT_APEX_SEPARATION = 1.0       # candidates closer than this RT distance are not grouped
     GROUP_MIN_INTENSITY_RATIO = 0.55     # MUST stay 0.55 per your requirement
-    GROUP_REQUIRE_NO_RT_OVERLAP = True   # True = RT windows cannot overlap
     MASS_LIST: list[float] = []               # active group's masses
     CURRENT_GROUP: str | None = None
     MASS_TOLERANCE = 0.0005
