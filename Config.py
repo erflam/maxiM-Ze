@@ -51,7 +51,7 @@ class Config:
     # Library Matching
     LIB_FILE = r"/Users/elizabethflammer/Desktop/Research/MZMine/POS OE Library Metformin Baseline.csv"
     LIBRARY_MATCH_MZ_TOL = 0.0005
-    LIBRARY_MATCH_RT_TOL = 0.1
+    LIBRARY_MATCH_RT_TOL = 0.125
 
     @classmethod
     def _analysis_output_root(cls) -> Path:
