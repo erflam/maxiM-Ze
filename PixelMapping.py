@@ -8,9 +8,11 @@ import colorsys
 
 from Config import Config
 
+
 def _group_tag(group_name: str) -> str:
     """Convert 'Group 1' -> 'Group1' (must match your EICBuilder naming)."""
     return str(group_name).replace(" ", "")
+
 
 def hex_to_rgb(hex_color: str) -> Tuple[int, int, int]:
     hex_color = hex_color.strip().lstrip("#")
@@ -21,22 +23,26 @@ def hex_to_rgb(hex_color: str) -> Tuple[int, int, int]:
     b = int(hex_color[4:6], 16)
     return r, g, b
 
+
 def _dark_hex_palette(n: int) -> List[str]:
+    """MUST MATCH EICBuilder exactly: s=0.85, v=0.25"""
     if n <= 0:
         return []
     colors: List[str] = []
     for i in range(n):
         h = (i / n) % 1.0
-        s = 0.85
-        v = 0.25
+        s = 0.85  # EXACTLY as in EICBuilder
+        v = 0.25  # EXACTLY as in EICBuilder
         r, g, b = colorsys.hsv_to_rgb(h, s, v)
-        colors.append(f"#{int(r*255):02x}{int(g*255):02x}{int(b*255):02x}")
+        colors.append(f"#{int(r * 255):02x}{int(g * 255):02x}{int(b * 255):02x}")
     return colors
+
 
 def generate_mass_colors(mass_list: List[float]) -> Dict[str, str]:
     mass_strs = [f"{m:.4f}" for m in mass_list]
     palette = _dark_hex_palette(len(mass_strs))
     return {mass_strs[i]: palette[i] for i in range(len(mass_strs))}
+
 
 def boolean_runs_to_segments(col_has: np.ndarray) -> List[Tuple[int, int]]:
     segments: List[Tuple[int, int]] = []
@@ -58,6 +64,7 @@ def boolean_runs_to_segments(col_has: np.ndarray) -> List[Tuple[int, int]]:
 
     return segments
 
+
 def merge_close_segments(segments: List[Tuple[int, int]], max_gap_px: int = 2) -> List[Tuple[int, int]]:
     if not segments:
         return []
@@ -75,6 +82,7 @@ def merge_close_segments(segments: List[Tuple[int, int]], max_gap_px: int = 2) -
 
     return merged
 
+
 def filter_short_segments(segments: List[Tuple[int, int]], min_width_px: int = 3) -> List[Tuple[int, int]]:
     out: List[Tuple[int, int]] = []
     for s, e in segments:
@@ -82,13 +90,14 @@ def filter_short_segments(segments: List[Tuple[int, int]], min_width_px: int = 3
             out.append((s, e))
     return out
 
+
 def find_segments_for_color(
-    rgba: np.ndarray,
-    target_rgb: Tuple[int, int, int],
-    alpha_threshold: int = 1,
-    rgb_tolerance: int = 40,
-    max_gap_px: int = 2,
-    min_width_px: int = 3,
+        rgba: np.ndarray,
+        target_rgb: Tuple[int, int, int],
+        alpha_threshold: int = 1,
+        rgb_tolerance: int = 40,
+        max_gap_px: int = 2,
+        min_width_px: int = 3,
 ) -> List[Tuple[int, int]]:
     rgb = rgba[:, :, :3].astype(np.int16)
     alpha = rgba[:, :, 3].astype(np.int16)
@@ -108,14 +117,16 @@ def find_segments_for_color(
     segments = filter_short_segments(segments, min_width_px=min_width_px)
     return segments
 
+
 def _normalize_base_for_png_lookup(base: str, group_tag: str) -> str:
     if base.startswith("EIC_"):
-        base = base[len("EIC_") :]
+        base = base[len("EIC_"):]
     suffix = f"_{group_tag}"
     if base.endswith(suffix):
         base = base[: -len(suffix)]
 
     return base
+
 
 def process_file_checkpoint4(fp: str, dirs: Dict[str, str], group_name: str) -> str:
     Config.set_mass_group(group_name)
@@ -131,16 +142,17 @@ def process_file_checkpoint4(fp: str, dirs: Dict[str, str], group_name: str) -> 
     mass_strs = [f"{m:.4f}" for m in mass_list]
     mass_colors = generate_mass_colors(mass_list)
 
-    # Knobs
-    RGB_TOL = 60        # tolerance for anti-aliasing
-    MAX_GAP = 3         # merge tiny breaks
-    MIN_WIDTH = 4       # drop tiny noise segments
-    ALPHA_TH = 1        # background is transparent
+    # Tuned for dark colors (v=0.25) - need tighter tolerance
+    RGB_TOL = 15  # Strict - dark colors are close together
+    MAX_GAP = 5  # Allow gaps in real peaks
+    MIN_WIDTH = 15  # Real peaks are substantial
+    ALPHA_TH = 1  # background is transparent
 
     with Image.open(png_path) as im:
         rgba = np.array(im.convert("RGBA"))
 
     rows: List[Dict[str, object]] = []
+
     for mz_str in mass_strs:
         color_hex = mass_colors[mz_str]
         rgb = hex_to_rgb(color_hex)
@@ -159,18 +171,19 @@ def process_file_checkpoint4(fp: str, dirs: Dict[str, str], group_name: str) -> 
                 {
                     "File Name": base,
                     "m/z": mz_str,
-                    "Segment_ID": None,  # we will assign later
+                    "Segment_ID": None,
                     "Pixel_start": int(px_start),
                     "Pixel_end": int(px_end),
                 }
             )
 
-        # Sort all segments by Pixel_start (left to right)
-        rows.sort(key=lambda r: r["Pixel_start"])
+    if len(rows) == 0:
+        return f"[!] No segments in {os.path.basename(png_path)}"
 
-        # Assign Segment_ID = 1, 2, 3, 4, ...
-        for i, r in enumerate(rows, start=1):
-            r["Segment_ID"] = i
+    # Sort all segments by pixel position and assign sequential IDs
+    rows.sort(key=lambda r: r["Pixel_start"])
+    for i, r in enumerate(rows, start=1):
+        r["Segment_ID"] = i
 
     pd.DataFrame(
         rows,
@@ -178,6 +191,7 @@ def process_file_checkpoint4(fp: str, dirs: Dict[str, str], group_name: str) -> 
     ).to_csv(out_path, index=False)
 
     return f"[✔] {os.path.basename(out_path)} ({len(rows)} segments)"
+
 
 def run_for_group(group_name: str) -> None:
     Config.set_mass_group(group_name)
@@ -191,6 +205,7 @@ def run_for_group(group_name: str) -> None:
     for p in pngs:
         msg = process_file_checkpoint4(str(p), dirs, group_name)
         print(msg)
+
 
 if __name__ == "__main__":
     run_for_group(Config.CURRENT_GROUP)
