@@ -1,6 +1,7 @@
 import re
 import json
 import time
+from collections import defaultdict
 from dataclasses import dataclass, asdict, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -196,33 +197,238 @@ class PeakClusterer:
         self._write_outputs(group, df_align, df_summary, df_unclustered)
         return df_align, df_summary, df_unclustered
 
-    def _load_all_peaks_for_group(self, patch_dir: Path, group: str) -> List[PeakInfo]:
-        pixel_dir = self.dirs["pixel"]
-        peaks: List[PeakInfo] = []
+    # ------------------------------------------------------------------
+    # Internal helper: build elution-rank map for a pixel CSV + mass
+    # ------------------------------------------------------------------
 
-        for png_path in sorted(patch_dir.glob("*.png")):
+    def _get_mz_candidates(
+        self,
+        df_pix: pd.DataFrame,
+        mass: float,
+        mz_tol: float = 0.002,
+    ) -> pd.DataFrame:
+        """Return rows from df_pix matching *mass* (±mz_tol), sorted by RT_apex.
+
+        If no m/z column is present the entire DataFrame is returned sorted by
+        RT_apex so downstream rank logic still works.
+        """
+        mz_col = next((c for c in ["m/z", "mass", "_mz_key"] if c in df_pix.columns), None)
+        if mz_col is not None:
+            candidates = df_pix.loc[
+                (df_pix[mz_col].astype(float) - mass).abs() <= mz_tol
+            ].copy()
+        else:
+            candidates = df_pix.copy()
+
+        if "RT_apex" in candidates.columns:
+            candidates = candidates.sort_values("RT_apex").reset_index(drop=True)
+
+        return candidates
+
+    def _collect_patch_entries_for_group(self, group: str) -> List[Dict[str, Any]]:
+        """Collect parsed patch PNG metadata for one group."""
+        patch_dir = self.dirs["patch"]
+        entries: List[Dict[str, Any]] = []
+
+        for png_path in sorted(patch_dir.glob(f"*_{group}.png")):
             m = self.PATCH_RE.match(png_path.name)
-            if not m:
-                continue
-            if m.group("group") != group:
+            if not m or m.group("group") != group:
                 continue
 
-            file_base = m.group("file_base")
-            mass = float(m.group("mass"))
-            peak_num = int(m.group("peak_num"))
+            entries.append({
+                "patch_path": png_path,
+                "patch_file": png_path.name,
+                "peak_id": png_path.stem,
+                "file_base": m.group("file_base"),
+                "mass": float(m.group("mass")),
+                "filename_peak_number": int(m.group("peak_num")),
+                "group": m.group("group"),
+            })
 
+        return entries
+
+    def _get_mz_candidates_preserve_index(
+        self,
+        df_pix: pd.DataFrame,
+        mass: float,
+        mz_tol: float = 0.002,
+    ) -> pd.DataFrame:
+        """Return m/z-matched pixel rows sorted by RT_apex while preserving original index."""
+        mz_col = next((c for c in ["m/z", "mass", "_mz_key"] if c in df_pix.columns), None)
+
+        if mz_col is not None:
+            candidates = df_pix.loc[
+                (df_pix[mz_col].astype(float) - mass).abs() <= mz_tol
+            ].copy()
+        else:
+            candidates = df_pix.copy()
+
+        if "RT_apex" in candidates.columns:
+            candidates = candidates.sort_values("RT_apex")
+
+        return candidates
+
+    def _build_filename_rank_map(
+        self,
+        patch_entries: List[Dict[str, Any]],
+    ) -> Dict[Tuple[str, float], List[int]]:
+        """Map (file_base, mass) -> sorted filename PeakX values."""
+        out: Dict[Tuple[str, float], List[int]] = defaultdict(list)
+
+        for e in patch_entries:
+            out[(e["file_base"], e["mass"])].append(e["filename_peak_number"])
+
+        return {k: sorted(v) for k, v in out.items()}
+
+    def _write_matched_pixel_csvs(self, group: str) -> None:
+        """
+        Write one debug CSV per pixel CSV:
+          <file_base>_peaks_pix_<group>_matched.csv
+
+        Matching logic:
+          - match by m/z first
+          - if one pixel row and one patch file for that m/z, direct match
+          - if multiple, sort pixel rows by RT_apex and patch files by filename PeakX
+          - assign by rank
+        """
+        pixel_dir = self.dirs["pixel"]
+        patch_entries = self._collect_patch_entries_for_group(group)
+
+        if not patch_entries:
+            return
+
+        entries_by_file: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+        for e in patch_entries:
+            entries_by_file[e["file_base"]].append(e)
+
+        for file_base, file_entries in entries_by_file.items():
             pixel_csv = pixel_dir / f"{file_base}_peaks_pix_{group}.csv"
             if not pixel_csv.exists():
                 continue
 
-            df_pix = pd.read_csv(pixel_csv)
-            df_pix = self._assert_required_columns(df_pix, pixel_csv)
-
-            hits = df_pix.loc[df_pix["peak_num"].astype(int) == peak_num]
-            if hits.shape[0] != 1:
+            try:
+                df_pix = pd.read_csv(pixel_csv)
+                df_pix = self._assert_required_columns(df_pix, pixel_csv)
+            except Exception:
                 continue
 
-            r = hits.iloc[0]
+            # Add debug columns.
+            df_matched = df_pix.copy()
+            df_matched["matched_peak_patch_file"] = ""
+            df_matched["matched_peak_id"] = ""
+            df_matched["filename_peak_number"] = np.nan
+            df_matched["match_method"] = ""
+            df_matched["match_warning"] = ""
+
+            entries_by_mass: Dict[float, List[Dict[str, Any]]] = defaultdict(list)
+            for e in file_entries:
+                entries_by_mass[e["mass"]].append(e)
+
+            for mass, mass_entries in entries_by_mass.items():
+                patch_sorted = sorted(mass_entries, key=lambda x: x["filename_peak_number"])
+                candidates = self._get_mz_candidates_preserve_index(df_matched, mass)
+
+                if candidates.empty:
+                    warning = "no_pixel_rows_for_mz"
+                    continue
+
+                n_pix = len(candidates)
+                n_patch = len(patch_sorted)
+
+                if n_pix == 1 and n_patch == 1:
+                    match_method = "single_mz_single_patch"
+                else:
+                    match_method = "mz_rt_rank_order"
+
+                warning = ""
+                if n_pix != n_patch:
+                    warning = f"count_mismatch_pixel_rows_{n_pix}_patch_files_{n_patch}"
+
+                # Assign in rank order.
+                for rank, patch_entry in enumerate(patch_sorted):
+                    if rank >= n_pix:
+                        # More patch files than pixel rows. No row to annotate.
+                        continue
+
+                    original_idx = candidates.index[rank]
+
+                    existing_peak_id = str(df_matched.at[original_idx, "matched_peak_id"])
+                    if existing_peak_id:
+                        row_warning = "row_already_matched"
+                        if warning:
+                            row_warning = warning + ";row_already_matched"
+                    else:
+                        row_warning = warning
+
+                    df_matched.at[original_idx, "matched_peak_patch_file"] = patch_entry["patch_file"]
+                    df_matched.at[original_idx, "matched_peak_id"] = patch_entry["peak_id"]
+                    df_matched.at[original_idx, "filename_peak_number"] = patch_entry["filename_peak_number"]
+                    df_matched.at[original_idx, "match_method"] = match_method
+                    df_matched.at[original_idx, "match_warning"] = row_warning
+
+            out_csv = pixel_dir / f"{file_base}_peaks_pix_{group}_matched.csv"
+            df_matched.to_csv(out_csv, index=False)
+
+    def _load_all_peaks_for_group(self, patch_dir: Path, group: str) -> List[PeakInfo]:
+        """Load PeakInfo objects for every patch PNG belonging to *group*.
+
+        Matching strategy (fixes peak_num mismatch after slicing/splitting):
+          1. Collect all filename peak_nums for each (file_base, mass) pair so we
+             know their sorted elution order (rank).
+          2. For each PNG, filter the pixel CSV by m/z (±0.002 Da) and sort
+             candidates by RT_apex.
+          3. Use the filename peak_num's rank within its (file_base, mass) group
+             to index into the sorted pixel CSV rows — NOT the raw peak_num value.
+        """
+        pixel_dir = self.dirs["pixel"]
+
+        # --- Pass 1: collect all (file_base, mass, peak_num) from patch filenames ---
+        patch_entries: List[Tuple[Path, str, float, int]] = []  # (path, file_base, mass, peak_num)
+        fn_peaks_by_key: Dict[Tuple[str, float], List[int]] = defaultdict(list)
+
+        for png_path in sorted(patch_dir.glob("*.png")):
+            m = self.PATCH_RE.match(png_path.name)
+            if not m or m.group("group") != group:
+                continue
+            file_base = m.group("file_base")
+            mass = float(m.group("mass"))
+            peak_num = int(m.group("peak_num"))
+            patch_entries.append((png_path, file_base, mass, peak_num))
+            fn_peaks_by_key[(file_base, mass)].append(peak_num)
+
+        # Sort filename peak_nums so rank 0 = earliest-labelled = earliest eluting
+        fn_peaks_sorted: Dict[Tuple[str, float], List[int]] = {
+            k: sorted(v) for k, v in fn_peaks_by_key.items()
+        }
+
+        # --- Pass 2: load pixel CSV rows by elution rank ---
+        peaks: List[PeakInfo] = []
+
+        for png_path, file_base, mass, peak_num in patch_entries:
+            pixel_csv = pixel_dir / f"{file_base}_peaks_pix_{group}.csv"
+            if not pixel_csv.exists():
+                continue
+
+            try:
+                df_pix = pd.read_csv(pixel_csv)
+            except Exception:
+                continue
+
+            df_pix = self._assert_required_columns(df_pix, pixel_csv)
+
+            # Filter by m/z and sort by RT_apex
+            candidates = self._get_mz_candidates(df_pix, mass)
+            if candidates.empty:
+                continue
+
+            # Determine elution rank of this filename peak_num
+            fn_sorted = fn_peaks_sorted.get((file_base, mass), [peak_num])
+            elution_rank = fn_sorted.index(peak_num) if peak_num in fn_sorted else 0
+
+            # Clamp to available rows
+            row_idx = min(elution_rank, len(candidates) - 1)
+            r = candidates.iloc[row_idx]
+
             img = self._read_grayscale(png_path)
             prof = self._extract_shape_profile(img)
 
@@ -568,65 +774,123 @@ class PeakClusterer:
         return ((prof - mn) / (mx - mn)).astype(np.float32)
 
     def _enrich_unclustered(self, df_unclustered: pd.DataFrame, group: str) -> pd.DataFrame:
-        """Add m/z, RT_apex, RT_start, RT_end, height, and area columns to the unclustered DataFrame
-        by parsing the peak_id string and looking up the pixel CSV."""
+        """Add m/z, RT_apex, RT_start, RT_end, height, and area columns to unclustered peaks.
+
+        Uses the same robust matching strategy as peak loading:
+          1. Match by m/z.
+          2. Sort pixel CSV rows by RT_apex.
+          3. Sort all patch filenames for the same file_base/mass by filename PeakX.
+          4. Use filename PeakX only as an ordering label, not as peak_num lookup.
+        """
         if df_unclustered.empty:
             return df_unclustered
 
         pixel_dir = self.dirs["pixel"]
-        mass_re = re.compile(r"_mass(?P<mass>\d+(?:\.\d+)?)_Peak(?P<peak_num>\d+)_")
+
+        all_patch_entries = self._collect_patch_entries_for_group(group)
+        rank_map = self._build_filename_rank_map(all_patch_entries)
+
+        patch_by_peak_id = {
+            e["peak_id"]: e
+            for e in all_patch_entries
+        }
 
         records = []
+
         for peak_id in df_unclustered["peak_id"]:
-            m = mass_re.search(peak_id)
-            if not m:
-                records.append({"peak_id": peak_id, "m/z": None, "RT_apex": None,
-                                 "RT_start": None, "RT_end": None, "height": None, "area": None})
+            e = patch_by_peak_id.get(peak_id)
+
+            if e is None:
+                records.append({
+                    "peak_id": peak_id,
+                    "m/z": None,
+                    "RT_start": None,
+                    "RT_apex": None,
+                    "RT_end": None,
+                    "height": None,
+                    "area": None,
+                    "match_method": "unparsed_peak_id",
+                    "match_warning": "peak_id_not_found_in_patch_files",
+                })
                 continue
 
-            mass = float(m.group("mass"))
-            peak_num = int(m.group("peak_num"))
-            file_base = peak_id[: peak_id.find("_mass")]
+            file_base = e["file_base"]
+            mass = e["mass"]
+            filename_peak_number = e["filename_peak_number"]
 
             pixel_csv = pixel_dir / f"{file_base}_peaks_pix_{group}.csv"
-            rt_apex = rt_start = rt_end = height = area = None
 
-            if pixel_csv.exists():
+            rt_start = rt_apex = rt_end = height = area = None
+            match_method = ""
+            match_warning = ""
+
+            if not pixel_csv.exists():
+                match_warning = "missing_pixel_csv"
+            else:
                 try:
                     df_pix = pd.read_csv(pixel_csv)
-                    df_pix = self._normalize_columns(df_pix)
-                    hit = df_pix.loc[df_pix["peak_num"].astype(int) == peak_num]
-                    if not hit.empty:
-                        r = hit.iloc[0]
-                        rt_apex  = float(r["RT_apex"])
+                    df_pix = self._assert_required_columns(df_pix, pixel_csv)
+
+                    candidates = self._get_mz_candidates(df_pix, mass)
+
+                    if candidates.empty:
+                        match_warning = "no_pixel_rows_for_mz"
+                    else:
+                        fn_sorted = rank_map.get((file_base, mass), [filename_peak_number])
+                        elution_rank = (
+                            fn_sorted.index(filename_peak_number)
+                            if filename_peak_number in fn_sorted
+                            else 0
+                        )
+
+                        if len(candidates) == 1 and len(fn_sorted) == 1:
+                            match_method = "single_mz_single_patch"
+                        else:
+                            match_method = "mz_rt_rank_order"
+
+                        if len(candidates) != len(fn_sorted):
+                            match_warning = (
+                                f"count_mismatch_pixel_rows_{len(candidates)}"
+                                f"_patch_files_{len(fn_sorted)}"
+                            )
+
+                        row_idx = min(elution_rank, len(candidates) - 1)
+                        r = candidates.iloc[row_idx]
+
                         rt_start = float(r["RT_start"])
-                        rt_end   = float(r["RT_end"])
-                        height   = float(r["height"])
-                        area     = float(r["area"])
-                except Exception:
-                    pass
+                        rt_apex = float(r["RT_apex"])
+                        rt_end = float(r["RT_end"])
+                        height = float(r["height"])
+                        area = float(r["area"])
+
+                except Exception as ex:
+                    match_warning = f"lookup_error:{type(ex).__name__}"
 
             records.append({
-                "peak_id":  peak_id,
-                "m/z":      mass,
+                "peak_id": peak_id,
+                "m/z": mass,
                 "RT_start": rt_start,
-                "RT_apex":  rt_apex,
-                "RT_end":   rt_end,
-                "height":   height,
-                "area":     area,
+                "RT_apex": rt_apex,
+                "RT_end": rt_end,
+                "height": height,
+                "area": area,
+                "filename_peak_number": filename_peak_number,
+                "match_method": match_method,
+                "match_warning": match_warning,
             })
 
         return pd.DataFrame(records)
 
-    def _write_outputs(self, group: str, df_align: pd.DataFrame, df_summary: pd.DataFrame, df_unclustered: pd.DataFrame) -> None:
+    def _write_outputs(self, group: str, df_align: pd.DataFrame, df_summary: pd.DataFrame,
+                       df_unclustered: pd.DataFrame) -> None:
         outdir = self.dirs["clustering"]
+        self._write_matched_pixel_csvs(group)
         df_align.to_csv(outdir / "peak_alignment.csv", index=False)
         df_unclustered = self._enrich_unclustered(df_unclustered, group)
         df_unclustered.to_csv(outdir / f"unclustered_peaks_group_{group}.csv", index=False)
         df_summary.to_csv(outdir / f"alignment_summary_group_{group}.csv", index=False)
         df_patch = self._build_cluster_patch(df_align)
         df_patch.to_csv(outdir / f"cluster_patch_{group}.csv", index=False)
-
 
 def process_file_cluster_peaks(dirs: Dict[str, str | Path], group_name: str, config: Optional[ClusterConfig] = None) -> str:
     """
