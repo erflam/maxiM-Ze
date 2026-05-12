@@ -25,7 +25,7 @@ class Config:
         # Used only for filename normalization/verification (optional)
         return cls.BASE_DIR / cls.OUTPUT_ROOT / cls.ANALYSIS_FOLDER / cls.CURRENT_GROUP / "Peak Patches"
 
-RT_TOLERANCE = 0.08
+RT_TOLERANCE = 0.15
 
 def _sample_name_from_col(col: str) -> str:
     for suffix in ("_height", "_area"):
