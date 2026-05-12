@@ -26,20 +26,17 @@ DEBUG_PEAK_FILTER = False
 EXPORT_DEBUG_CSV = False
 BYPASS_CACHE_WHEN_DEBUG = False
 
-# Noise detection: any m/z with more than this many peaks in a single file
-# is considered noise and removed from the group for that file.
 NOISE_PEAK_COUNT_THRESHOLD = 15
 
 
 def _dark_hex_palette(n: int):
-    """Generate n distinct dark-ish hex colors."""
     if n <= 0:
         return []
     colors = []
     for i in range(n):
         h = (i / n) % 1.0
         s = 0.85
-        v = 0.25  # darker
+        v = 0.25
         r, g, b = colorsys.hsv_to_rgb(h, s, v)
         colors.append(f"#{int(r*255):02x}{int(g*255):02x}{int(b*255):02x}")
     return colors
@@ -76,18 +73,14 @@ def improved_peak_cutting(intensity_vals_smooth, rt_vals, peaks, width_results, 
     def calculate_peak_quality(apex_idx, left_idx, right_idx):
         if right_idx <= left_idx or apex_idx < left_idx or apex_idx > right_idx:
             return 0.0
-
         segment = intensity_vals_smooth[left_idx:right_idx + 1]
         apex_val = intensity_vals_smooth[apex_idx]
-
         left_min = np.min(segment[:apex_idx - left_idx + 1]) if apex_idx > left_idx else apex_val
         right_min = np.min(segment[apex_idx - left_idx:]) if apex_idx < right_idx else apex_val
         prominence = apex_val - max(left_min, right_min)
-
         left_wing = segment[:apex_idx - left_idx]
         right_wing = segment[apex_idx - left_idx + 1:]
         min_len = min(len(left_wing), len(right_wing))
-
         if min_len >= 2:
             a = left_wing[-min_len:]
             b = right_wing[:min_len][::-1]
@@ -98,7 +91,6 @@ def improved_peak_cutting(intensity_vals_smooth, rt_vals, peaks, width_results, 
                 symmetry = max(0, symmetry)
         else:
             symmetry = 0
-
         return prominence * (1 + 0.3 * symmetry)
 
     rel_height_split = 0.85
@@ -137,12 +129,10 @@ def improved_peak_cutting(intensity_vals_smooth, rt_vals, peaks, width_results, 
             valley_intensity = intensity_vals_smooth[valley]
             local_window = slice(max(0, valley - 3), min(len(intensity_vals_smooth), valley + 4))
             local_max = np.max(intensity_vals_smooth[local_window])
-
             left_peak_h = np.max(intensity_vals_smooth[left_idx:valley + 1])
             right_peak_h = np.max(intensity_vals_smooth[valley:right_idx + 1])
             ratio = min(left_peak_h, right_peak_h) / max(left_peak_h, right_peak_h)
             adaptive_threshold = 0.6 + (0.3 * ratio)
-
             if valley_intensity <= adaptive_threshold * local_max:
                 valley_rt = rt_vals[valley]
                 peak_rt = rt_vals[pk]
@@ -160,11 +150,9 @@ def improved_peak_cutting(intensity_vals_smooth, rt_vals, peaks, width_results, 
         for seg_l, seg_r in zip(seg_starts, seg_ends):
             if seg_r - seg_l < 3 or not seg_time_ok(seg_l, seg_r):
                 continue
-
             local_segment = intensity_vals_smooth[seg_l:seg_r + 1]
             apex_idx = seg_l + int(np.argmax(local_segment))
             quality = calculate_peak_quality(apex_idx, seg_l, seg_r)
-
             if quality > peak_intensity * 0.1:
                 candidate_peaks.append((apex_idx, quality))
 
@@ -197,12 +185,6 @@ def improved_peak_cutting(intensity_vals_smooth, rt_vals, peaks, width_results, 
 
 
 def looks_like_real_peak(y_raw_window: np.ndarray):
-    """
-    Returns:
-      (is_peak, frac_up, frac_down, apex, left_end, right_end)
-
-    This ALWAYS returns 6 values (so your CSV logging never breaks).
-    """
     nan = float("nan")
 
     if y_raw_window is None:
@@ -218,7 +200,6 @@ def looks_like_real_peak(y_raw_window: np.ndarray):
     y = np.asarray(y_raw_window, dtype=float)
     apex_i = int(np.argmax(y))
     apex = float(y[apex_i])
-
     left_end = float(y[0])
     right_end = float(y[-1])
 
@@ -277,7 +258,6 @@ def analyze_ms_file_plotly(file_path, output_image_path, file_colors, axis_meta_
 
     group_tag = Config.CURRENT_GROUP.replace(" ", "")
 
-    # --- CACHING ---
     use_cache = True
     if BYPASS_CACHE_WHEN_DEBUG and (DEBUG_PEAK_FILTER or EXPORT_DEBUG_CSV):
         use_cache = False
@@ -310,33 +290,24 @@ def analyze_ms_file_plotly(file_path, output_image_path, file_colors, axis_meta_
             try:
                 rt = analyzer.get_retention_time(scan)
                 scan_num = scan.get('num', None)
-
                 mzs = np.asarray(scan['m/z array'], dtype=np.float32)
                 ints = np.asarray(scan['intensity array'], dtype=np.float32)
-
                 for mass in mass_list:
                     mask = np.abs(np.round(mzs, 4) - mass) <= Config.MASS_TOLERANCE
                     intensity = np.sum(ints[mask]) if np.any(mask) else 0.0
                     intensity_by_mass[mass].append(intensity)
-
                 rt_values.append(rt)
                 scan_numbers.append(scan_num)
-
             except KeyError:
                 continue
             except Exception as e:
                 print(f"Error processing scan: {str(e)}")
                 continue
 
-    # peaks_prefilter_by_mass collects records per mass string so we can
-    # apply the noise count check before touching the figure.
     peaks_prefilter_by_mass: dict[str, list] = {mz_str: [] for mz_str in mass_list_str}
-
     debug_rows = []
-
     rt_vals = np.array(rt_values)
     scan_numbers_arr = np.array(scan_numbers, dtype=object)
-
     gui_noise_level = Config.GROUP_NOISE_LEVEL
 
     def split_shoulders_in_window(
@@ -346,7 +317,6 @@ def analyze_ms_file_plotly(file_path, output_image_path, file_colors, axis_meta_
         x_win = rt_vals[left_idx:right_idx + 1]
         y_raw_win = intensity_raw[left_idx:right_idx + 1]
         y_smooth_win = intensity_smooth[left_idx:right_idx + 1]
-
         scan_start = scan_numbers_arr[left_idx]
         scan_end = scan_numbers_arr[right_idx]
 
@@ -368,7 +338,6 @@ def analyze_ms_file_plotly(file_path, output_image_path, file_colors, axis_meta_
         main_local = int(np.argmax(y_smooth_win))
         main_idx = left_idx + main_local
         main_height = float(intensity_raw[main_idx])
-
         local_maxima = argrelextrema(y_smooth_win, np.greater, order=SHOULDER_LOCALMAX_ORDER)[0]
 
         candidates = []
@@ -407,22 +376,17 @@ def analyze_ms_file_plotly(file_path, output_image_path, file_colors, axis_meta_
             hi = max(cand_idx, main_idx)
             if hi - lo < 3:
                 continue
-
             seg = intensity_smooth[lo:hi + 1]
             valley_ofs = int(np.argmin(seg))
             valley_idx = lo + valley_ofs
-
             cand_h = float(intensity_raw[cand_idx])
             main_h = float(intensity_raw[main_idx])
             valley_h = float(intensity_raw[valley_idx])
-
             smaller = min(cand_h, main_h)
             if smaller <= 0:
                 continue
-
             if valley_h > (SHOULDER_VALLEY_DROP_FRAC * smaller):
                 continue
-
             if cand_h > best_height:
                 best = cand_idx
                 best_height = cand_h
@@ -447,7 +411,6 @@ def analyze_ms_file_plotly(file_path, output_image_path, file_colors, axis_meta_
 
         left_s = intensity_smooth[left_l:left_r + 1]
         right_s = intensity_smooth[right_l:right_r + 1]
-
         left_apex = left_l + int(np.argmax(left_s))
         right_apex = right_l + int(np.argmax(right_s))
 
@@ -493,10 +456,7 @@ def analyze_ms_file_plotly(file_path, output_image_path, file_colors, axis_meta_
             }
         ]
 
-    # ── Per-mass peak detection — collect into peaks_prefilter_by_mass ──
-    # We also stash (mass_idx, x_peak, y_peak, specific_mass) for every
-    # passing record so we can add figure traces after the noise check.
-    trace_candidates: list[tuple] = []  # (mass_str, x_peak, y_peak, specific_mass)
+    trace_candidates: list[tuple] = []
 
     for mass_idx, specific_mass in enumerate(mass_list):
         intensity_vals = np.array(intensity_by_mass[specific_mass])
@@ -595,27 +555,39 @@ def analyze_ms_file_plotly(file_path, output_image_path, file_colors, axis_meta_
                     "passed_filter": bool(is_peak),
                 })
 
-                if len(y_peak) >= 12:
-                    apex_idx_local = np.argmax(y_peak)
-                    peak_height = y_peak[apex_idx_local]
-                    post_y = y_peak[apex_idx_local + 1:]
-                    slope = np.abs(np.diff(post_y))
+                # ── Right-side tail trim: cut at first post-apex local minimum ──
+                # The tail sometimes re-rises after the true peak end (secondary
+                # hump / baseline artifact).  A simple threshold cannot detect
+                # this because the signal dips then climbs again.
+                #
+                # Strategy: walk forward from the apex on the SMOOTHED signal.
+                # The first point where the signal stops falling and starts
+                # rising is a local minimum — the true return-to-baseline.
+                # Cut there, but only if that minimum is below 15 % of the apex
+                # height (so real shoulder peaks, which dip only slightly, are
+                # never accidentally cut).
+                if len(y_peak) >= 5:
+                    apex_local = int(np.argmax(y_peak))
+                    # Slice the smoothed signal from apex to current right edge
+                    post_smooth = intensity_vals_smooth[left_idx + apex_local: right_idx + 1]
 
-                    slope_thresh = 0.01 * peak_height
-                    height_thresh = 0.015 * peak_height
-                    stable_len = 5
+                    cut_local = None
+                    for k in range(1, len(post_smooth) - 1):
+                        # Local minimum: lower than the point before AND the point after
+                        if post_smooth[k] <= post_smooth[k - 1] and post_smooth[k] < post_smooth[k + 1]:
+                            cut_local = k
+                            break
 
-                    for j in range(len(slope) - stable_len):
-                        window = slope[j:j + stable_len]
-                        if np.all(window < slope_thresh):
-                            crop_candidate_idx = apex_idx_local + 1 + j
-                            if y_peak[crop_candidate_idx] < height_thresh:
-                                buffer = int(0.01 * len(y_peak))
-                                safe_idx = max(apex_idx_local + 1, crop_candidate_idx - buffer)
-                                x_peak = x_peak[:safe_idx]
-                                y_peak = y_peak[:safe_idx]
-                                right_idx = left_idx + safe_idx - 1
-                                break
+                    if cut_local is not None:
+                        new_right_idx = left_idx + apex_local + cut_local
+                        apex_height = intensity_vals_smooth[left_idx + apex_local]
+                        min_height_at_cut = intensity_vals_smooth[new_right_idx]
+                        # Only cut if the minimum is genuinely low (< 15 % of apex)
+                        if apex_height > 0 and (min_height_at_cut / apex_height) < 0.15:
+                            right_idx = new_right_idx
+                            x_peak = rt_vals[left_idx: right_idx + 1]
+                            y_peak = intensity_vals[left_idx: right_idx + 1]
+                # ──────────────────────────────────────────────────────────────
 
                 new_records = split_shoulders_in_window(
                     rt_vals=rt_vals,
@@ -629,10 +601,8 @@ def analyze_ms_file_plotly(file_path, output_image_path, file_colors, axis_meta_
                     base_name=base
                 )
 
-                # Collect into per-mass prefilter bucket
                 peaks_prefilter_by_mass[mz_str].extend(new_records)
 
-                # Stash trace candidate for later (after noise check)
                 passing_records = [r for r in new_records if r.get('height', 0) >= gui_noise_level]
                 if passing_records:
                     trace_candidates.append((mz_str, x_peak.copy(), y_peak.copy(), specific_mass))
@@ -641,14 +611,13 @@ def analyze_ms_file_plotly(file_path, output_image_path, file_colors, axis_meta_
                 print(f"Error processing peak {i} for mass {mass_list_str[mass_idx]}: {str(e)}")
                 continue
 
-    # ── Noise check: flag any m/z with > NOISE_PEAK_COUNT_THRESHOLD peaks ──
+    # ── Noise check ──
     noisy_masses: set[str] = set()
     for mz_str, records in peaks_prefilter_by_mass.items():
         if len(records) > NOISE_PEAK_COUNT_THRESHOLD:
             noisy_masses.add(mz_str)
             print(f"[Noise] m/z {mz_str} detected as noise ({len(records)} peaks in {base})")
 
-    # ── Build flat prefilter and filtered lists, excluding noisy masses ──
     peaks_prefilter: list[dict] = []
     peaks_out: list[dict] = []
     for mz_str, records in peaks_prefilter_by_mass.items():
@@ -657,7 +626,6 @@ def analyze_ms_file_plotly(file_path, output_image_path, file_colors, axis_meta_
         peaks_prefilter.extend(records)
         peaks_out.extend([r for r in records if r.get('height', 0) >= gui_noise_level])
 
-    # ── Build figure from stashed trace candidates, skipping noisy masses ──
     fig = go.Figure()
     mass_colors = _dark_hex_palette(len(mass_list))
     mass_color_map = {mass_list[i]: mass_colors[i] for i in range(len(mass_list))}
@@ -687,7 +655,6 @@ def analyze_ms_file_plotly(file_path, output_image_path, file_colors, axis_meta_
             print(f"[DEBUG] wrote {len(debug_rows)} rows to {debug_csv}")
         return peaks_out, peaks_prefilter, noisy_masses
 
-    # --- FORCE SAME X-AXIS SIZE (>= 6 minutes) FOR EVERY IMAGE ---
     min_rt = float(np.min(rt_vals))
     max_rt = float(np.max(rt_vals))
 
@@ -703,7 +670,6 @@ def analyze_ms_file_plotly(file_path, output_image_path, file_colors, axis_meta_
 
     x0 = center - half_width - X_PADDING_MINUTES
     x1 = center + half_width + X_PADDING_MINUTES
-
     x0 = max(x0, min_rt)
     x1 = min(x1, max_rt)
 
@@ -798,17 +764,14 @@ def process_file_checkpoint2(fp, dirs, file_colors, group_name):
             fp, png_path, file_colors, axis_meta_csv=axis_meta_csv
         )
 
-        # If every mass in the group was flagged as noise, skip entirely
         if noisy_masses:
             remaining = [m for m in [f"{x:.4f}" for x in Config.MASS_LIST] if m not in noisy_masses]
             if not remaining:
                 return f"[–] {base} skipped — all masses detected as noise"
 
-        # Save prefilter CSV (all detected peaks, noisy masses already excluded)
         if peaks_prefilter:
             pd.DataFrame(peaks_prefilter).to_csv(peaks_prefilter_csv, index=False, float_format='%.3f')
 
-        # Save filtered CSV (only peaks with height >= GUI noise level)
         if peaks:
             pd.DataFrame(peaks).to_csv(peaks_csv, index=False, float_format='%.3f')
 
