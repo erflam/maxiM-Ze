@@ -1,23 +1,30 @@
-import sys
-import os
-
-# Fix for PyInstaller
-if getattr(sys, 'frozen', False):
-    sys.path.insert(0, sys._MEIPASS)
-else:
-    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
 import customtkinter as ctk
 from tkinter import filedialog, messagebox
 import threading
 from pathlib import Path
 
+import sys
+import os
+
+if getattr(sys, 'frozen', False):
+    base_path = sys._MEIPASS
+else:
+    base_path = os.path.dirname(os.path.abspath(__file__))
+
+sys.path.insert(0, base_path)
+
+# DEBUG - print what's actually in the folder at runtime
+print(f"Base path: {base_path}")
+print(f"Files found: {os.listdir(base_path)}")
+print(f"sys.path: {sys.path}")
+
 try:
     from Pipeline import Pipeline
     from Config import Config
     from FileUtils import FileUtils
+    print("SUCCESS: All modules imported!")
 except ImportError as e:
-    print(f"Warning: Import error - {e}")
+    print(f"IMPORT FAILED: {e}")
     Pipeline = None
     Config = None
 
@@ -614,7 +621,7 @@ class MainWindow(ctk.CTk):
 
         def analysis_thread():
             try:
-                if not Pipeline or not Config:
+                if Pipeline is None or Config is None:
                     messagebox.showerror("Error", "Pipeline modules not found.")
                     return
 
