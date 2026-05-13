@@ -2,6 +2,7 @@ numpy
 pandas
 matplotlib
 plotly
+kaleido
 Pillow
 scipy
 opencv-python
@@ -10,3 +11,4 @@ numba
 openpyxl
 customtkinter
 aiofiles
+lxml
