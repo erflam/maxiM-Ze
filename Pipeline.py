@@ -1,4 +1,10 @@
+import sys
 import os
+
+if getattr(sys, 'frozen', False):
+    sys.path.insert(0, sys._MEIPASS)
+else:
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import time
 import shutil
 from multiprocessing import Pool, cpu_count
@@ -264,6 +270,7 @@ class Pipeline:
 
 if __name__ == "__main__":
     import multiprocessing
+    multiprocessing.freeze_support()
     multiprocessing.set_start_method("spawn", force=True)
     pipeline = Pipeline()
     pipeline.clean_run()

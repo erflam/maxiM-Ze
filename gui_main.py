@@ -1,7 +1,14 @@
-import customtkinter as ctk
-from tkinter import filedialog, messagebox
 import sys
 import os
+
+# Fix for PyInstaller
+if getattr(sys, 'frozen', False):
+    sys.path.insert(0, sys._MEIPASS)
+else:
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import customtkinter as ctk
+from tkinter import filedialog, messagebox
 import threading
 from pathlib import Path
 
@@ -671,6 +678,7 @@ def main():
     app = MainWindow()
     app.mainloop()
 
-
 if __name__ == "__main__":
+    import multiprocessing
+    multiprocessing.freeze_support()
     main()
