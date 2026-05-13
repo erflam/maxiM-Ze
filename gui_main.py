@@ -1,8 +1,4 @@
-import customtkinter as ctk
-from tkinter import filedialog, messagebox
-import threading
-from pathlib import Path
-
+import multiprocessing
 import sys
 import os
 
@@ -13,16 +9,18 @@ else:
 
 sys.path.insert(0, base_path)
 
-# DEBUG - print what's actually in the folder at runtime
-print(f"Base path: {base_path}")
-print(f"Files found: {os.listdir(base_path)}")
-print(f"sys.path: {sys.path}")
+multiprocessing.freeze_support()
+multiprocessing.set_start_method('spawn', force=True)
+
+import customtkinter as ctk
+from tkinter import filedialog, messagebox
+import threading
+from pathlib import Path
 
 try:
     from Pipeline import Pipeline
     from Config import Config
     from FileUtils import FileUtils
-    print("SUCCESS: All modules imported!")
 except ImportError as e:
     print(f"IMPORT FAILED: {e}")
     Pipeline = None
@@ -686,6 +684,4 @@ def main():
     app.mainloop()
 
 if __name__ == "__main__":
-    import multiprocessing
-    multiprocessing.freeze_support()
     main()
