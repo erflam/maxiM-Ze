@@ -9,9 +9,6 @@ else:
 
 sys.path.insert(0, base_path)
 
-multiprocessing.freeze_support()
-multiprocessing.set_start_method('spawn', force=True)
-
 import customtkinter as ctk
 from tkinter import filedialog, messagebox
 import threading
@@ -684,4 +681,6 @@ def main():
     app.mainloop()
 
 if __name__ == "__main__":
+    multiprocessing.freeze_support()
+    multiprocessing.set_start_method('spawn', force=True)
     main()

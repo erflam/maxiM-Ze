@@ -95,7 +95,8 @@ class Pipeline:
         start_time = time.time()
         args = [(fp, dirs, group_name) for fp in files_to_process]
 
-        with Pool(processes=max(1, cpu_count() - 1), initializer=init_worker) as pool:
+        ctx = multiprocessing.get_context('spawn')
+        with ctx.Pool(processes=max(1, cpu_count() - 1), initializer=init_worker) as pool:
             results = pool.starmap(process_file_checkpoint1, args)
 
         for r in results:
@@ -113,7 +114,8 @@ class Pipeline:
         start_time = time.time()
         args = [(fp, dirs, self.file_colors, group_name) for fp in files_to_process]
 
-        with Pool(processes=max(1, cpu_count() - 1), initializer=init_worker) as pool:
+        ctx = multiprocessing.get_context('spawn')
+        with ctx.Pool(processes=max(1, cpu_count() - 1), initializer=init_worker) as pool:
             results = pool.starmap(process_file_checkpoint2, args)
 
         for r in results:
@@ -131,7 +133,8 @@ class Pipeline:
         start_time = time.time()
         args = [(fp, dirs, group_name) for fp in files_to_process]
 
-        with Pool(processes=max(1, cpu_count() - 1), initializer=init_worker) as pool:
+        ctx = multiprocessing.get_context('spawn')
+        with ctx.Pool(processes=max(1, cpu_count() - 1), initializer=init_worker) as pool:
             results = pool.starmap(process_file_checkpoint3, args)
 
         for r in results:
@@ -166,7 +169,8 @@ class Pipeline:
         start_time = time.time()
         args = [(png, dirs, group_name) for png in pngs]
 
-        with Pool(processes=max(1, cpu_count() - 1), initializer=init_worker) as pool:
+        ctx = multiprocessing.get_context('spawn')
+        with ctx.Pool(processes=max(1, cpu_count() - 1), initializer=init_worker) as pool:
             results = pool.starmap(process_file_checkpoint4, args)
 
         for r in results:
