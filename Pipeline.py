@@ -8,7 +8,8 @@ else:
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import shutil
-from multiprocessing import Pool, cpu_count
+import multiprocessing
+from multiprocessing import cpu_count
 from pathlib import Path
 
 from Config import Config
