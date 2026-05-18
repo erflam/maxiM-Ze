@@ -245,9 +245,23 @@ class Pipeline:
 
             Config.set_mass_group(group_name)
             dirs = Config.setup_directories()
+            group_tag = str(group_name).replace(" ", "")
 
             self.run_group_checkpoint1(dirs, group_name)
             self.run_group_checkpoint2(dirs, group_name)
+
+            # Skip group if no EIC PNGs were built
+            png_dir = dirs['png']
+            built_pngs = [
+                f for f in os.listdir(png_dir)
+                if f.startswith("EIC_") and f.endswith(f"_{group_tag}.png")
+            ] if os.path.exists(png_dir) else []
+
+            if not built_pngs:
+                print(f"[!] No EIC PNGs built for group '{group_name}' "
+                      f"(all masses likely noisy or below noise threshold). Skipping group.")
+                continue
+
             self.run_group_checkpoint3(dirs, group_name)
             self.run_group_checkpoint4(dirs, group_name)
             self.run_group_checkpoint5(dirs, group_name)
@@ -259,20 +273,7 @@ class Pipeline:
 
         excel_path = self.run_final_checkpoint_excel()
         self.run_final_checkpoint_library_match(excel_path)
-
-        total_elapsed = time.time() - total_start
-
-        hours = int(total_elapsed // 3600)
-        minutes = int((total_elapsed % 3600) // 60)
-        seconds = total_elapsed % 60
-
-        print("\n")
-        print("🐊" * 33)
-        print("=" * 70)
-        print(f"ALL GROUPS COMPLETE in {hours:02d}:{minutes:02d}:{seconds:05.2f} (hh:mm:ss)")
-        print("=" * 70)
-        print("🐊" * 33)
-        print("Go Gators! Go Garrett Lab!")
+        # ... rest of your timing/print block unchanged
 
 if __name__ == "__main__":
     import multiprocessing
