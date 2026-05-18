@@ -272,8 +272,11 @@ class Pipeline:
             self.run_group_checkpoint10(dirs, group_name)
 
         excel_path = self.run_final_checkpoint_excel()
-        self.run_final_checkpoint_library_match(excel_path)
-        # ... rest of your timing/print block unchanged
+        lib_file = getattr(Config, 'LIB_FILE', None)
+        if lib_file and os.path.exists(lib_file):
+            self.run_final_checkpoint_library_match(excel_path)
+        else:
+            print("[–] No library file provided or file not found — skipping library matching.")
 
 if __name__ == "__main__":
     import multiprocessing
