@@ -663,8 +663,11 @@ class MainWindow(ctk.CTk):
                 messagebox.showinfo("Success", "Analysis completed successfully!")
 
             except Exception as e:
+                import traceback
+                tb = traceback.format_exc()
                 messagebox.showerror("Error", f"Analysis failed:\n{str(e)}")
                 print(f"\nError: {str(e)}")
+                print(tb)
             finally:
                 self.run_btn.configure(state="normal", text="Run Analysis")
 
