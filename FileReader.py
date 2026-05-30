@@ -9,18 +9,18 @@ from pyteomics import mzml, mzxml
 
 
 # ── Scan cache (CSR format) ───────────────────────────────────────────────────
+# Each input file is parsed from XML once and the raw scan arrays saved as a
+# compressed .npz (CSR format) so subsequent groups skip XML parsing.
 #
-# Each input file is parsed from XML exactly once per run. The raw scan data is
-# stored on disk as a compressed .npz in CSR (Compressed Sparse Row) format:
+# IMPORTANT: _scan_cache_path uses Config._analysis_output_root(), which is
+# only correct in the MAIN process. In spawned workers this path may be wrong
+# (workers re-import Config with default class values). The scan cache is
+# therefore a best-effort optimisation — if the path is wrong the fallback
+# XML read is used transparently.
 #
-#   scan_nums  : int32[n_scans]       — scan numbers
-#   rts        : float32[n_scans]     — retention times
-#   offsets    : int64[n_scans + 1]   — offsets[i]:offsets[i+1] = slice for scan i
-#   mzs_flat   : float32[total_pts]   — all m/z values concatenated
-#   ints_flat  : float32[total_pts]   — all intensity values concatenated
-#
-# Subsequent groups load this binary cache (~10-50× faster than XML parsing)
-# and run the numba CSR extraction directly on the flat arrays.
+# The RT manifest (scan_nums + rts only) is written to dirs['csv'] by
+# process_file_checkpoint1, which always receives the correct dirs dict.
+# EICBuilder reads it from the same location — no Config dependency.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _scan_cache_path(fp: str) -> Path:
@@ -31,44 +31,56 @@ def _scan_cache_path(fp: str) -> Path:
 
 
 def _save_scan_cache(fp: str, scan_nums, rts, offsets, mzs_flat, ints_flat) -> None:
-    np.savez_compressed(
-        str(_scan_cache_path(fp)),
-        scan_nums=np.array(scan_nums, dtype=np.int32),
-        rts=np.array(rts, dtype=np.float32),
-        offsets=np.array(offsets, dtype=np.int64),
-        mzs_flat=mzs_flat.astype(np.float32),
-        ints_flat=ints_flat.astype(np.float32),
-    )
+    try:
+        np.savez_compressed(
+            str(_scan_cache_path(fp)),
+            scan_nums=np.array(scan_nums, dtype=np.int32),
+            rts=np.array(rts, dtype=np.float32),
+            offsets=np.array(offsets, dtype=np.int64),
+            mzs_flat=mzs_flat.astype(np.float32),
+            ints_flat=ints_flat.astype(np.float32),
+        )
+    except Exception:
+        pass  # best-effort; workers may have wrong path
 
 
 def _load_scan_cache(fp: str):
     """Returns (scan_nums, rts, offsets, mzs_flat, ints_flat) or None."""
-    path = _scan_cache_path(fp)
-    if not path.exists():
+    try:
+        path = _scan_cache_path(fp)
+        if not path.exists():
+            return None
+        d = np.load(str(path))
+        return d['scan_nums'], d['rts'], d['offsets'], d['mzs_flat'], d['ints_flat']
+    except Exception:
         return None
-    d = np.load(str(path))
-    return d['scan_nums'], d['rts'], d['offsets'], d['mzs_flat'], d['ints_flat']
 
 
-# ── Numba CSR extraction ──────────────────────────────────────────────────────
+def rt_manifest_path(fp: str, csv_dir: str) -> Path:
+    """
+    RT manifest lives in the group's EIC CSVs directory alongside the raw CSV.
+    This path is always correct because csv_dir comes from dirs['csv'] which
+    is passed explicitly to every worker — no Config dependency.
+    """
+    base = os.path.splitext(os.path.basename(fp))[0]
+    return Path(csv_dir) / f"{base}_rt.npz"
+
+
+# ── Numba CSR extraction (checkpoint 1) ──────────────────────────────────────
 
 @njit(parallel=True)
 def _eic_from_csr(rts, offsets, mzs_flat, ints_flat, mass_list, tolerance):
-    """
-    Extract EIC intensities from CSR scan cache for all masses in parallel.
-
-    Returns a (n_scans, n_masses) float32 matrix.
-    Scans are parallelised across CPU cores via prange.
-    """
-    n_scans = len(rts)
+    """Extract EIC intensities from CSR scan cache for all masses in parallel.
+    Returns (n_scans, n_masses) float32 matrix."""
+    n_scans  = len(rts)
     n_masses = len(mass_list)
     out = np.zeros((n_scans, n_masses), dtype=np.float32)
     for s in prange(n_scans):
         start = offsets[s]
-        end = offsets[s + 1]
+        end   = offsets[s + 1]
         for m in range(n_masses):
             target = mass_list[m]
-            total = np.float32(0.0)
+            total  = np.float32(0.0)
             for k in range(start, end):
                 if abs(mzs_flat[k] - target) <= tolerance:
                     total += ints_flat[k]
@@ -77,7 +89,6 @@ def _eic_from_csr(rts, offsets, mzs_flat, ints_flat, mass_list, tolerance):
 
 
 def _eic_matrix_to_df(scan_nums, rts, intensity_matrix, mass_list):
-    """Convert the (n_scans, n_masses) matrix to the long-format DataFrame."""
     rows_s, rows_m = np.where(intensity_matrix > 0)
     if len(rows_s) == 0:
         return pd.DataFrame(columns=['scan', 'rt', 'mass', 'intensity'])
@@ -89,7 +100,7 @@ def _eic_matrix_to_df(scan_nums, rts, intensity_matrix, mass_list):
     })
 
 
-# ── MSFileAnalyzer (unchanged public API) ────────────────────────────────────
+# ── MSFileAnalyzer ────────────────────────────────────────────────────────────
 
 class MSFileAnalyzer:
     def __init__(self, file_path):
@@ -113,7 +124,6 @@ class MSFileAnalyzer:
                     m = re.match(r'PT(?P<v>[\d\.]+)S', rt_val)
                     return float(m.group('v')) if m else float(rt_val)
                 return float(rt_val)
-
             scan_list = scan.get('scanList', {}).get('scan', [])
             if scan_list:
                 for cv in scan_list[0].get('cvParam', []):
@@ -153,22 +163,22 @@ class MSFileAnalyzer:
     def extract_eic(self):
         if self._cached_eic is not None:
             return self._cached_eic
-
         records = []
         mass_list = np.array(Config.MASS_LIST, dtype=np.float32)
-
         try:
             with self.get_reader() as reader:
                 for scan in reader:
                     try:
                         rt = self.get_retention_time(scan)
                         scan_num = scan.get('num', None)
-                        mzs = self._convert_array_dtype(scan['m/z array'])
+                        mzs  = self._convert_array_dtype(scan['m/z array'])
                         ints = self._convert_array_dtype(scan['intensity array'])
-                        intensities = self.fast_eic_extraction_parallel(mzs, ints, mass_list, Config.MASS_TOLERANCE)
+                        intensities = self.fast_eic_extraction_parallel(
+                            mzs, ints, mass_list, Config.MASS_TOLERANCE)
                         for m, i in zip(mass_list, intensities):
                             if i > 0:
-                                records.append({'scan': scan_num, 'rt': rt, 'mass': m, 'intensity': i})
+                                records.append({'scan': scan_num, 'rt': rt,
+                                                'mass': m, 'intensity': i})
                     except KeyError:
                         continue
                     except Exception as e:
@@ -177,32 +187,44 @@ class MSFileAnalyzer:
         except Exception as e:
             print(f"Fatal error processing {self.file_path}: {str(e)}")
             raise
-
         self._cached_eic = pd.DataFrame(records)
         return self._cached_eic
 
 
 class MSFileAnalyzerOptimized(MSFileAnalyzer):
-    """Optimized version with CSR disk cache — parses XML at most once per run."""
+    """
+    Optimized EIC extractor with two improvements:
+
+    1. CSR scan cache (.npz) — skips XML parsing on second+ access.
+       Written to Config._analysis_output_root()/scan_cache/ which may be
+       wrong in spawned workers; falls back to XML read transparently.
+
+    2. RT manifest — scan_nums + rts for ALL scans (including zero-intensity).
+       NOT written here; written by process_file_checkpoint1 to dirs['csv']
+       where the path is always correct.  Exposed via self.all_scan_nums /
+       self.all_rts so the checkpoint function can save it.
+    """
+
+    def __init__(self, file_path):
+        super().__init__(file_path)
+        self.all_scan_nums: list = []   # all scans (including zero-intensity)
+        self.all_rts:       list = []   # parallel retention times
 
     def _read_and_cache(self):
-        """
-        Parse the mzML/mzXML file, build CSR arrays, save to disk cache,
-        and return (scan_nums, rts, offsets, mzs_flat, ints_flat).
-        """
-        scan_nums = []
-        rts = []
+        """Parse file, populate all_scan_nums/all_rts, save CSR cache."""
+        scan_nums  = []
+        rts        = []
         mzs_chunks = []
-        ints_chunks = []
-        offsets = [0]
+        ints_chunks= []
+        offsets    = [0]
 
         try:
             with self.get_reader() as reader:
                 for scan in reader:
                     try:
-                        rt = self.get_retention_time(scan)
+                        rt       = self.get_retention_time(scan)
                         scan_num = scan.get('num', None)
-                        mzs = self._convert_array_dtype(scan['m/z array'])
+                        mzs  = self._convert_array_dtype(scan['m/z array'])
                         ints = self._convert_array_dtype(scan['intensity array'])
 
                         scan_nums.append(scan_num)
@@ -210,7 +232,6 @@ class MSFileAnalyzerOptimized(MSFileAnalyzer):
                         mzs_chunks.append(mzs)
                         ints_chunks.append(ints)
                         offsets.append(offsets[-1] + len(mzs))
-
                     except KeyError:
                         continue
                     except Exception as e:
@@ -220,14 +241,19 @@ class MSFileAnalyzerOptimized(MSFileAnalyzer):
             print(f"Fatal error processing {self.file_path}: {str(e)}")
             raise
 
-        mzs_flat = np.concatenate(mzs_chunks).astype(np.float32) if mzs_chunks else np.empty(0, np.float32)
-        ints_flat = np.concatenate(ints_chunks).astype(np.float32) if ints_chunks else np.empty(0, np.float32)
+        # Expose full scan list for RT manifest saving by checkpoint 1
+        self.all_scan_nums = scan_nums
+        self.all_rts       = rts
+
+        mzs_flat  = np.concatenate(mzs_chunks).astype(np.float32)  if mzs_chunks  else np.empty(0, np.float32)
+        ints_flat = np.concatenate(ints_chunks).astype(np.float32)  if ints_chunks else np.empty(0, np.float32)
 
         _save_scan_cache(self.file_path, scan_nums, rts, offsets, mzs_flat, ints_flat)
+
         return (
             np.array(scan_nums, dtype=np.int32),
-            np.array(rts, dtype=np.float32),
-            np.array(offsets, dtype=np.int64),
+            np.array(rts,       dtype=np.float32),
+            np.array(offsets,   dtype=np.int64),
             mzs_flat,
             ints_flat,
         )
@@ -236,42 +262,63 @@ class MSFileAnalyzerOptimized(MSFileAnalyzer):
         if self._cached_eic is not None:
             return self._cached_eic
 
-        # Load CSR cache from disk, or build it from XML on first access
         cached = _load_scan_cache(self.file_path)
         if cached is None:
             scan_nums, rts, offsets, mzs_flat, ints_flat = self._read_and_cache()
         else:
             scan_nums, rts, offsets, mzs_flat, ints_flat = cached
+            # Populate all_scan_nums / all_rts from cache so checkpoint 1
+            # can still save the RT manifest even on a cache-hit path
+            self.all_scan_nums = scan_nums.tolist()
+            self.all_rts       = rts.tolist()
 
         mass_list = np.array(Config.MASS_LIST, dtype=np.float32)
         tolerance = np.float32(Config.MASS_TOLERANCE)
 
-        intensity_matrix = _eic_from_csr(rts, offsets, mzs_flat, ints_flat, mass_list, tolerance)
-        self._cached_eic = _eic_matrix_to_df(scan_nums, rts, intensity_matrix, mass_list)
+        intensity_matrix  = _eic_from_csr(rts, offsets, mzs_flat, ints_flat, mass_list, tolerance)
+        self._cached_eic  = _eic_matrix_to_df(scan_nums, rts, intensity_matrix, mass_list)
         return self._cached_eic
 
 
-# ── Checkpoint 1 (unchanged signature) ───────────────────────────────────────
+# ── Checkpoint 1 ─────────────────────────────────────────────────────────────
 
 def process_file_checkpoint1(fp, dirs, group_name):
-    """Checkpoint 1: Extract EIC raw CSV with scan numbers, group-specific filename."""
+    """Checkpoint 1: Extract EIC raw CSV; also write RT manifest to dirs['csv']."""
     Config.set_mass_group(group_name)
     try:
-        base = os.path.splitext(os.path.basename(fp))[0]
+        base      = os.path.splitext(os.path.basename(fp))[0]
         assert Config.CURRENT_GROUP is not None, "No group selected"
         group_tag = Config.CURRENT_GROUP.replace(" ", "")
-        raw_csv = os.path.join(dirs['csv'], f"{base}_EIC_raw_{group_tag}.csv")
+        raw_csv   = os.path.join(dirs['csv'], f"{base}_EIC_raw_{group_tag}.csv")
         assert os.path.exists(dirs['csv']), f"CSV directory does not exist: {dirs['csv']}"
 
+        rt_path = rt_manifest_path(fp, dirs['csv'])
+
         if os.path.exists(raw_csv):
+            # Raw CSV cached — ensure RT manifest exists too (first run after upgrade)
+            if not rt_path.exists():
+                # Try to backfill from scan cache
+                cached = _load_scan_cache(fp)
+                if cached is not None:
+                    sn, rt_arr, *_ = cached
+                    np.savez_compressed(str(rt_path),
+                                        scan_nums=sn, rts=rt_arr)
             return f"[↷] {base} (raw cached)"
 
         analyzer = MSFileAnalyzerOptimized(fp)
-        df_raw = analyzer.extract_eic()
-        df_raw.to_csv(raw_csv, index=False, float_format='%.3f')
+        df_raw   = analyzer.extract_eic()
+        df_raw.to_csv(raw_csv, index=False, float_format='%.4f')
+
+        # Save RT manifest to dirs['csv'] — always the correct path in workers
+        if analyzer.all_scan_nums:
+            np.savez_compressed(
+                str(rt_path),
+                scan_nums=np.array(analyzer.all_scan_nums, dtype=np.int32),
+                rts=np.array(analyzer.all_rts,       dtype=np.float32),
+            )
+
         del df_raw
         del analyzer
-
         return f"[✔] {base} (raw)"
     except Exception as e:
         return f"[!] Error: {os.path.basename(fp)}: {str(e)[:50]}"
