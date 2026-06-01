@@ -507,12 +507,12 @@ def analyze_ms_file_plotly(file_path, output_image_path, file_colors,
                       paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)')
 
     try:
-        pio.write_image(fig, output_image_path, format='png', engine='kaleido', scale=4)
+        pio.write_image(fig, output_image_path, format='png', engine='kaleido', scale=2)
     except Exception as e:
         print(f"Error saving image: {str(e)}")
         try:
             rp = output_image_path.replace('.png', '_raw.png')
-            pio.write_image(fig, rp, format='png', engine='kaleido', scale=4)
+            pio.write_image(fig, rp, format='png', engine='kaleido', scale=2)
             with Image.open(rp) as img:
                 img.save(output_image_path, optimize=True, compress_level=9)
             os.remove(rp)
