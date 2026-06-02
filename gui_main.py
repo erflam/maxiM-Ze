@@ -75,8 +75,12 @@ class MainWindow(ctk.CTk):
         self.sidebar.grid_rowconfigure(4, weight=1)
 
         try:
+            import sys, os
             from PIL import Image as PilImage
-            _logo_path = Path(__file__).parent / "logo.png"
+            if hasattr(sys, '_MEIPASS'):
+                _logo_path = os.path.join(sys._MEIPASS, "logo.png")
+            else:
+                _logo_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logo.png")
             pil_img = PilImage.open(_logo_path)
             self._logo_img = ctk.CTkImage(light_image=pil_img, dark_image=pil_img, size=(170, 18))
             self.logo_label = ctk.CTkLabel(self.sidebar, image=self._logo_img, text="", fg_color="transparent")
