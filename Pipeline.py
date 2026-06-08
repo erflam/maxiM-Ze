@@ -1,5 +1,10 @@
 import sys
 import os
+# Keep Numba/OpenMP from oversubscribing inside each multiprocessing worker.
+# This must be set before FileReader imports numba.
+os.environ.setdefault('NUMBA_NUM_THREADS', '1')
+os.environ.setdefault('OMP_NUM_THREADS', '1')
+os.environ.setdefault('MKL_NUM_THREADS', '1')
 import time
 
 if getattr(sys, 'frozen', False):
@@ -11,6 +16,16 @@ import shutil
 import multiprocessing
 from multiprocessing import cpu_count
 from pathlib import Path
+
+# Windows + PyInstaller process spawning is expensive.  Using nearly every
+# logical CPU can be slower because each worker imports pandas/scipy/plotly/numba
+# and Numba may also try to thread internally.  Override with environment var:
+#     set MAXIMIZE_MAX_WORKERS=6
+MAX_WORKERS = max(1, int(os.environ.get('MAXIMIZE_MAX_WORKERS', '4')))
+
+def _pool_size(n_tasks: int) -> int:
+    usable_cpus = max(1, cpu_count() - 1)
+    return max(1, min(MAX_WORKERS, usable_cpus, max(1, n_tasks)))
 
 from Config import Config
 from FileUtils import FileUtils
@@ -28,11 +43,18 @@ from ExportExcel import process_export_excel
 from LibraryMatching import process_library_match
 
 def init_worker():
-    import matplotlib
-    matplotlib.use('Agg')
+    # Only used for image/pixel-oriented multiprocessing steps.
+    # Do not disable Kaleido here; checkpoint 2 needs it for PNG export.
     import os
-    os.environ['KALEIDO_DISABLE'] = '1'
-    os.environ['PLOTLY_RENDERER'] = 'json'
+    os.environ.setdefault('NUMBA_NUM_THREADS', '1')
+    os.environ.setdefault('OMP_NUM_THREADS', '1')
+    os.environ.setdefault('MKL_NUM_THREADS', '1')
+    os.environ.setdefault('PLOTLY_RENDERER', 'json')
+    try:
+        import matplotlib
+        matplotlib.use('Agg')
+    except Exception:
+        pass
 
 class Pipeline:
     def __init__(self, import_json_path: str | Path | None = None):
@@ -149,7 +171,7 @@ class Pipeline:
         t0 = time.time()
         args = [(fp, dirs, group_name) for fp in files_to_process]
         ctx = multiprocessing.get_context('spawn')
-        with ctx.Pool(processes=max(1, cpu_count() - 1), initializer=init_worker) as pool:
+        with ctx.Pool(processes=_pool_size(len(args))) as pool:
             results = pool.starmap(process_file_checkpoint1, args)
         for r in results:
             print(r)
@@ -166,7 +188,7 @@ class Pipeline:
         t0 = time.time()
         args = [(fp, dirs, self.file_colors, group_name) for fp in files_to_process]
         ctx = multiprocessing.get_context('spawn')
-        with ctx.Pool(processes=max(1, cpu_count() - 1), initializer=init_worker) as pool:
+        with ctx.Pool(processes=_pool_size(len(args))) as pool:
             results = pool.starmap(process_file_checkpoint2, args)
         for r in results:
             print(r)
@@ -183,7 +205,7 @@ class Pipeline:
         t0 = time.time()
         args = [(fp, dirs, group_name) for fp in files_to_process]
         ctx = multiprocessing.get_context('spawn')
-        with ctx.Pool(processes=max(1, cpu_count() - 1), initializer=init_worker) as pool:
+        with ctx.Pool(processes=_pool_size(len(args))) as pool:
             results = pool.starmap(process_file_checkpoint3, args)
         for r in results:
             print(r)
@@ -212,7 +234,7 @@ class Pipeline:
         t0 = time.time()
         args = [(png, dirs, group_name) for png in pngs]
         ctx = multiprocessing.get_context('spawn')
-        with ctx.Pool(processes=max(1, cpu_count() - 1), initializer=init_worker) as pool:
+        with ctx.Pool(processes=_pool_size(len(args)), initializer=init_worker) as pool:
             results = pool.starmap(process_file_checkpoint4, args)
         for r in results:
             print(r)

@@ -1,3 +1,9 @@
+import os
+# Keep thread-heavy libraries from oversubscribing inside multiprocessing workers.
+os.environ.setdefault('OMP_NUM_THREADS', '1')
+os.environ.setdefault('MKL_NUM_THREADS', '1')
+os.environ.setdefault('NUMBA_NUM_THREADS', '1')
+
 from FileReader import MSFileAnalyzer, rt_manifest_path
 import numpy as np
 import pandas as pd
@@ -7,7 +13,6 @@ from scipy.ndimage import gaussian_filter1d
 import plotly.io as pio
 import plotly.graph_objects as go
 from PIL import Image
-import os
 from pathlib import Path
 from Config import Config
 import colorsys
@@ -28,6 +33,12 @@ EXPORT_DEBUG_CSV        = False
 BYPASS_CACHE_WHEN_DEBUG = False
 
 NOISE_PEAK_COUNT_THRESHOLD = 15
+
+# scale=2 creates a 3200x1800 PNG from the 1600x900 figure.
+# On Windows/PyInstaller/Kaleido this can be a major bottleneck.
+# Override with environment var if you want a smaller/faster export:
+#     set MAXIMIZE_PNG_SCALE=1
+PNG_EXPORT_SCALE = float(os.environ.get('MAXIMIZE_PNG_SCALE', '2'))
 
 
 def _dark_hex_palette(n: int):
@@ -507,12 +518,12 @@ def analyze_ms_file_plotly(file_path, output_image_path, file_colors,
                       paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)')
 
     try:
-        pio.write_image(fig, output_image_path, format='png', engine='kaleido', scale=2)
+        pio.write_image(fig, output_image_path, format='png', engine='kaleido', scale=PNG_EXPORT_SCALE)
     except Exception as e:
         print(f"Error saving image: {str(e)}")
         try:
             rp = output_image_path.replace('.png', '_raw.png')
-            pio.write_image(fig, rp, format='png', engine='kaleido', scale=2)
+            pio.write_image(fig, rp, format='png', engine='kaleido', scale=PNG_EXPORT_SCALE)
             with Image.open(rp) as img:
                 img.save(output_image_path, optimize=True, compress_level=9)
             os.remove(rp)

@@ -1,4 +1,8 @@
 import os
+# Prevent Numba/OpenMP from spawning many threads inside each multiprocessing worker.
+os.environ.setdefault('NUMBA_NUM_THREADS', '1')
+os.environ.setdefault('OMP_NUM_THREADS', '1')
+os.environ.setdefault('MKL_NUM_THREADS', '1')
 import re
 from pathlib import Path
 from Config import Config
@@ -10,7 +14,7 @@ from pyteomics import mzml, mzxml
 
 # ── Scan cache (CSR format) ───────────────────────────────────────────────────
 # Each input file is parsed from XML once and the raw scan arrays saved as a
-# compressed .npz (CSR format) so subsequent groups skip XML parsing.
+# uncompressed .npz (CSR format) so subsequent groups skip XML parsing.
 #
 # IMPORTANT: _scan_cache_path uses Config._analysis_output_root(), which is
 # only correct in the MAIN process. In spawned workers this path may be wrong
@@ -32,7 +36,7 @@ def _scan_cache_path(fp: str) -> Path:
 
 def _save_scan_cache(fp: str, scan_nums, rts, offsets, mzs_flat, ints_flat) -> None:
     try:
-        np.savez_compressed(
+        np.savez(
             str(_scan_cache_path(fp)),
             scan_nums=np.array(scan_nums, dtype=np.int32),
             rts=np.array(rts, dtype=np.float32),
@@ -68,7 +72,7 @@ def rt_manifest_path(fp: str, csv_dir: str) -> Path:
 
 # ── Numba CSR extraction (checkpoint 1) ──────────────────────────────────────
 
-@njit(parallel=True)
+@njit(parallel=True, cache=True)
 def _eic_from_csr(rts, offsets, mzs_flat, ints_flat, mass_list, tolerance):
     """Extract EIC intensities from CSR scan cache for all masses in parallel.
     Returns (n_scans, n_masses) float32 matrix."""
@@ -137,7 +141,7 @@ class MSFileAnalyzer:
         raise KeyError("No retention time found")
 
     @staticmethod
-    @njit(parallel=True)
+    @njit(parallel=True, cache=True)
     def fast_eic_extraction_parallel(mzs, ints, mass_list, tolerance):
         results = np.zeros(len(mass_list))
         for i in prange(len(mass_list)):
@@ -147,7 +151,7 @@ class MSFileAnalyzer:
         return results
 
     @staticmethod
-    @njit
+    @njit(cache=True)
     def fast_eic_extraction(mzs, ints, mass_list, tolerance):
         results = np.zeros(len(mass_list))
         for i, mz_target in enumerate(mass_list):
@@ -301,8 +305,8 @@ def process_file_checkpoint1(fp, dirs, group_name):
                 cached = _load_scan_cache(fp)
                 if cached is not None:
                     sn, rt_arr, *_ = cached
-                    np.savez_compressed(str(rt_path),
-                                        scan_nums=sn, rts=rt_arr)
+                    np.savez(str(rt_path),
+                             scan_nums=sn, rts=rt_arr)
             return f"[↷] {base} (raw cached)"
 
         analyzer = MSFileAnalyzerOptimized(fp)
@@ -311,7 +315,7 @@ def process_file_checkpoint1(fp, dirs, group_name):
 
         # Save RT manifest to dirs['csv'] — always the correct path in workers
         if analyzer.all_scan_nums:
-            np.savez_compressed(
+            np.savez(
                 str(rt_path),
                 scan_nums=np.array(analyzer.all_scan_nums, dtype=np.int32),
                 rts=np.array(analyzer.all_rts,       dtype=np.float32),
