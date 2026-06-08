@@ -362,6 +362,7 @@ def process_file_coelution_sliced(dirs: Dict[str, str], group_name: str) -> str:
 
             # labels 1..n left->right (these become _p1, _p2, ...)
             labels = list(range(1, n_peaks + 1))
+            peak_nums = labels.copy()
 
         else:
             peak_nums = sorted(pd.unique(g["Peak_num_cluster"]))
